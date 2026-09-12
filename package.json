@@ -1,0 +1,19 @@
+{
+  "name": "electrontemplate",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "Frosttide",
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "latest",
+    "electron-builder": "latest"
+  }
+}
