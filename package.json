@@ -1,19 +1,22 @@
 {
-  "name": "electrontemplate",
+  "name": "insuranceserver",
   "version": "1.0.0",
-  "description": "",
-  "license": "ISC",
-  "author": "Frosttide",
-  "type": "module",
   "main": "main.js",
   "scripts": {
-    "start": "electron .",
-    "build": "electron-builder",
-    "pack": "electron-builder --dir",
-    "dist": "electron-builder"
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "devDependencies": {
-    "electron": "latest",
-    "electron-builder": "latest"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VLFrosttide/InsuranceServer.git"
+  },
+  "author": "Frosttide",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/VLFrosttide/InsuranceServer/issues"
+  },
+  "homepage": "https://github.com/VLFrosttide/InsuranceServer#readme",
+  "description": "",
+  "dependencies": {
+    "express": "^5.2.1"
   }
 }
