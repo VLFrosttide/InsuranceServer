@@ -1,14 +1,23 @@
 "use strict";
-const express = require("express");
+import express from "express";
 const app = express();
 const port = process.env.PORT || 8080;
-const http = require("http");
-// const path = require("path");
+import http from "http";
 const httpServer = http.createServer(app);
-const { Client } = require("pg");
-const DBClient = new Client(process.env.ConString);
-const Bcrypt = require("bcrypt");
-const Crypto = require("crypto");
+import { Client } from "pg";
+const DBClient = new Client({
+  user: process.env.DBUser,
+  password: process.env.DBPass,
+  host: process.env.DBHost,
+  port: 25060,
+  database: "insurancedb",
+  ssl: "true",
+});
+import Bcrypt from "bcrypt";
+import Crypto from "crypto";
+app.get("/", (req, res) => {
+  res.send("Server is running");
+});
 await DBClient.connect();
 
 app.post("/logme", async (req, res) => {
@@ -76,9 +85,6 @@ app.post("/userreg", async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: "Registration failed" });
   }
-});
-app.get("/", (req, res) => {
-  res.send("Server is running");
 });
 
 httpServer.listen(port, "0.0.0.0", () => {
