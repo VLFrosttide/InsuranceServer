@@ -5,7 +5,7 @@ const port = process.env.PORT || 8080;
 import http from "http";
 const httpServer = http.createServer(app);
 import { Client } from "pg";
-const DBClient = new Client(process.env.Constring);
+const DBClient = new Client(process.env.ConString);
 
 import Bcrypt from "bcrypt";
 import Crypto from "crypto";
