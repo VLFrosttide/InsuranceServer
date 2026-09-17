@@ -1,21 +1,16 @@
 "use strict";
-import express from "express";
+const express = require("express");
 const app = express();
 const port = process.env.PORT || 8080;
-import http from "http";
+const http = require("http");
+// const path = require("path");
 const httpServer = http.createServer(app);
-import { Client } from "pg";
-const DBClient = new Client({
-  user: process.env.DBUser,
-  password: process.env.DBPass,
-  host: process.env.DBHost,
-  port: 25060,
-  database: "insurancedb",
-  ssl: "true",
-});
-import Bcrypt from "bcrypt";
-import Crypto from "crypto";
+const { Client } = require("pg");
+const DBClient = new Client(process.env.ConString);
+const Bcrypt = require("bcrypt");
+const Crypto = require("crypto");
 await DBClient.connect();
+
 app.post("/logme", async (req, res) => {
   res.send("Got a POST request");
   try {
