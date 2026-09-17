@@ -11,7 +11,7 @@ const DBClient = new Client({
   host: process.env.DBHost,
   port: 25060,
   database: "insurancedb",
-  ssl: "require",
+  ssl: "true",
 });
 import Bcrypt from "bcrypt";
 import Crypto from "crypto";
