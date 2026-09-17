@@ -9,7 +9,7 @@ const DBClient = new Client({
   user: process.env.DBUser,
   password: process.env.DBPass,
   host: process.env.DBHost,
-  port: port,
+  port: 25060,
   database: "insurancedb",
   ssl: "require",
 });
