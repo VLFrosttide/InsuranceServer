@@ -5,14 +5,7 @@ const port = process.env.PORT || 8080;
 import http from "http";
 const httpServer = http.createServer(app);
 import { Client } from "pg";
-const DBClient = new Client({
-  user: process.env.DBUser,
-  password: process.env.DBPass,
-  host: process.env.DBHost,
-  port: 25060,
-  database: "defaultdb",
-  ssl: ca ? { rejectUnauthorized: true, ca } : undefined,
-});
+const DBClient = new Client(process.env.Constring);
 
 import Bcrypt from "bcrypt";
 import Crypto from "crypto";
