@@ -10,9 +10,10 @@ const DBClient = new Client({
   password: process.env.DBPass,
   host: process.env.DBHost,
   port: 25060,
-  database: "insurancedb",
-  ssl: "true",
+  database: "defaultdb",
+  ssl: ca ? { rejectUnauthorized: true, ca } : undefined,
 });
+
 import Bcrypt from "bcrypt";
 import Crypto from "crypto";
 app.get("/", (req, res) => {
