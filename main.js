@@ -76,12 +76,12 @@ app.post("/userreg", async (req, res) => {
     res.status(500).json({ error: "Registration failed" });
   }
 });
-// app.get("/", (req, res) => {
-//   res.send("Server is running");
-// });
-
-httpServer.listen(port, "0.0.0.0", () => {
-  // console.log(`Server listening on port ${port}`);
+app.get("/", (req, res) => {
+  res.send("Server is running");
 });
 
-// export { DBClient };
+httpServer.listen(port, "0.0.0.0", () => {
+  console.log(`Server listening on port ${port}`);
+});
+
+export { DBClient };
