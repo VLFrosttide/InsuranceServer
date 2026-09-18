@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "main": "main.js",
   "scripts": {
-    "start": "node main.js",
+    "start": "node --env-file=.env main.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
@@ -21,9 +21,12 @@
   "dependencies": {
     "bcrypt": "^6.0.0",
     "express": "^5.2.1",
-    "pg": "^8.23.0"
+    "mysql2": "^3.24.4"
   },
   "devDependencies": {
     "@types/node": "^26.1.2"
+  },
+  "allowScripts": {
+    "bcrypt@6.0.0": true
   }
 }
