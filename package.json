@@ -19,6 +19,7 @@
   "homepage": "https://github.com/VLFrosttide/InsuranceServer#readme",
   "description": "",
   "dependencies": {
+    "@googleapis/gmail": "^22.0.0",
     "bcrypt": "^6.0.0",
     "express": "^5.2.1",
     "mysql2": "^3.24.4"
