@@ -48,8 +48,9 @@ jspm_packages/
 .env.test.local
 .env.production.local
 .env.local
-
-
+credentials.json
+Credentials.json
+client_secret_2_761144659905-echuvrd5p276inrds912qrgvtuj37nh4.apps.googleusercontent.com.json
 dist
 build
 #pics

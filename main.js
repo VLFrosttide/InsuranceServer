@@ -3,6 +3,8 @@ import express from "express";
 import http from "http";
 import mysql from "mysql2/promise";
 import {LoginRouter} from "./Requests/LoginReq.js";
+import ngrok from "@ngrok/ngrok";
+
 const app = express();
 const httpServer = http.createServer(app);
 let DBConnection = await mysql.createConnection({
@@ -15,6 +17,17 @@ let DBConnection = await mysql.createConnection({
 
 const [rows] = await DBConnection.execute("SELECT * FROM users");
 
+async function forwardToApp() {
+  const forwarder = await ngrok.forward({
+    addr: "http://localhost:5501",
+    authtoken_from_env: true,
+    domain: "creative-jukebox-caddy.ngrok-free.dev",
+  });
+  console.log(`Available at: ${forwarder.url()}`);
+}
+
+forwardToApp();
+
 console.log(rows);
 app.use(express.json());
 app.use((req, res, next) => {
@@ -22,7 +35,6 @@ app.use((req, res, next) => {
 });
 
 app.use(LoginRouter);
-
 httpServer.listen(5501, "127.0.0.1", () => {
   console.log(`Server listening on port ${5501}`);
 });
