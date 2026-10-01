@@ -1,59 +1,55 @@
-import path from 'node:path';
-import process from 'node:process';
-import {authenticate} from '@google-cloud/local-auth';
-import {google} from 'googleapis';
-const SCOPES = ['https://www.googleapis.com/auth/gmail.readonly'];
-const CREDENTIALS_PATH = process.env.JSONPath
-let PollInterval = 5*60*1000; // 5 minutes in milliseconds
+import { google } from "googleapis";
+import { ProcessEmail } from "./ProcessEmail.js";
+import { loadCredentials } from "./secrets.js";
+import Authorize from "./Authorize.js";
 
-async function CheckEmail() {
+let MailPhotos = [];
+
+function CreateOauthClient(ClientID, ClientSecret, RedirectUri) {
+  return new google.auth.OAuth2(ClientID, ClientSecret, RedirectUri);
+}
+
+const { clientId, clientSecret, redirectUri } = loadCredentials();
+
+const OAuthClient = await Authorize(
+  CreateOauthClient(clientId, clientSecret, redirectUri),
+  "Account1",
+  redirectUri
+);
+
+const gmail = google.gmail({ version: "v1", auth: OAuthClient });
+const Profile = await gmail.users.getProfile({ userId: "me" });
+console.log("Profile log: ", Profile.data.emailAddress);
+const Email = Profile.data.emailAddress;
+console.log("Email log: ", Email);
+
+const POLL_INTERVAL_MS = Number(process.env.MAIL_POLL_INTERVAL_MS) || 30000;
+
+// Processes all currently unread messages for the connected inbox.
+async function processUnreadMessages() {
+  const unreadIds = await listUnreadIds(gmail);
+  for (const messageId of unreadIds) {
+    await ProcessEmail(gmail, messageId, "Account1");
+  }
+}
+
+async function listUnreadIds(gmail) {
   const res = await gmail.users.messages.list({
     userId: "me",
-    q: "in:inbox is:unread",
-    maxResults: 5,
+    q: "is:unread",
   });
-
-  let Messages = res.data.messages || [];
-
-  for (const message of Messages) {
-    await processEmail(message.id);
-  }
+  return (res.data.messages || []).map((m) => m.id);
 }
 
-async function poll() {
+// Initial sweep for anything that arrived while the server was offline.
+await processUnreadMessages();
+
+// Continuously poll the inbox so newly arriving unread emails are picked up
+// and broadcast to connected Electron clients.
+setInterval(async () => {
   try {
-    await CheckEmail();
+    await processUnreadMessages();
   } catch (err) {
-    console.error("Gmail polling failed:", err);
+    console.error("Error while polling Gmail for unread messages:", err);
   }
-
-  setTimeout(poll, PollInterval);
-}
-
-poll();
-
-
-// async function listLabels() {
-//   const auth = await authenticate({
-//     scopes: SCOPES,
-//     keyfilePath: CREDENTIALS_PATH,
-//   });
-
-//   const gmail = google.gmail({version: 'v1', auth});
-//   // Get the list of labels.
-//   const result = await gmail.users.labels.list({
-//     userId: 'me',
-//   });
-//   const labels = result.data.labels;
-//   if (!labels || labels.length === 0) {
-//     console.log('No labels found.');
-//     return;
-//   }
-//   console.log('Labels:');
-//   // Print the name of each label.`
-//   labels.forEach((label) => {
-//     console.log(`- ${label.name}`);
-//   });
-// }
-
-await listLabels();
+}, POLL_INTERVAL_MS);

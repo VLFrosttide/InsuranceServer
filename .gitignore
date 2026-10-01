@@ -48,15 +48,25 @@ jspm_packages/
 .env.test.local
 .env.production.local
 .env.local
+
+# OAuth client credentials and runtime token storage (keep secrets out of git)
+token.json
+Mail/token.json
+Mail/tokens/
 credentials.json
 Credentials.json
 client_secret_2_761144659905-echuvrd5p276inrds912qrgvtuj37nh4.apps.googleusercontent.com.json
+
+# Gmail attachments downloaded at runtime (may contain personal data)
+attachments/
+
 dist
 build
 #pics
 renderer/EssencePics/
 renderer/CurrencyPics/
 renderer/SaveIconPics/
+token.js
 
 
 

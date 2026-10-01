@@ -1,66 +1,98 @@
-import { DBConnection, app } from "../main.js";
+"use strict";
 import express from "express";
 import Bcrypt from "bcrypt";
 import Crypto from "crypto";
-let LoginRouter = express.Router();
 
+const ROLE_PAGES = {
+  1: "/admin",
+  2: "/worker",
+  3: "/client",
+};
 
+/**
+ * Login router factory. Receives the DB connection so it does not rely on a
+ * circular import from main.js.
+ *
+ * @param {import("mysql2/promise").Connection} DBConnection
+ * @returns {import("express").Router}
+ */
+export function createLoginRouter(DBConnection) {
+  const router = express.Router();
 
-LoginRouter.post("/logme", async (req, res) => {
-  try {
-    // console.log(req.body);
-    let Username = req.body["username"];
-    let Password = req.body["password"];
+  router.post("/logme", async (req, res) => {
+    try {
+      const Username = req.body["username"];
+      const Password = req.body["password"];
 
-    if (!Username || !Password) {
-      return res.status(400).json({
-        error: "Username and Password are required",
-      });
-    }
+      if (!Username || !Password) {
+        return res.status(400).json({
+          error: "Username and Password are required",
+        });
+      }
 
-    const UsernameCheck = await DBConnection.query(
-      "SELECT * FROM Users WHERE Username = ?",
-      [Username]
-    );
-    console.log("Username Check:", UsernameCheck[0][0].Username);
-    let DBUsername = UsernameCheck[0][0].Username;
-    let DBPassword = UsernameCheck[0][0].Password;
-    let DBRole = UsernameCheck[0][0].Role;
-    if (DBUsername !== Username) {
-      console.log("Username Check Failed:", DBUsername, Username);
-      return res.status(401).json({
-        error: "Invalid username",
-      });
-    }
-    const PasswordCheck = await Bcrypt.compare(Password, DBPassword);
-    console.log("Password Check:", PasswordCheck);
-    if (!PasswordCheck) {
-      console.log("Password Check Failed:");
-      return res.status(401).json({
-        error: "Invalid username or password",
-      });
-    } else {
-      let GeneratedToken = Crypto.randomBytes(32).toString("hex");
-      await DBConnection.query(    "DELETE FROM tokens WHERE Username = ?",[Username]   )
-      let StoredToken = await DBConnection.query(
-        "INSERT INTO tokens (Token, Username, Expires) VALUES (?, ?, NOW()+ INTERVAL 12 HOUR)",
+      const [rows] = await DBConnection.query(
+        "SELECT * FROM Users WHERE Username = ?",
+        [Username]
+      );
+
+      if (rows.length === 0) {
+        return res.status(401).json({ error: "Invalid username or password" });
+      }
+
+      const user = rows[0];
+      const DBPassword = user.Password;
+      const DBRole = user.Role;
+      const DBalance = user.Balance;
+
+      const PasswordCheck = await Bcrypt.compare(Password, DBPassword);
+      if (!PasswordCheck) {
+        return res.status(401).json({
+          error: "Invalid username or password",
+        });
+      }
+
+      const GeneratedToken = Crypto.randomBytes(32).toString("hex");
+      await DBConnection.query("DELETE FROM tokens WHERE Username = ?", [
+        Username,
+      ]);
+      await DBConnection.query(
+        "INSERT INTO tokens (Token, Username, Expires) VALUES (?, ?, NOW() + INTERVAL 12 HOUR)",
         [GeneratedToken, Username]
       );
-      res.cookie("token", StoredToken, {  
+
+      // `secure: false` because local dev runs over plain HTTP.
+      res.cookie("token", GeneratedToken, {
         httpOnly: true,
-        secure: true,
+        secure: false,
+        sameSite: "lax",
       });
-      res.status(200).json({
-  message: "Login successful",
-});
 
+      const targetPage = ROLE_PAGES[String(DBRole)];
+      if (!targetPage) {
+        return res.status(403).json({
+          error: "Access Denied: unknown role",
+        });
+      }
 
-  console.log("Login Successful for user: ", Username);
+      const response = {
+        message: "Login Successful",
+        username: Username,
+        role: String(DBRole),
+        redirectTo: targetPage,
+        token: GeneratedToken,
+      };
+
+      if (DBalance !== null && DBalance !== undefined) {
+        response.balance = DBalance;
+      }
+
+      console.log("Login Successful for user: ", Username, "->", targetPage);
+      return res.status(200).json(response);
+    } catch (err) {
+      console.error("Error during login:", err);
+      return res.status(500).json({ error: "Login Failed" });
     }
-  } catch (err) {
-    console.error("Error during login:", err);
-    res.status(500).json({ error: "Login Failed" });
-  }
-});
+  });
 
-export { LoginRouter };
+  return router;
+}

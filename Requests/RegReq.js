@@ -1,31 +1,75 @@
-import app from "../main.js";
+"use strict";
+// Self-service registration. Anyone can create a "client" (role 3) account.
+// Admin/worker accounts are seeded via db/setup.js (or created at the DB).
+import express from "express";
 import Bcrypt from "bcrypt";
-import Crypto from "crypto";
 
+const VALID_ROLES = new Set(["1", "2", "3"]);
 
-app.post("/userreg", async (req, res) => {
-  try {
-    const { Username, Password, RoleID } = req.body;
-    if (!Username || !Password) {
-      return res
-        .status(400)
-        .json({ error: "Username and password are required" });
-    }
-    let UserRoleID = await DBClient.query(
-      "SELECT RoleID FROM Users WHERE Username = $1",
-      [Username]
-    );
-    if (UserRoleID === "3") {
-      const PassHash = await Bcrypt.hash(Password, 12);
-      let NewUser = await DBClient.query(
-        "INSERT INTO Users (Username, Password, RoleID) VALUES ($1, $2, $3)",
-        [Username, PassHash, RoleID]
+/**
+ * @param {import("mysql2/promise").Connection} DBConnection
+ * @returns {import("express").Router}
+ */
+export function createRegRouter(DBConnection) {
+  const router = express.Router();
+
+  router.post("/userreg", async (req, res) => {
+    try {
+      const Username = req.body.username ?? req.body.Username;
+      const Password = req.body.password ?? req.body.Password;
+      const RoleID = req.body.role ?? req.body.RoleID ?? "3";
+
+      if (!Username || !Password) {
+        return res
+          .status(400)
+          .json({ error: "Username and Password are required" });
+      }
+
+      if (typeof Username !== "string" || Username.length < 2) {
+        return res
+          .status(400)
+          .json({ error: "Username must be at least 2 characters" });
+      }
+
+      if (typeof Password !== "string" || Password.length < 6) {
+        return res
+          .status(400)
+          .json({ error: "Password must be at least 6 characters" });
+      }
+
+      const role = String(RoleID);
+      if (!VALID_ROLES.has(role)) {
+        return res
+          .status(400)
+          .json({
+            error: "RoleID must be one of 1 (admin), 2 (worker), 3 (client)",
+          });
+      }
+
+      const [existing] = await DBConnection.query(
+        "SELECT Username FROM Users WHERE Username = ?",
+        [Username]
       );
-      res.status(201).json({ message: "User Created" });
-    } else {
-      res.status(403).json({ error: "Access Denied" });
+      if (existing.length > 0) {
+        return res.status(409).json({ error: "Username already exists" });
+      }
+
+      const PassHash = await Bcrypt.hash(Password, 12);
+      await DBConnection.query(
+        "INSERT INTO Users (Username, Password, Role, Balance) VALUES (?, ?, ?, 0)",
+        [Username, PassHash, Number(role)]
+      );
+
+      return res.status(201).json({
+        message: "User Created",
+        username: Username,
+        role,
+      });
+    } catch (err) {
+      console.error("Registration failed:", err);
+      return res.status(500).json({ error: "Registration failed" });
     }
-  } catch (err) {
-    res.status(500).json({ error: "Registration failed" });
-  }
-});
+  });
+
+  return router;
+}
