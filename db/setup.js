@@ -111,13 +111,6 @@ async function main() {
       payout: null,
     },
     // Matches the default credentials pre-filled in the Electron login page.
-    {
-      username: "list4e",
-      password: "Pedese50",
-      role: 2,
-      balance: 0,
-      payout: 40,
-    },
   ];
 
   for (const u of users) {

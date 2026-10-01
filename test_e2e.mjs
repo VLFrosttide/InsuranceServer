@@ -103,11 +103,6 @@ async function main() {
     );
     const adminToken = r.data.token;
 
-    // Login (worker) - list4e
-    r = await req("POST", "/logme", {
-      username: "list4e",
-      password: "Pedese50",
-    });
     check(
       "POST /logme worker",
       r.status === 200 && r.data.role === "2",
