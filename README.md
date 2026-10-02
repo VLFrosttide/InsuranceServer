@@ -10,11 +10,11 @@ Electron client (`InsuranceClient`).
 - A `.env` file in the repo root with at least:
 
   ```env
-  DBPassword=your_mysql_root_password
+  DB_PASSWORD=your_mysql_root_password
   ```
 
-  Gmail polling is optional. If you want it, also set `ClientID`, `ClientSecret`,
-  `RedirectUri`, and the `GMAIL_*` token variables.
+  Gmail polling is optional. If you want it, also set `CLIENT_ID`, `CLIENT_SECRET`,
+  `REDIRECT_URI`, and the `GMAIL_*` token variables.
 
 ## One-time database setup
 

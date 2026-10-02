@@ -13,7 +13,7 @@ const httpServer = http.createServer(app);
 let DBConnection = await mysql.createConnection({
   host: "localhost",
   user: "root",
-  password: process.env.DBPassword,
+  password: process.env.DB_PASSWORD,
   database: "insurancedb",
   port: 5500,
 });

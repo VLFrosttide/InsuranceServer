@@ -15,13 +15,13 @@ const TOKEN_ENV_KEYS = {
 };
 
 export function loadCredentials() {
-  const clientId = process.env.ClientID;
-  const clientSecret = process.env.ClientSecret;
-  const redirectUri = process.env.RedirectUri || "http://localhost:3000";
+  const clientId = process.env.CLIENT_ID;
+  const clientSecret = process.env.CLIENT_SECRET;
+  const redirectUri = process.env.REDIRECT_URI || "http://localhost:3000";
 
   if (!clientId || !clientSecret) {
     throw new Error(
-      "Missing OAuth credentials. Set ClientID and ClientSecret in .env"
+      "Missing OAuth credentials. Set CLIENT_ID and CLIENT_SECRET in .env"
     );
   }
 

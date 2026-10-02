@@ -5,7 +5,7 @@
 // Run from the repo root:
 //   node --env-file=.env db/setup.js
 //
-// Requires .env to contain DBPassword (MySQL root password).
+// Requires .env to contain DB_PASSWORD (MySQL root password).
 import mysql from "mysql2/promise";
 import bcrypt from "bcrypt";
 
@@ -13,9 +13,9 @@ const DB_NAME = "insurancedb";
 const DB_PORT = 5500;
 
 async function main() {
-  const password = process.env.DBPassword;
+  const password = process.env.DB_PASSWORD;
   if (!password) {
-    throw new Error("Missing DBPassword in .env");
+    throw new Error("Missing DB_PASSWORD in .env");
   }
 
   // 1) Connect without a database and create it if missing.
