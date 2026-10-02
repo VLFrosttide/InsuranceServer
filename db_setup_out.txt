@@ -1,0 +1,117 @@
+
+> insuranceserver@1.0.0 db:setup
+> node --env-file=.env db/setup.js
+
+Migrated current_cash from per-day to single-balance schema
+Seeded users: admin (role 1), worker (role 2), client (role 3)
+Sample broker:
+{
+  "id": 1,
+  "Name": "Demo Broker",
+  "CashBalance": "1000.00",
+  "Percentage": "10.00",
+  "PolicyRangeStart": 100,
+  "PolicyRangeEnd": 500,
+  "InactivePolicies": 400,
+  "emails": [
+    "demo@broker.example",
+    "sales@broker.example",
+    "support@broker.example"
+  ],
+  "insurances": [
+    {
+      "PolicyNumber": "BG/02/FI26154498",
+      "BlancNumber": "153056",
+      "ClientName": "Ferhat Aktas",
+      "Price": "35",
+      "CurrencyType": "EUR",
+      "BrokerId": 1
+    },
+    {
+      "PolicyNumber": "",
+      "BlancNumber": "487046",
+      "ClientName": "Broker Test Client",
+      "Price": "500",
+      "CurrencyType": "",
+      "BrokerId": 1
+    },
+    {
+      "PolicyNumber": "BG/TEST/1",
+      "BlancNumber": "B1790737773070",
+      "ClientName": "Test Client",
+      "Price": "120",
+      "CurrencyType": "EUR",
+      "BrokerId": 1
+    },
+    {
+      "PolicyNumber": "BG/TEST/1",
+      "BlancNumber": "B1790737851614",
+      "ClientName": "Test Client",
+      "Price": "120",
+      "CurrencyType": "EUR",
+      "BrokerId": 1
+    },
+    {
+      "PolicyNumber": "BG/TEST/1",
+      "BlancNumber": "B1790907373197",
+      "ClientName": "Test Client",
+      "Price": "120",
+      "CurrencyType": "EUR",
+      "BrokerId": 1
+    },
+    {
+      "PolicyNumber": "BG/TEST/1",
+      "BlancNumber": "B1790908586906",
+      "ClientName": "Test Client",
+      "Price": "120",
+      "CurrencyType": "EUR",
+      "BrokerId": 1
+    },
+    {
+      "PolicyNumber": "",
+      "BlancNumber": "DUP1790737851631",
+      "ClientName": "Test Client",
+      "Price": "0",
+      "CurrencyType": "",
+      "BrokerId": 1
+    },
+    {
+      "PolicyNumber": "",
+      "BlancNumber": "DUP1790907373208",
+      "ClientName": "Test Client",
+      "Price": "0",
+      "CurrencyType": "",
+      "BrokerId": 1
+    },
+    {
+      "PolicyNumber": "",
+      "BlancNumber": "DUP1790908586929",
+      "ClientName": "Test Client",
+      "Price": "0",
+      "CurrencyType": "",
+      "BrokerId": 1
+    },
+    {
+      "PolicyNumber": "",
+      "BlancNumber": "DUPTEST1",
+      "ClientName": "Test Client",
+      "Price": "0",
+      "CurrencyType": "",
+      "BrokerId": 1
+    },
+    {
+      "PolicyNumber": "BG/02/TEST5498",
+      "BlancNumber": "TEST-BROKER-001",
+      "ClientName": "Sample Broker Client",
+      "Price": "99",
+      "CurrencyType": "EUR",
+      "BrokerId": 1
+    }
+  ]
+}
+
+Database setup complete.
+Demo logins:
+  admin / AdminPass123  (role 1)
+  worker / WorkerPass123  (role 2)
+  client / ClientPass123  (role 3)

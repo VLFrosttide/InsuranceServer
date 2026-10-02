@@ -7,6 +7,9 @@ const mysql = require("mysql2/promise");
 const { createLoginRouter } = require("./Requests/LoginReq.js");
 const { createRegRouter } = require("./Requests/RegReq.js");
 const { createTierRouter } = require("./Requests/TierEndpoints.js");
+const { createCurrentCashRouter } = require("./Requests/CurrentCash.js");
+const { createCardPaymentsRouter } = require("./Requests/CardPayments.js");
+const { createBrokerRouter } = require("./Requests/Brokers.js");
 const { initWsServer } = require("./Users/websocket.js");
 
 // ---------------------------------------------------------------------------
@@ -126,6 +129,9 @@ async function start() {
     app.use(createLoginRouter(DBConnection));
     app.use(createRegRouter(DBConnection));
     app.use(createTierRouter(DBConnection));
+    app.use(createCurrentCashRouter(DBConnection));
+    app.use(createCardPaymentsRouter(DBConnection));
+    app.use(createBrokerRouter(DBConnection));
 
     initWsServer(httpServer, DBConnection);
     startGmailPolling();

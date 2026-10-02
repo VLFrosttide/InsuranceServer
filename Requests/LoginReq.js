@@ -40,6 +40,11 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
       }
 
       const user = rows[0];
+
+      if (String(user.Status || "active") !== "active") {
+        return res.status(403).json({ error: "Account suspended" });
+      }
+
       const DBPassword = user.Password;
       const DBRole = user.Role;
       const DBalance = user.Balance;
@@ -65,6 +70,7 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
         httpOnly: true,
         secure: false,
         sameSite: "lax",
+        maxAge: 12 * 60 * 60 * 1000, // 12 hours
       });
 
       const targetPage = ROLE_PAGES[String(DBRole)];

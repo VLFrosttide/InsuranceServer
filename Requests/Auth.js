@@ -3,6 +3,9 @@
 // The server authenticates users with a session token that is stored in an
 // httpOnly cookie at login time. To keep API clients (e.g. Electron) flexible,
 // the same token may also be supplied via an Authorization header.
+//
+// Suspended users (users.Status = 'suspended') are rejected even when they
+// present a valid token, so an admin can immediately lock an account out.
 
 /**
  * Extract the session token from either an Authorization header or a cookie.
@@ -43,7 +46,7 @@ module.exports.requireAuth = function requireAuth(DBConnection) {
       }
 
       const [rows] = await DBConnection.query(
-        `SELECT t.Username, u.Role
+        `SELECT t.Username, u.Role, u.Status
            FROM tokens t
            JOIN Users u ON u.Username = t.Username
           WHERE t.Token = ? AND t.Expires > NOW()`,
@@ -54,6 +57,10 @@ module.exports.requireAuth = function requireAuth(DBConnection) {
         return res
           .status(401)
           .json({ error: "Unauthorized: invalid or expired token" });
+      }
+
+      if (String(rows[0].Status || "active") !== "active") {
+        return res.status(403).json({ error: "Account suspended" });
       }
 
       req.user = {
