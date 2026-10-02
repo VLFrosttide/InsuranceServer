@@ -272,23 +272,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             .json({ error: "Forbidden: cannot delete an admin" });
         }
 
-        await DBConnection.beginTransaction();
-        try {
-          await DBConnection.query("DELETE FROM tokens WHERE Username = ?", [
-            username,
-          ]);
-          await DBConnection.query("DELETE FROM Users WHERE Username = ?", [
-            username,
-          ]);
-          await DBConnection.commit();
-        } catch (err) {
-          try {
-            await DBConnection.rollback();
-          } catch {
-            // ignore
-          }
-          throw err;
-        }
+        await DBConnection.withTransaction(async (conn) => {
+          await conn.query("DELETE FROM tokens WHERE Username = ?", [username]);
+          await conn.query("DELETE FROM Users WHERE Username = ?", [username]);
+        });
 
         res.json({ message: "User deleted", username });
       } catch (err) {
@@ -480,9 +467,8 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
       const priceDecimal = toDecimal(price);
 
-      await DBConnection.beginTransaction();
-      try {
-        await DBConnection.query(sql, params);
+      await DBConnection.withTransaction(async (conn) => {
+        await conn.query(sql, params);
 
         // Every created insurance contributes its value to either current cash
         // (PaymentType = "Cash") or the card balance (PaymentType = "Card").
@@ -490,7 +476,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         if (priceDecimal !== null && priceDecimal > 0) {
           if (paymentType === "Cash") {
             await recordCashMovement(
-              DBConnection,
+              conn,
               req.user.username,
               "increase",
               priceDecimal,
@@ -498,7 +484,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             );
           } else {
             await recordCardPayment(
-              DBConnection,
+              conn,
               req.user.username,
               priceDecimal,
               blancNumber
@@ -508,23 +494,14 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
         // Charge the policy against its broker: reduce the broker balance by
         // price × Percentage / 100 and decrement its InactivePolicies.
-        const brokerId = await resolveBrokerId(DBConnection, {
+        const brokerId = await resolveBrokerId(conn, {
           blancNumber,
           brokerId: b.BrokerId ?? b.brokerId ?? null,
         });
         if (brokerId !== null) {
-          await decreaseBrokerForInsurance(DBConnection, brokerId, price);
+          await decreaseBrokerForInsurance(conn, brokerId, price);
         }
-
-        await DBConnection.commit();
-      } catch (err) {
-        try {
-          await DBConnection.rollback();
-        } catch {
-          // ignore
-        }
-        throw err;
-      }
+      });
 
       res.status(201).json({
         message: "Insurance created",

@@ -124,7 +124,51 @@ async function start() {
   });
 
   try {
-    DBConnection = await mysql.createConnection(DB_CONFIG);
+    // Use a pool instead of a single connection. A single connection can be
+    // closed by the MySQL server (idle timeout / network drop) and the app had
+    // no way to recover from that, producing errors such as
+    // "Can't add new command when connection is in closed state".
+    const pool = mysql.createPool({
+      ...DB_CONFIG,
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0,
+      enableKeepAlive: true,
+      keepAliveInitialDelay: 0,
+    });
+
+    DBConnection = pool;
+
+    // Verify we can actually reach MySQL before wiring up the routers. This
+    // keeps the same "degraded /health" behavior we had with a single
+    // connection, while the pool itself handles reconnects at runtime.
+    {
+      const conn = await pool.getConnection();
+      await conn.ping();
+      conn.release();
+    }
+
+    // Transaction helper: run a sequence of statements on one dedicated
+    // connection and atomically roll back on failure. Simple queries may still
+    // use `pool.query(...)` directly (transparent connection reuse).
+    pool.withTransaction = async function withTransaction(fn) {
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        const result = await fn(conn);
+        await conn.commit();
+        return result;
+      } catch (err) {
+        try {
+          await conn.rollback();
+        } catch {
+          // Ignore rollback errors; the original error is more useful.
+        }
+        throw err;
+      } finally {
+        conn.release();
+      }
+    };
 
     app.use(createLoginRouter(DBConnection));
     app.use(createRegRouter(DBConnection));
@@ -138,6 +182,13 @@ async function start() {
 
     console.log("Connected to MySQL database.");
   } catch (err) {
+    if (DBConnection) {
+      try {
+        await DBConnection.end();
+      } catch {
+        // Ignore shutdown errors during the connection-failure path.
+      }
+    }
     console.error(
       "Failed to connect to MySQL database.",
       err && err.message ? err.message : err

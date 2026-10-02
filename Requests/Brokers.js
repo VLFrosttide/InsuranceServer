@@ -379,29 +379,25 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
       const emails = parseBrokerEmails(req.body?.emails) || [];
 
-      await DBConnection.beginTransaction();
       let brokerId;
       try {
-        const [result] = await DBConnection.query(
-          `INSERT INTO brokers
-             (Name, CashBalance, Percentage, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [name, cashBalance, percentage, rangeStart, rangeEnd, inactive]
-        );
-        brokerId = result.insertId;
-        for (const email of emails) {
-          await DBConnection.query(
-            "INSERT INTO broker_emails (BrokerId, Email) VALUES (?, ?)",
-            [brokerId, email]
+        brokerId = await DBConnection.withTransaction(async (conn) => {
+          const [result] = await conn.query(
+            `INSERT INTO brokers
+               (Name, CashBalance, Percentage, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [name, cashBalance, percentage, rangeStart, rangeEnd, inactive]
           );
-        }
-        await DBConnection.commit();
+          const id = result.insertId;
+          for (const email of emails) {
+            await conn.query(
+              "INSERT INTO broker_emails (BrokerId, Email) VALUES (?, ?)",
+              [id, email]
+            );
+          }
+          return id;
+        });
       } catch (err) {
-        try {
-          await DBConnection.rollback();
-        } catch {
-          // ignore
-        }
         if (err?.code === "ER_DUP_ENTRY") {
           return res
             .status(409)
@@ -469,34 +465,28 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         return res.status(400).json({ error: "Nothing to update" });
       }
 
-      await DBConnection.beginTransaction();
       try {
-        if (sets.length > 0) {
-          params.push(brokerId);
-          await DBConnection.query(
-            `UPDATE brokers SET ${sets.join(", ")} WHERE id = ?`,
-            params
-          );
-        }
-        if (emails !== null) {
-          await DBConnection.query(
-            "DELETE FROM broker_emails WHERE BrokerId = ?",
-            [brokerId]
-          );
-          for (const email of emails) {
-            await DBConnection.query(
-              "INSERT INTO broker_emails (BrokerId, Email) VALUES (?, ?)",
-              [brokerId, email]
+        await DBConnection.withTransaction(async (conn) => {
+          if (sets.length > 0) {
+            params.push(brokerId);
+            await conn.query(
+              `UPDATE brokers SET ${sets.join(", ")} WHERE id = ?`,
+              params
             );
           }
-        }
-        await DBConnection.commit();
+          if (emails !== null) {
+            await conn.query("DELETE FROM broker_emails WHERE BrokerId = ?", [
+              brokerId,
+            ]);
+            for (const email of emails) {
+              await conn.query(
+                "INSERT INTO broker_emails (BrokerId, Email) VALUES (?, ?)",
+                [brokerId, email]
+              );
+            }
+          }
+        });
       } catch (err) {
-        try {
-          await DBConnection.rollback();
-        } catch {
-          // ignore
-        }
         if (err?.code === "ER_DUP_ENTRY") {
           return res
             .status(409)
@@ -529,29 +519,17 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         return res.status(404).json({ error: "Broker not found" });
       }
 
-      await DBConnection.beginTransaction();
-      try {
+      await DBConnection.withTransaction(async (conn) => {
         // Detach any linked insurance policies before removing the broker.
-        await DBConnection.query(
+        await conn.query(
           "UPDATE insurance SET BrokerId = NULL WHERE BrokerId = ?",
           [brokerId]
         );
-        await DBConnection.query(
-          "DELETE FROM broker_emails WHERE BrokerId = ?",
-          [brokerId]
-        );
-        await DBConnection.query("DELETE FROM brokers WHERE id = ?", [
+        await conn.query("DELETE FROM broker_emails WHERE BrokerId = ?", [
           brokerId,
         ]);
-        await DBConnection.commit();
-      } catch (err) {
-        try {
-          await DBConnection.rollback();
-        } catch {
-          // ignore
-        }
-        throw err;
-      }
+        await conn.query("DELETE FROM brokers WHERE id = ?", [brokerId]);
+      });
 
       res.json({ message: "Broker deleted", id: brokerId });
     } catch (err) {

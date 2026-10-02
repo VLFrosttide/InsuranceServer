@@ -190,15 +190,15 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
     async (req, res) => {
       try {
         const { amount, reason } = req.body || {};
-        await DBConnection.beginTransaction();
-        const applied = await recordCashMovement(
-          DBConnection,
-          req.user.username,
-          "increase",
-          amount,
-          reasonText(reason)
+        const applied = await DBConnection.withTransaction((conn) =>
+          recordCashMovement(
+            conn,
+            req.user.username,
+            "increase",
+            amount,
+            reasonText(reason)
+          )
         );
-        await DBConnection.commit();
 
         res.status(201).json({
           message: "Current cash increased",
@@ -207,11 +207,6 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
           reason: reasonText(reason),
         });
       } catch (err) {
-        try {
-          await DBConnection.rollback();
-        } catch {
-          // ignore
-        }
         const msg = (err && err.message) || "";
         if (msg.includes("amount") || msg.includes("reason")) {
           return res.status(400).json({ error: msg });
@@ -230,15 +225,15 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
     async (req, res) => {
       try {
         const { amount, reason } = req.body || {};
-        await DBConnection.beginTransaction();
-        const applied = await recordCashMovement(
-          DBConnection,
-          req.user.username,
-          "reduce",
-          amount,
-          reasonText(reason)
+        const applied = await DBConnection.withTransaction((conn) =>
+          recordCashMovement(
+            conn,
+            req.user.username,
+            "reduce",
+            amount,
+            reasonText(reason)
+          )
         );
-        await DBConnection.commit();
 
         res.status(201).json({
           message: "Current cash reduced",
@@ -247,11 +242,6 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
           reason: reasonText(reason),
         });
       } catch (err) {
-        try {
-          await DBConnection.rollback();
-        } catch {
-          // ignore
-        }
         const msg = (err && err.message) || "";
         if (msg.includes("amount") || msg.includes("reason")) {
           return res.status(400).json({ error: msg });
@@ -268,9 +258,9 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
   // POST /currentcash/reset — reset current cash to 0 and record the reset.
   router.post("/currentcash/reset", auth, requireCashRole, async (req, res) => {
     try {
-      await DBConnection.beginTransaction();
-      const kept = await resetCurrentCash(DBConnection, req.user.username);
-      await DBConnection.commit();
+      const kept = await DBConnection.withTransaction((conn) =>
+        resetCurrentCash(conn, req.user.username)
+      );
 
       res.status(200).json({
         message: "Current cash reset",
@@ -278,11 +268,6 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         author: req.user.username,
       });
     } catch (err) {
-      try {
-        await DBConnection.rollback();
-      } catch {
-        // ignore
-      }
       console.error("CurrentCash reset failed:", err);
       res.status(500).json({ error: "Failed to reset current cash" });
     }
