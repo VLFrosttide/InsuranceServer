@@ -1,6 +1,6 @@
-import { SCOPES } from "./constants.js";
-import { loadTokens, persistTokens } from "./secrets.js";
-import obtainAuthCode from "./ObtainCode.js";
+const { SCOPES } = require("./constants.js");
+const { loadTokens, persistTokens } = require("./secrets.js");
+const obtainAuthCode = require("./ObtainCode.js");
 
 async function Authorize(MyClient, Account, RedirectUri) {
   // Tokens are read from the environment (.env), not from a tracked file.
@@ -51,4 +51,4 @@ async function Authorize(MyClient, Account, RedirectUri) {
   return MyClient;
 }
 
-export default Authorize;
+module.exports = Authorize;

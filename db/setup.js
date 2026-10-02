@@ -6,8 +6,8 @@
 //   node --env-file=.env db/setup.js
 //
 // Requires .env to contain DB_PASSWORD (MySQL root password).
-import mysql from "mysql2/promise";
-import bcrypt from "bcrypt";
+const mysql = require("mysql2/promise");
+const bcrypt = require("bcrypt");
 
 const DB_NAME = "insurancedb";
 const DB_PORT = 5500;

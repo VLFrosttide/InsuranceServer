@@ -1,5 +1,5 @@
-import fs from "node:fs";
-import path from "node:path";
+const fs = require("node:fs");
+const path = require("node:path");
 
 // All OAuth credentials and Gmail tokens are supplied exclusively through the
 // .env file (which is gitignored). Nothing in this file contains raw values.
@@ -14,7 +14,7 @@ const TOKEN_ENV_KEYS = {
   expiry_date: "GMAIL_EXPIRY_DATE",
 };
 
-export function loadCredentials() {
+module.exports.loadCredentials = function loadCredentials() {
   const clientId = process.env.CLIENT_ID;
   const clientSecret = process.env.CLIENT_SECRET;
   const redirectUri = process.env.REDIRECT_URI || "http://localhost:3000";
@@ -26,9 +26,9 @@ export function loadCredentials() {
   }
 
   return { clientId, clientSecret, redirectUri };
-}
+};
 
-export function loadTokens() {
+module.exports.loadTokens = function loadTokens() {
   const tokens = {};
 
   if (process.env.GMAIL_ACCESS_TOKEN) {
@@ -48,11 +48,11 @@ export function loadTokens() {
   }
 
   return Object.keys(tokens).length > 0 ? tokens : null;
-}
+};
 
 // Writes refreshed/updated tokens back into the .env file so tokens only ever
 // live in .env (never in source control). Existing comments are preserved.
-export function persistTokens(tokens) {
+module.exports.persistTokens = function persistTokens(tokens) {
   if (!tokens || typeof tokens !== "object") return;
   if (!fs.existsSync(ENV_PATH)) return;
 
@@ -82,4 +82,4 @@ export function persistTokens(tokens) {
   }
 
   fs.writeFileSync(ENV_PATH, updated.join("\n"));
-}
+};

@@ -1,4 +1,4 @@
-import fs from "fs";
+const fs = require("fs");
 
 function PersistRefreshTokens(oAuth2Client, tokenPath, initial) {
   let current = initial;
@@ -8,4 +8,4 @@ function PersistRefreshTokens(oAuth2Client, tokenPath, initial) {
   });
 }
 
-export default PersistRefreshTokens;
+module.exports = PersistRefreshTokens;

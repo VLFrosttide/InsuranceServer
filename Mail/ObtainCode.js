@@ -1,5 +1,5 @@
-import readline from "node:readline";
-import http from "node:http";
+const readline = require("node:readline");
+const http = require("node:http");
 
 function extractCode(value) {
   // Support pasting the full redirect URL or just the raw code.
@@ -116,4 +116,4 @@ function obtainAuthCode(redirectUri) {
   });
 }
 
-export default obtainAuthCode;
+module.exports = obtainAuthCode;

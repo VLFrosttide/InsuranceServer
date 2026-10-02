@@ -40,4 +40,4 @@ function decodeBase64Url(data) {
   return Buffer.from(normalized, "base64");
 }
 
-export default walkParts;
+module.exports = walkParts;

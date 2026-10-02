@@ -1,7 +1,7 @@
 "use strict";
-import express from "express";
-import Bcrypt from "bcrypt";
-import Crypto from "crypto";
+const express = require("express");
+const Bcrypt = require("bcrypt");
+const Crypto = require("crypto");
 
 const ROLE_PAGES = {
   1: "/admin",
@@ -16,7 +16,7 @@ const ROLE_PAGES = {
  * @param {import("mysql2/promise").Connection} DBConnection
  * @returns {import("express").Router}
  */
-export function createLoginRouter(DBConnection) {
+module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
   const router = express.Router();
 
   router.post("/logme", async (req, res) => {
@@ -95,4 +95,4 @@ export function createLoginRouter(DBConnection) {
   });
 
   return router;
-}
+};

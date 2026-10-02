@@ -1,8 +1,8 @@
 "use strict";
 // Self-service registration. Anyone can create a "client" (role 3) account.
 // Admin/worker accounts are seeded via db/setup.js (or created at the DB).
-import express from "express";
-import Bcrypt from "bcrypt";
+const express = require("express");
+const Bcrypt = require("bcrypt");
 
 const VALID_ROLES = new Set(["1", "2", "3"]);
 
@@ -10,7 +10,7 @@ const VALID_ROLES = new Set(["1", "2", "3"]);
  * @param {import("mysql2/promise").Connection} DBConnection
  * @returns {import("express").Router}
  */
-export function createRegRouter(DBConnection) {
+module.exports.createRegRouter = function createRegRouter(DBConnection) {
   const router = express.Router();
 
   router.post("/userreg", async (req, res) => {
@@ -39,11 +39,9 @@ export function createRegRouter(DBConnection) {
 
       const role = String(RoleID);
       if (!VALID_ROLES.has(role)) {
-        return res
-          .status(400)
-          .json({
-            error: "RoleID must be one of 1 (admin), 2 (worker), 3 (client)",
-          });
+        return res.status(400).json({
+          error: "RoleID must be one of 1 (admin), 2 (worker), 3 (client)",
+        });
       }
 
       const [existing] = await DBConnection.query(
@@ -72,4 +70,4 @@ export function createRegRouter(DBConnection) {
   });
 
   return router;
-}
+};

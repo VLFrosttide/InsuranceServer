@@ -9,7 +9,7 @@
  * @param {import("express").Request} req
  * @returns {string | null}
  */
-export function extractToken(req) {
+const extractToken = (module.exports.extractToken = function extractToken(req) {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
     return authHeader.slice("Bearer ".length).trim() || null;
@@ -25,7 +25,7 @@ export function extractToken(req) {
   }
 
   return null;
-}
+});
 
 /**
  * Middleware factory that requires a valid, unexpired session token.
@@ -34,7 +34,7 @@ export function extractToken(req) {
  * @param {import("mysql2/promise").Connection} DBConnection
  * @returns {import("express").RequestHandler}
  */
-export function requireAuth(DBConnection) {
+module.exports.requireAuth = function requireAuth(DBConnection) {
   return async (req, res, next) => {
     try {
       const token = extractToken(req);
@@ -66,7 +66,7 @@ export function requireAuth(DBConnection) {
       return res.status(500).json({ error: "Authentication failed" });
     }
   };
-}
+};
 
 /**
  * Middleware that restricts a route to the given roles.
@@ -75,7 +75,7 @@ export function requireAuth(DBConnection) {
  * @param {...(string|number)} allowedRoles
  * @returns {import("express").RequestHandler}
  */
-export function requireRole(...allowedRoles) {
+module.exports.requireRole = function requireRole(...allowedRoles) {
   const allowed = allowedRoles.map(String);
   return (req, res, next) => {
     if (!req.user) {
@@ -88,4 +88,4 @@ export function requireRole(...allowedRoles) {
     }
     next();
   };
-}
+};

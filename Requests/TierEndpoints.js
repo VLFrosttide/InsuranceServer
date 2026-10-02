@@ -9,8 +9,8 @@
 // Every route below is protected by `requireAuth` and further restricted with
 // `requireRole`, so a user can only reach endpoints matching their tier.
 
-import express from "express";
-import { requireAuth, requireRole } from "./Auth.js";
+const express = require("express");
+const { requireAuth, requireRole } = require("./Auth.js");
 
 /**
  * Parse a human/duration value into an integer number of days.
@@ -33,7 +33,7 @@ function parseDurationDays(value) {
  * @param {import("mysql2/promise").Connection} DBConnection
  * @returns {import("express").Router}
  */
-export function createTierRouter(DBConnection) {
+module.exports.createTierRouter = function createTierRouter(DBConnection) {
   const router = express.Router();
   const auth = requireAuth(DBConnection);
 
@@ -376,4 +376,4 @@ export function createTierRouter(DBConnection) {
   });
 
   return router;
-}
+};

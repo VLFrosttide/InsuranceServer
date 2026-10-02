@@ -1,8 +1,8 @@
 "use strict";
-import fs from "node:fs";
-import path from "node:path";
-import walkParts from "./walkParts.js";
-import { notifyUnreadEmail } from "../Users/websocket.js";
+const fs = require("node:fs");
+const path = require("node:path");
+const walkParts = require("./walkParts.js");
+const { notifyUnreadEmail } = require("../Users/websocket.js");
 
 const SAVE_TO_DISK = process.env.SAVE_ATTACHMENTS_TO_DISK !== "0";
 const ATTACHMENTS_DIR = path.resolve(
@@ -11,7 +11,7 @@ const ATTACHMENTS_DIR = path.resolve(
 const RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
 /** In-memory store of every attachment found while processing mail. */
-export const attachments = [];
+const attachments = (module.exports.attachments = []);
 
 function headerValue(headers, name) {
   const h = (headers || []).find(
@@ -88,7 +88,11 @@ async function fetchAttachmentBytes(gmail, messageId, meta) {
  * @param {string} messageId
  * @param {string} account
  */
-export async function ProcessEmail(gmail, messageId, account) {
+module.exports.ProcessEmail = async function ProcessEmail(
+  gmail,
+  messageId,
+  account
+) {
   const res = await gmail.users.messages.get({
     userId: "me",
     id: messageId,
@@ -156,4 +160,4 @@ export async function ProcessEmail(gmail, messageId, account) {
     id: messageId,
     requestBody: { removeLabelIds: ["UNREAD"] },
   });
-}
+};

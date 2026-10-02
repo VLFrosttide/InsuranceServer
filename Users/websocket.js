@@ -1,4 +1,4 @@
-import { WebSocketServer, WebSocket } from "ws";
+const { WebSocketServer, WebSocket } = require("ws");
 
 let wss = null;
 let db = null;
@@ -13,7 +13,7 @@ const EMAIL_UPDATE_ROLE = "2";
  * @param {import("http").Server} server  Existing HTTP server (port 5501).
  * @param {import("mysql2/promise").Connection} DBConnection  MySQL connection.
  */
-export function initWsServer(server, DBConnection) {
+module.exports.initWsServer = function initWsServer(server, DBConnection) {
   db = DBConnection;
   wss = new WebSocketServer({ noServer: true });
 
@@ -65,7 +65,7 @@ export function initWsServer(server, DBConnection) {
   }, 30000);
 
   return wss;
-}
+};
 
 async function handleMessage(ws, data) {
   let msg;
@@ -111,7 +111,7 @@ async function handleMessage(ws, data) {
  * @param {Object} emailInfo  Details about the unread email.
  * @returns {number} Number of clients the notification was delivered to.
  */
-export function notifyUnreadEmail(emailInfo) {
+module.exports.notifyUnreadEmail = function notifyUnreadEmail(emailInfo) {
   if (!wss) return 0;
 
   let delivered = 0;
@@ -129,7 +129,7 @@ export function notifyUnreadEmail(emailInfo) {
   }
 
   return delivered;
-}
+};
 
 /**
  * Send an arbitrary payload to all connected sockets belonging to a specific
@@ -139,7 +139,7 @@ export function notifyUnreadEmail(emailInfo) {
  * @param {*} [payload]  Data to send (object or string).
  * @returns {number} Number of clients the payload was delivered to.
  */
-export function sendToUser(username, payload) {
+module.exports.sendToUser = function sendToUser(username, payload) {
   if (!wss) return 0;
 
   const message =
@@ -154,4 +154,4 @@ export function sendToUser(username, payload) {
   }
 
   return delivered;
-}
+};

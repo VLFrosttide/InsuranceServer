@@ -1,1 +1,1 @@
-export const SCOPES = ["https://www.googleapis.com/auth/gmail.modify"];
+module.exports.SCOPES = ["https://www.googleapis.com/auth/gmail.modify"];
