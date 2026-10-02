@@ -30,7 +30,6 @@ This creates the `insurancedb` database, adds any missing columns, creates the
 | admin    | AdminPass123  | admin  |
 | worker   | WorkerPass123 | worker |
 | client   | ClientPass123 | client |
-| list4e   | Pedese50      | worker |
 
 ## Run the server
 
