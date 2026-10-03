@@ -15,12 +15,13 @@ const { notifyUnreadEmail } = require("../Users/websocket.js");
 const TEST_EMAIL_SUBJECT =
   "1,21- ANET SAHAKOĞLU - 34 PJY 807 - 1MES: 22.09.2026 - BI: 156423";
 
-// Picture placed in the InsuranceClient/Test folder, used as a test attachment.
+// Picture placed in this server repo's Test folder, used as a test
+// attachment. Keeping it inside the server repo (rather than referencing a
+// sibling InsuranceClient folder) ensures the path resolves on the deployed
+// server, where only InsuranceServer is checked out.
 const TEST_ATTACHMENT_PATH = path.resolve(
   __dirname,
   "..",
-  "..",
-  "InsuranceClient",
   "Test",
   "IMG-20260508-WA0012.jpg"
 );
