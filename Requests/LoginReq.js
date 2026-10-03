@@ -19,13 +19,26 @@ const ROLE_PAGES = {
 module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
   const router = express.Router();
 
+  // Terse, structured logging for each login attempt and its final response.
+  // The response is logged as a quick summary (status + message/error), never
+  // the entire Express response object.
+  function sendLoginResponse(res, status, body) {
+    const summary = (body && (body.message || body.error)) || "";
+    console.log(`Login response: ${status}${summary ? " - " + summary : ""}`);
+    return res.status(status).json(body);
+  }
+
   router.post("/logme", async (req, res) => {
     try {
       const Username = req.body["username"];
       const Password = req.body["password"];
 
+      console.log(
+        `Login attempt for user: ${Username || "(missing username)"}`
+      );
+
       if (!Username || !Password) {
-        return res.status(400).json({
+        return sendLoginResponse(res, 400, {
           error: "Username and Password are required",
         });
       }
@@ -36,13 +49,15 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
       );
 
       if (rows.length === 0) {
-        return res.status(401).json({ error: "Invalid username or password" });
+        return sendLoginResponse(res, 401, {
+          error: "Invalid username or password",
+        });
       }
 
       const user = rows[0];
 
       if (String(user.Status || "active") !== "active") {
-        return res.status(403).json({ error: "Account suspended" });
+        return sendLoginResponse(res, 403, { error: "Account suspended" });
       }
 
       const DBPassword = user.Password;
@@ -51,7 +66,7 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
 
       const PasswordCheck = await Bcrypt.compare(Password, DBPassword);
       if (!PasswordCheck) {
-        return res.status(401).json({
+        return sendLoginResponse(res, 401, {
           error: "Invalid username or password",
         });
       }
@@ -75,7 +90,7 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
 
       const targetPage = ROLE_PAGES[String(DBRole)];
       if (!targetPage) {
-        return res.status(403).json({
+        return sendLoginResponse(res, 403, {
           error: "Access Denied: unknown role",
         });
       }
@@ -92,11 +107,10 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
         response.balance = DBalance;
       }
 
-      console.log("Login Successful for user: ", Username, "->", targetPage);
-      return res.status(200).json(response);
+      return sendLoginResponse(res, 200, response);
     } catch (err) {
       console.error("Error during login:", err);
-      return res.status(500).json({ error: "Login Failed" });
+      return sendLoginResponse(res, 500, { error: "Login Failed" });
     }
   });
 

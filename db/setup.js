@@ -9,35 +9,62 @@
 const mysql = require("mysql2/promise");
 const bcrypt = require("bcrypt");
 
-const DB_NAME = process.env.DB_NAME || "insurancedb";
-const DB_PORT = 5500;
-
-async function main() {
-  const password = process.env.DB_PASSWORD;
+/**
+ * Run the idempotent schema creation + test-data seed.
+ *
+ * @param {{host?: string, port?: number|string, user?: string,
+ *          password?: string, database?: string}} [config]
+ *   Optional connection overrides. Falls back to env vars / sensible local
+ *   defaults so the script still runs standalone (`npm run db:setup`).
+ */
+async function runSetup(config = {}) {
+  const DB_NAME = config.database || process.env.DB_NAME || "insurancedb";
+  const host = config.host || process.env.DB_HOST || "localhost";
+  const user = config.user || process.env.DB_USER || "root";
+  const port = Number(config.port || process.env.DB_PORT || 5500);
+  const password = config.password || process.env.DB_PASSWORD;
   if (!password) {
     throw new Error("Missing DB_PASSWORD in .env");
   }
 
-  // 1) Connect without a database and create it if missing.
-  const server = await mysql.createConnection({
-    host: "localhost",
-    user: "root",
-    password,
-    port: DB_PORT,
-  });
-  await server.query(
-    `CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`
-     CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`
-  );
-  await server.end();
+  // 1) Try the target database directly first. On shared/released hosting the
+  // database is usually pre-provisioned and the DB user often lacks the
+  // server-level CREATE privilege, so only issue CREATE DATABASE when the
+  // database does not exist yet (error 1049 = ER_BAD_DB_ERROR).
+  let db;
+  try {
+    db = await mysql.createConnection({
+      host,
+      user,
+      password,
+      database: DB_NAME,
+      port,
+    });
+  } catch (err) {
+    if (!err || err.code !== "ER_BAD_DB_ERROR") {
+      throw err;
+    }
 
-  const db = await mysql.createConnection({
-    host: "localhost",
-    user: "root",
-    password,
-    database: DB_NAME,
-    port: DB_PORT,
-  });
+    const server = await mysql.createConnection({
+      host,
+      user,
+      password,
+      port,
+    });
+    await server.query(
+      `CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`
+       CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`
+    );
+    await server.end();
+
+    db = await mysql.createConnection({
+      host,
+      user,
+      password,
+      database: DB_NAME,
+      port,
+    });
+  }
 
   // 1b) Create the core `users` and `insurance` tables when they are missing.
   // This makes the script work against a completely empty database. Existing
@@ -337,16 +364,21 @@ async function main() {
     // Matches the default credentials pre-filled in the Electron login page.
   ];
 
+  // Insert demo accounts only when they are missing. Because this now runs on
+  // every server start, we must NOT overwrite existing rows (an operator may
+  // have changed a password or balance; a restart must not reset that).
   for (const u of users) {
+    const [existing] = await db.query(
+      "SELECT Username FROM users WHERE Username = ?",
+      [u.username]
+    );
+    if (existing.length > 0) {
+      continue;
+    }
     const hash = await bcrypt.hash(u.password, 12);
     await db.query(
       `INSERT INTO users (Username, Password, Role, Balance, PayoutPercentage)
-       VALUES (?, ?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE
-         Password = VALUES(Password),
-         Role = VALUES(Role),
-         Balance = VALUES(Balance),
-         PayoutPercentage = VALUES(PayoutPercentage)`,
+       VALUES (?, ?, ?, ?, ?)`,
       [u.username, hash, u.role, u.balance, u.payout]
     );
   }
@@ -388,17 +420,19 @@ async function main() {
 
   // 7) Seed a demo broker (multiple emails, cash balance, policy range,
   //    total given policies) and link insurances to it.
-  await db.query(
-    `INSERT INTO brokers (Name, CashBalance, Percentage, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
-     VALUES (?, ?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE
-       CashBalance = VALUES(CashBalance),
-       Percentage = VALUES(Percentage),
-       PolicyRangeStart = VALUES(PolicyRangeStart),
-       PolicyRangeEnd = VALUES(PolicyRangeEnd),
-       InactivePolicies = VALUES(InactivePolicies)`,
-    ["Demo Broker", 1000, 10, 100, 500, 400]
+  // Insert the demo broker only when missing so a restart does not reset its
+  // balance/percentage back to the seed values.
+  const [brokerExisting] = await db.query(
+    "SELECT id FROM brokers WHERE Name = ?",
+    ["Demo Broker"]
   );
+  if (brokerExisting.length === 0) {
+    await db.query(
+      `INSERT INTO brokers (Name, CashBalance, Percentage, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      ["Demo Broker", 1000, 10, 100, 500, 400]
+    );
+  }
 
   const [[brokerRow]] = await db.query(
     "SELECT id FROM brokers WHERE Name = ?",
@@ -488,7 +522,12 @@ async function main() {
   await db.end();
 }
 
-main().catch((err) => {
-  console.error("Database setup failed:", err);
-  process.exitCode = 1;
-});
+module.exports = { runSetup };
+
+// Allow `npm run db:setup` to run this file directly.
+if (require.main === module) {
+  runSetup().catch((err) => {
+    console.error("Database setup failed:", err);
+    process.exitCode = 1;
+  });
+}

@@ -11,6 +11,7 @@ const { createCurrentCashRouter } = require("./Requests/CurrentCash.js");
 const { createCardPaymentsRouter } = require("./Requests/CardPayments.js");
 const { createBrokerRouter } = require("./Requests/Brokers.js");
 const { initWsServer } = require("./Users/websocket.js");
+const { runSetup } = require("./db/setup.js");
 
 // ---------------------------------------------------------------------------
 // Optional .env loading.
@@ -116,14 +117,37 @@ async function start() {
     next();
   });
 
-  // Start the HTTP listener immediately. Hostinger's startup watchdog requires
-  // `listen()` to be called within a few seconds, so it must never be gated
-  // behind the (potentially slow or failing) database connection below.
-  httpServer.listen(PORT, HOST, () => {
-    console.log(`Server listening on http://${HOST}:${PORT}`);
-  });
+  // Bind the socket immediately (no readiness log yet). Hostinger's startup
+  // watchdog requires `listen()` to be called within a few seconds, so it must
+  // never be gated behind the (potentially slow) database setup below. The
+  // "Server listening" readiness log is emitted later, after the routers (or
+  // the degraded /health fallback) are registered.
+  httpServer.listen(PORT, HOST);
 
   try {
+    // Ensure the schema and seed/test data exist BEFORE the pool is verified.
+    // `runSetup` creates the database when it is missing, so running it first
+    // lets a brand-new (deployed) database be created and seeded. It is also
+    // idempotent, so it is safe to call on every start. Any seed failure is
+    // non-fatal here: the code below still attempts the pool connection so the
+    // server can report a degraded /health instead of crashing (e.g. on shared
+    // hosting where the DB user lacks CREATE/ALTER privileges).
+    try {
+      await runSetup({
+        host: DB_CONFIG.host,
+        user: DB_CONFIG.user,
+        password: DB_CONFIG.password,
+        database: DB_CONFIG.database,
+        port: DB_CONFIG.port,
+      });
+      console.log("Database schema and test data are ready.");
+    } catch (seedErr) {
+      console.warn(
+        "Database auto-seed skipped:",
+        seedErr && seedErr.message ? seedErr.message : seedErr
+      );
+    }
+
     // Use a pool instead of a single connection. A single connection can be
     // closed by the MySQL server (idle timeout / network drop) and the app had
     // no way to recover from that, producing errors such as
@@ -147,6 +171,8 @@ async function start() {
       await conn.ping();
       conn.release();
     }
+
+    console.log("Connected to MySQL database.");
 
     // Transaction helper: run a sequence of statements on one dedicated
     // connection and atomically roll back on failure. Simple queries may still
@@ -180,7 +206,7 @@ async function start() {
     initWsServer(httpServer, DBConnection);
     startGmailPolling();
 
-    console.log("Connected to MySQL database.");
+    console.log(`Server listening on http://${HOST}:${PORT}`);
   } catch (err) {
     if (DBConnection) {
       try {
@@ -208,6 +234,8 @@ async function start() {
         .status(503)
         .json({ status: "degraded", error: "Database unavailable" });
     });
+
+    console.log(`Server listening on http://${HOST}:${PORT} (degraded)`);
   }
 }
 
