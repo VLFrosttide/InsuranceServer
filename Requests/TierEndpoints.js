@@ -61,13 +61,6 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   const auth = requireAuth(DBConnection);
 
   // ---------------------------------------------------------------------
-  // Public
-  // ---------------------------------------------------------------------
-  router.get("/health", (req, res) => {
-    res.json({ status: "ok", service: "InsuranceServer" });
-  });
-
-  // ---------------------------------------------------------------------
   // Admin tier (role 1)
   // ---------------------------------------------------------------------
   router.get("/admin", auth, requireRole(1), (req, res) => {

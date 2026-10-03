@@ -117,11 +117,72 @@ async function start() {
     next();
   });
 
-  // Bind the socket immediately (no readiness log yet). Hostinger's startup
-  // watchdog requires `listen()` to be called within a few seconds, so it must
-  // never be gated behind the (potentially slow) database setup below. The
-  // "Server listening" readiness log is emitted later, after the routers (or
-  // the degraded /health fallback) are registered.
+  // Create the connection pool immediately. A pool does not open a socket
+  // until the first query, so mounting routes and binding the HTTP server is
+  // never blocked by MySQL availability. Endpoints stay registered even when
+  // the database is temporarily unreachable (they then surface a real DB
+  // error instead of a misleading Express 404).
+  const pool = mysql.createPool({
+    ...DB_CONFIG,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 0,
+  });
+
+  // Transaction helper: run a sequence of statements on one dedicated
+  // connection and atomically roll back on failure. Simple queries may still
+  // use `pool.query(...)` directly (transparent connection reuse).
+  pool.withTransaction = async function withTransaction(fn) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const result = await fn(conn);
+      await conn.commit();
+      return result;
+    } catch (err) {
+      try {
+        await conn.rollback();
+      } catch {
+        // Ignore rollback errors; the original error is more useful.
+      }
+      throw err;
+    } finally {
+      conn.release();
+    }
+  };
+
+  DBConnection = pool;
+
+  // Mount every router up front so its routes are always available. The
+  // routers only touch DBConnection at request time, so this is safe even
+  // before the first successful database ping. This guarantees /logme (and
+  // every other endpoint) never returns a bare 404 just because the MySQL
+  // setup/verification below has not completed or failed.
+  app.use(createLoginRouter(DBConnection));
+  app.use(createRegRouter(DBConnection));
+  app.use(createTierRouter(DBConnection));
+  app.use(createCurrentCashRouter(DBConnection));
+  app.use(createCardPaymentsRouter(DBConnection));
+  app.use(createBrokerRouter(DBConnection));
+
+  // Live state used by /health. It becomes true only after a successful
+  // database ping, so /health accurately reports degraded vs. ready.
+  let dbHealthy = false;
+
+  app.get("/health", (req, res) => {
+    if (dbHealthy) {
+      return res.json({ status: "ok", service: "InsuranceServer" });
+    }
+    return res
+      .status(503)
+      .json({ status: "degraded", error: "Database unavailable" });
+  });
+
+  // Bind the socket immediately. Hostinger's startup watchdog requires
+  // `listen()` to be called within a few seconds, so it must never be gated
+  // behind the (potentially slow) database setup below.
   httpServer.listen(PORT, HOST);
 
   try {
@@ -130,8 +191,7 @@ async function start() {
     // lets a brand-new (deployed) database be created and seeded. It is also
     // idempotent, so it is safe to call on every start. Any seed failure is
     // non-fatal here: the code below still attempts the pool connection so the
-    // server can report a degraded /health instead of crashing (e.g. on shared
-    // hosting where the DB user lacks CREATE/ALTER privileges).
+    // server can report a degraded /health instead of crashing.
     try {
       await runSetup({
         host: DB_CONFIG.host,
@@ -148,73 +208,22 @@ async function start() {
       );
     }
 
-    // Use a pool instead of a single connection. A single connection can be
-    // closed by the MySQL server (idle timeout / network drop) and the app had
-    // no way to recover from that, producing errors such as
-    // "Can't add new command when connection is in closed state".
-    const pool = mysql.createPool({
-      ...DB_CONFIG,
-      waitForConnections: true,
-      connectionLimit: 10,
-      queueLimit: 0,
-      enableKeepAlive: true,
-      keepAliveInitialDelay: 0,
-    });
-
-    DBConnection = pool;
-
-    // Verify we can actually reach MySQL before wiring up the routers. This
-    // keeps the same "degraded /health" behavior we had with a single
-    // connection, while the pool itself handles reconnects at runtime.
+    // Verify we can actually reach MySQL. The pool itself handles reconnects
+    // at runtime; this check only drives the /health readiness signal.
     {
       const conn = await pool.getConnection();
       await conn.ping();
       conn.release();
     }
 
+    dbHealthy = true;
     console.log("Connected to MySQL database.");
-
-    // Transaction helper: run a sequence of statements on one dedicated
-    // connection and atomically roll back on failure. Simple queries may still
-    // use `pool.query(...)` directly (transparent connection reuse).
-    pool.withTransaction = async function withTransaction(fn) {
-      const conn = await pool.getConnection();
-      try {
-        await conn.beginTransaction();
-        const result = await fn(conn);
-        await conn.commit();
-        return result;
-      } catch (err) {
-        try {
-          await conn.rollback();
-        } catch {
-          // Ignore rollback errors; the original error is more useful.
-        }
-        throw err;
-      } finally {
-        conn.release();
-      }
-    };
-
-    app.use(createLoginRouter(DBConnection));
-    app.use(createRegRouter(DBConnection));
-    app.use(createTierRouter(DBConnection));
-    app.use(createCurrentCashRouter(DBConnection));
-    app.use(createCardPaymentsRouter(DBConnection));
-    app.use(createBrokerRouter(DBConnection));
 
     initWsServer(httpServer, DBConnection);
     startGmailPolling();
 
     console.log(`Server listening on http://${HOST}:${PORT}`);
   } catch (err) {
-    if (DBConnection) {
-      try {
-        await DBConnection.end();
-      } catch {
-        // Ignore shutdown errors during the connection-failure path.
-      }
-    }
     console.error(
       "Failed to connect to MySQL database.",
       err && err.message ? err.message : err
@@ -225,15 +234,9 @@ async function start() {
     console.error(
       "Set DB_HOST, DB_PORT, DB_USER, DB_PASSWORD and DB_NAME environment " +
         "variables (or create a .env file) and restart. The HTTP server stays " +
-        "up in a degraded state so /health can be reached."
+        "up in a degraded state so /health can be reached; routes remain " +
+        "registered and return a real error instead of a JSON 404."
     );
-
-    // Expose a degraded health endpoint instead of crashing before listen().
-    app.get("/health", (req, res) => {
-      res
-        .status(503)
-        .json({ status: "degraded", error: "Database unavailable" });
-    });
 
     console.log(`Server listening on http://${HOST}:${PORT} (degraded)`);
   }
