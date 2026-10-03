@@ -1,4 +1,5 @@
 const { WebSocketServer, WebSocket } = require("ws");
+const mailStore = require("../Mail/mailStore.js");
 
 let wss = null;
 let db = null;
@@ -101,6 +102,61 @@ async function handleMessage(ws, data) {
     }
   } else if (msg.type === "ping") {
     ws.send(JSON.stringify({ type: "pong" }));
+  } else if (msg.type === "list_emails") {
+    if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
+      ws.send(JSON.stringify({ type: "list_emails", data: [] }));
+      return;
+    }
+    const data = mailStore.listAll();
+    ws.send(JSON.stringify({ type: "list_emails", data }));
+  } else if (msg.type === "claim_email") {
+    if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
+      return;
+    }
+    const messageId = msg.messageId || null;
+    const email = messageId ? mailStore.get(messageId) : null;
+    if (!email) {
+      ws.send(
+        JSON.stringify({ type: "claim_email", ok: false, error: "Not found" })
+      );
+      return;
+    }
+    const ok = mailStore.claim(messageId, ws.username);
+    if (ok) {
+      broadcast({ type: "email_claimed", messageId });
+    }
+    ws.send(JSON.stringify({ type: "claim_email", ok, messageId }));
+  } else if (msg.type === "release_email") {
+    if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
+      return;
+    }
+    const messageId = msg.messageId || null;
+    const claimer = mailStore.getClaimer(messageId);
+    // Only the worker that holds the claim may return it to everyone. Carry
+    // the full email so clients without it can reconstruct the card.
+    if (!claimer || claimer === ws.username) {
+      mailStore.unclaim(messageId);
+      if (claimer === ws.username) {
+        const email = mailStore.get(messageId);
+        if (email) broadcast({ type: "email_released", data: email });
+      }
+    }
+  } else if (msg.type === "complete_email") {
+    if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
+      return;
+    }
+    const messageId = msg.messageId || null;
+    const email = messageId ? mailStore.get(messageId) : null;
+    if (!email) return;
+
+    mailStore.remove(messageId);
+    // Only now mark the Gmail message read (the worker finished the form).
+    try {
+      await mailStore.markRead(messageId);
+    } catch (err) {
+      console.error("Failed to mark email as read:", err);
+    }
+    broadcast({ type: "email_completed", messageId });
   }
 }
 
@@ -112,10 +168,22 @@ async function handleMessage(ws, data) {
  * @returns {number} Number of clients the notification was delivered to.
  */
 module.exports.notifyUnreadEmail = function notifyUnreadEmail(emailInfo) {
+  return broadcast({ type: "new_email", data: emailInfo });
+};
+
+/**
+ * Send a payload to every connected, authenticated client belonging to the
+ * designated email-update role.
+ *
+ * @param {Object} payload  Message to deliver to workers.
+ * @returns {number} Number of clients the notification was delivered to.
+ */
+function broadcast(payload) {
   if (!wss) return 0;
 
   let delivered = 0;
-  const payload = JSON.stringify({ type: "new_email", data: emailInfo });
+  const message =
+    typeof payload === "string" ? payload : JSON.stringify(payload);
 
   for (const client of wss.clients) {
     if (
@@ -123,13 +191,13 @@ module.exports.notifyUnreadEmail = function notifyUnreadEmail(emailInfo) {
       client.username &&
       String(client.role) === EMAIL_UPDATE_ROLE
     ) {
-      client.send(payload);
+      client.send(message);
       delivered++;
     }
   }
 
   return delivered;
-};
+}
 
 /**
  * Send an arbitrary payload to all connected sockets belonging to a specific

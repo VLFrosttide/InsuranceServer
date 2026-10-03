@@ -3,6 +3,7 @@ const { google } = require("googleapis");
 const { ProcessEmail } = require("./ProcessEmail.js");
 const { loadCredentials } = require("./secrets.js");
 const Authorize = require("./Authorize.js");
+const mailStore = require("./mailStore.js");
 
 let MailPhotos = [];
 
@@ -42,6 +43,7 @@ async function init() {
   );
 
   const gmail = google.gmail({ version: "v1", auth: OAuthClient });
+  mailStore.setGmail(gmail);
   const Profile = await gmail.users.getProfile({ userId: "me" });
   console.log("Profile log: ", Profile.data.emailAddress);
   const Email = Profile.data.emailAddress;

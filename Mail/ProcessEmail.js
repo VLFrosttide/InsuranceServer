@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const walkParts = require("./walkParts.js");
 const { notifyUnreadEmail } = require("../Users/websocket.js");
+const mailStore = require("./mailStore.js");
 
 const SAVE_TO_DISK = process.env.SAVE_ATTACHMENTS_TO_DISK !== "0";
 const ATTACHMENTS_DIR = path.resolve(
@@ -116,10 +117,17 @@ module.exports.ProcessEmail = async function ProcessEmail(
     subject: headerValue(headers, "Subject"),
     date: headerValue(headers, "Date"),
     body: body || "",
+    attachments: [],
   };
 
-  // Send info to all connected, authenticated clients.
-  notifyUnreadEmail(emailInfo);
+  // Skip work we already know about (e.g. because the server restarted before
+  // a worker completed the form). The message is only marked read on complete.
+  if (mailStore.has(messageId)) {
+    return;
+  }
+
+  // Store the email so workers can list/claim it after the broadcast.
+  mailStore.add(emailInfo);
 
   console.log("======== UNREAD MESSAGE ========");
   console.log(`Account: ${account}`);
@@ -133,31 +141,43 @@ module.exports.ProcessEmail = async function ProcessEmail(
 
   const usedNames = new Set();
   for (const meta of bag.attachmentParts) {
-    const data = await fetchAttachmentBytes(gmail, messageId, meta);
-    const filename = uniqueFileName(meta.filename, usedNames);
-    const item = {
-      account,
-      messageId,
-      filename,
-      mimeType: meta.mimeType,
-      size: data.length,
-      data,
-    };
-    attachments.push(item);
-    console.log(`- ${item.filename} (${item.mimeType}, ${item.size} bytes)`);
+    try {
+      const data = await fetchAttachmentBytes(gmail, messageId, meta);
+      const filename = uniqueFileName(meta.filename, usedNames);
+      const item = {
+        account,
+        messageId,
+        filename,
+        mimeType: meta.mimeType,
+        size: data.length,
+        data,
+      };
+      attachments.push(item);
+      console.log(`- ${item.filename} (${item.mimeType}, ${item.size} bytes)`);
 
-    if (SAVE_TO_DISK) {
-      const dir = path.join(ATTACHMENTS_DIR, account, messageId);
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, filename), data);
+      // Expose the attachment to the Electron clients. Only inline a base64
+      // payload when it is reasonably small; large files are still saved to
+      // disk and can be referenced by filename.
+      emailInfo.attachments.push({
+        filename,
+        mimeType: meta.mimeType || "application/octet-stream",
+        size: data.length,
+        base64: data.length <= 5 * 1024 * 1024 ? data.toString("base64") : null,
+      });
+
+      if (SAVE_TO_DISK) {
+        const dir = path.join(ATTACHMENTS_DIR, account, messageId);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, filename), data);
+      }
+    } catch (err) {
+      console.error(`Failed to process attachment "${meta.filename}":`, err);
     }
   }
   if (!bag.attachmentParts.length) console.log("(none)");
   console.log("===============================\n");
 
-  await gmail.users.messages.modify({
-    userId: "me",
-    id: messageId,
-    requestBody: { removeLabelIds: ["UNREAD"] },
-  });
+  // Broadcast only after attachments are attached so cards carry the full
+  // email (body + pictures) when a worker opens it.
+  notifyUnreadEmail(emailInfo);
 };
