@@ -226,8 +226,8 @@ Log in with any of the demo accounts above. The client routes by role:
 
 ## HTTP API
 
-- `POST /logme` — login (sets an HttpOnly session cookie; the token is NOT in
-  the JSON body)
+- `POST /logme` — login (sets an HttpOnly session cookie and also returns the
+  token in the JSON body so the Electron client can use Bearer auth)
 - `POST /userreg` — register a new client account
 - `GET /health` — liveness check
 
@@ -237,7 +237,9 @@ an `Authorization: Bearer <token>` header.
 The session cookie is `HttpOnly` and `Secure` (and `SameSite=Lax`), so the
 browser only sends it over HTTPS and frontend JavaScript cannot read it. For
 local development over plain HTTP, set `COOKIE_SECURE=false` so the cookie is
-still sent over `http://`.
+still sent over `http://`. The Electron client does not rely on the cookie:
+`/logme` also returns the token in the JSON body, and the client stores it in
+`localStorage` and sends it back as `Authorization: Bearer <token>`.
 
 - Admin (`role 1`): `/admin`, `/admin/users`, `/admin/stats`, `/admin/insurances`,
   `PATCH /admin/users/:username`,

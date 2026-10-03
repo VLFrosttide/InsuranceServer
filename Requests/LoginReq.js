@@ -80,10 +80,12 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
         [GeneratedToken, Username]
       );
 
-      // The token is delivered only as an HttpOnly cookie so frontend
-      // JavaScript cannot read it, and the JSON body below does not repeat it.
-      // `Secure` ensures the browser only sends it back over HTTPS. Local
-      // development over plain HTTP can opt out via COOKIE_SECURE=false.
+      // The token is delivered both as an HttpOnly cookie (for browser-style
+      // clients) and in the JSON body below. The Electron client stores the
+      // body token in localStorage and sends it back as `Authorization:
+      // Bearer`, so it MUST be included in the JSON response. `Secure` ensures
+      // the cookie is only sent over HTTPS. Local development over plain HTTP
+      // can opt out via COOKIE_SECURE=false.
       const SECURE_COOKIE = process.env.COOKIE_SECURE !== "false";
       res.cookie("token", GeneratedToken, {
         httpOnly: true,
@@ -101,6 +103,7 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
 
       const response = {
         message: "Login Successful",
+        token: GeneratedToken,
         username: Username,
         role: String(DBRole),
         redirectTo: targetPage,

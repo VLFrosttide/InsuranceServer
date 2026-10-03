@@ -35,10 +35,9 @@ async function req(method, path, body, token) {
   return { status: res.status, data, setCookie };
 }
 
-// The login response no longer includes the token in its JSON body (that copy
-// was readable by frontend JavaScript). The token is delivered only via the
-// HttpOnly cookie, so tests extract it from the Set-Cookie header to exercise
-// the Bearer/WebSocket auth paths.
+// The login response includes the token in its JSON body (for the Electron
+// client's Bearer auth) AND in the HttpOnly cookie. Tests read it from the
+// Set-Cookie header, which works regardless of COOKIE_SECURE.
 function tokenFromSetCookie(setCookie) {
   if (!setCookie) return null;
   const match = /(?:^|;\s*)token=([^;]+)/i.exec(setCookie);
