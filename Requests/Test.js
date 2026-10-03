@@ -6,9 +6,39 @@
 //                         Gmail polling pipeline does for a real message.
 
 const express = require("express");
+const fs = require("node:fs");
+const path = require("node:path");
 const { requireAuth, requireRole } = require("./Auth.js");
 const mailStore = require("../Mail/mailStore.js");
 const { notifyUnreadEmail } = require("../Users/websocket.js");
+
+const TEST_EMAIL_SUBJECT =
+  "1,21- ANET SAHAKOĞLU - 34 PJY 807 - 1MES: 22.09.2026 - BI: 156423";
+
+// Picture placed in the InsuranceClient/Test folder, used as a test attachment.
+const TEST_ATTACHMENT_PATH = path.resolve(
+  __dirname,
+  "..",
+  "..",
+  "InsuranceClient",
+  "Test",
+  "IMG-20260508-WA0012.jpg"
+);
+
+function loadTestAttachment() {
+  try {
+    const data = fs.readFileSync(TEST_ATTACHMENT_PATH);
+    return {
+      filename: path.basename(TEST_ATTACHMENT_PATH),
+      mimeType: "image/jpeg",
+      size: data.length,
+      base64: data.toString("base64"),
+    };
+  } catch (err) {
+    console.error("Failed to load test attachment:", err.message);
+    return null;
+  }
+}
 
 /**
  * Create the test router.
@@ -35,7 +65,7 @@ module.exports.createTestRouter = function createTestRouter(DBConnection) {
         account: req.body?.account || "TestAccount",
         messageId: `test-${unique}`,
         from: req.body?.from || "test@insurance.example",
-        subject: req.body?.subject || `Test email ${now.toISOString()}`,
+        subject: req.body?.subject || TEST_EMAIL_SUBJECT,
         date: now.toString(),
         body:
           req.body?.body ||
@@ -44,6 +74,9 @@ module.exports.createTestRouter = function createTestRouter(DBConnection) {
             "without waiting for a real Gmail message.",
         attachments: [],
       };
+
+      const testAttachment = loadTestAttachment();
+      if (testAttachment) email.attachments.push(testAttachment);
 
       mailStore.add(email);
       notifyUnreadEmail(email);
