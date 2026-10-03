@@ -226,11 +226,18 @@ Log in with any of the demo accounts above. The client routes by role:
 
 ## HTTP API
 
-- `POST /logme` — login (returns a session `token`)
+- `POST /logme` — login (sets an HttpOnly session cookie; the token is NOT in
+  the JSON body)
 - `POST /userreg` — register a new client account
 - `GET /health` — liveness check
 
-Protected endpoints require `Authorization: Bearer <token>`:
+Protected endpoints authenticate with either the `token` cookie set at login or
+an `Authorization: Bearer <token>` header.
+
+The session cookie is `HttpOnly` and `Secure` (and `SameSite=Lax`), so the
+browser only sends it over HTTPS and frontend JavaScript cannot read it. For
+local development over plain HTTP, set `COOKIE_SECURE=false` so the cookie is
+still sent over `http://`.
 
 - Admin (`role 1`): `/admin`, `/admin/users`, `/admin/stats`, `/admin/insurances`,
   `PATCH /admin/users/:username`,

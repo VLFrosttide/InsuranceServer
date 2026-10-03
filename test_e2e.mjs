@@ -31,7 +31,18 @@ async function req(method, path, body, token) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
-  return { status: res.status, data };
+  const setCookie = res.headers.get("set-cookie");
+  return { status: res.status, data, setCookie };
+}
+
+// The login response no longer includes the token in its JSON body (that copy
+// was readable by frontend JavaScript). The token is delivered only via the
+// HttpOnly cookie, so tests extract it from the Set-Cookie header to exercise
+// the Bearer/WebSocket auth paths.
+function tokenFromSetCookie(setCookie) {
+  if (!setCookie) return null;
+  const match = /(?:^|;\s*)token=([^;]+)/i.exec(setCookie);
+  return match ? match[1] : null;
 }
 
 function startServer() {
@@ -96,12 +107,12 @@ async function main() {
       username: "admin",
       password: "AdminPass123",
     });
+    const adminToken = tokenFromSetCookie(r.setCookie);
     check(
       "POST /logme admin",
-      r.status === 200 && r.data.token,
+      r.status === 200 && !!adminToken,
       JSON.stringify(r.data)
     );
-    const adminToken = r.data.token;
 
     // Login (worker)
     r = await req("POST", "/logme", {
@@ -113,7 +124,7 @@ async function main() {
       r.status === 200 && r.data.role === "2",
       JSON.stringify(r.data)
     );
-    const workerToken = r.data.token;
+    const workerToken = tokenFromSetCookie(r.setCookie);
 
     // Login (client)
     r = await req("POST", "/logme", {
@@ -125,7 +136,7 @@ async function main() {
       r.status === 200 && r.data.role === "3",
       JSON.stringify(r.data)
     );
-    const clientToken = r.data.token;
+    const clientToken = tokenFromSetCookie(r.setCookie);
 
     // Wrong password
     r = await req("POST", "/logme", { username: "admin", password: "wrong" });

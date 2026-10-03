@@ -80,10 +80,14 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
         [GeneratedToken, Username]
       );
 
-      // `secure: false` because local dev runs over plain HTTP.
+      // The token is delivered only as an HttpOnly cookie so frontend
+      // JavaScript cannot read it, and the JSON body below does not repeat it.
+      // `Secure` ensures the browser only sends it back over HTTPS. Local
+      // development over plain HTTP can opt out via COOKIE_SECURE=false.
+      const SECURE_COOKIE = process.env.COOKIE_SECURE !== "false";
       res.cookie("token", GeneratedToken, {
         httpOnly: true,
-        secure: false,
+        secure: SECURE_COOKIE,
         sameSite: "lax",
         maxAge: 12 * 60 * 60 * 1000, // 12 hours
       });
@@ -100,7 +104,6 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
         username: Username,
         role: String(DBRole),
         redirectTo: targetPage,
-        token: GeneratedToken,
       };
 
       if (DBalance !== null && DBalance !== undefined) {
