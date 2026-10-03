@@ -78,7 +78,7 @@ async function handleMessage(ws, data) {
   if (msg.type === "auth") {
     try {
       const [rows] = await db.query(
-        "SELECT t.Username, u.Role FROM tokens t JOIN Users u ON u.Username = t.Username WHERE t.Token = ? AND t.Expires > NOW()",
+        "SELECT t.Username, u.Role FROM tokens t JOIN users u ON u.Username = t.Username WHERE t.Token = ? AND t.Expires > NOW()",
         [msg.token]
       );
 

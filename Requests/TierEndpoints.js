@@ -81,7 +81,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   router.get("/admin/users", auth, requireRole(1), async (req, res) => {
     try {
       const [rows] = await DBConnection.query(
-        "SELECT Username, Role, Balance, PayoutPercentage, Status FROM Users"
+        "SELECT Username, Role, Balance, PayoutPercentage, Status FROM users"
       );
       res.json({ users: rows });
     } catch (err) {
@@ -98,7 +98,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
            SUM(Role = 2) AS workers,
            SUM(Role = 3) AS clients,
            COUNT(*) AS total
-         FROM Users`
+         FROM users`
       );
       res.json({ stats: rows[0] || {} });
     } catch (err) {
@@ -127,7 +127,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const { role, balance, payoutPercentage } = req.body;
 
         const [existing] = await DBConnection.query(
-          "SELECT Username FROM Users WHERE Username = ?",
+          "SELECT Username FROM users WHERE Username = ?",
           [username]
         );
         if (existing.length === 0) {
@@ -171,12 +171,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
         params.push(username);
         await DBConnection.query(
-          `UPDATE Users SET ${sets.join(", ")} WHERE Username = ?`,
+          `UPDATE users SET ${sets.join(", ")} WHERE Username = ?`,
           params
         );
 
         const [rows] = await DBConnection.query(
-          "SELECT Username, Role, Balance, PayoutPercentage FROM Users WHERE Username = ?",
+          "SELECT Username, Role, Balance, PayoutPercentage FROM users WHERE Username = ?",
           [username]
         );
         res.json({ message: "User updated", user: rows[0] });
@@ -208,7 +208,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
   async function fetchUser(res, username) {
     const [rows] = await DBConnection.query(
-      `SELECT ${ADMIN_USER_COLUMNS} FROM Users WHERE Username = ?`,
+      `SELECT ${ADMIN_USER_COLUMNS} FROM users WHERE Username = ?`,
       [username]
     );
     return rows[0] || null;
@@ -232,7 +232,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
 
         await DBConnection.query(
-          "UPDATE Users SET Status = 'suspended' WHERE Username = ?",
+          "UPDATE users SET Status = 'suspended' WHERE Username = ?",
           [username]
         );
         // Immediately invalidate any live sessions.
@@ -274,7 +274,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
         await DBConnection.withTransaction(async (conn) => {
           await conn.query("DELETE FROM tokens WHERE Username = ?", [username]);
-          await conn.query("DELETE FROM Users WHERE Username = ?", [username]);
+          await conn.query("DELETE FROM users WHERE Username = ?", [username]);
         });
 
         res.json({ message: "User deleted", username });
@@ -308,7 +308,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
 
         await DBConnection.query(
-          "UPDATE Users SET Role = ? WHERE Username = ?",
+          "UPDATE users SET Role = ? WHERE Username = ?",
           [role, username]
         );
 
@@ -335,7 +335,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   router.get("/worker/clients", auth, requireRole(2), async (req, res) => {
     try {
       const [rows] = await DBConnection.query(
-        "SELECT Username, Balance, PayoutPercentage FROM Users WHERE Role = 3"
+        "SELECT Username, Balance, PayoutPercentage FROM users WHERE Role = 3"
       );
       res.json({ clients: rows });
     } catch (err) {
@@ -369,7 +369,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
 
         const [result] = await DBConnection.query(
-          "UPDATE Users SET Balance = ? WHERE Username = ? AND Role = 3",
+          "UPDATE users SET Balance = ? WHERE Username = ? AND Role = 3",
           [balance, username]
         );
 
@@ -533,7 +533,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   router.get("/client/profile", auth, requireRole(3), async (req, res) => {
     try {
       const [rows] = await DBConnection.query(
-        "SELECT Username, Role, Balance, PayoutPercentage FROM Users WHERE Username = ?",
+        "SELECT Username, Role, Balance, PayoutPercentage FROM users WHERE Username = ?",
         [req.user.username]
       );
       res.json({ profile: rows[0] || null });

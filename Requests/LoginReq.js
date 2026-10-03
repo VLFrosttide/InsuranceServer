@@ -44,7 +44,7 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
       }
 
       const [rows] = await DBConnection.query(
-        "SELECT * FROM Users WHERE Username = ?",
+        "SELECT * FROM users WHERE Username = ?",
         [Username]
       );
 

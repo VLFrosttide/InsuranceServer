@@ -45,7 +45,7 @@ module.exports.createRegRouter = function createRegRouter(DBConnection) {
       }
 
       const [existing] = await DBConnection.query(
-        "SELECT Username FROM Users WHERE Username = ?",
+        "SELECT Username FROM users WHERE Username = ?",
         [Username]
       );
       if (existing.length > 0) {
@@ -54,7 +54,7 @@ module.exports.createRegRouter = function createRegRouter(DBConnection) {
 
       const PassHash = await Bcrypt.hash(Password, 12);
       await DBConnection.query(
-        "INSERT INTO Users (Username, Password, Role, Balance) VALUES (?, ?, ?, 0)",
+        "INSERT INTO users (Username, Password, Role, Balance) VALUES (?, ?, ?, 0)",
         [Username, PassHash, Number(role)]
       );
 

@@ -48,7 +48,7 @@ module.exports.requireAuth = function requireAuth(DBConnection) {
       const [rows] = await DBConnection.query(
         `SELECT t.Username, u.Role, u.Status
            FROM tokens t
-           JOIN Users u ON u.Username = t.Username
+           JOIN users u ON u.Username = t.Username
           WHERE t.Token = ? AND t.Expires > NOW()`,
         [token]
       );
