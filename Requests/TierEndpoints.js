@@ -80,10 +80,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
   router.get("/admin/users", auth, requireRole(1), async (req, res) => {
     try {
-      const [rows] = await DBConnection.query(
-        "SELECT Username, Role, Balance, PayoutPercentage, Status FROM users"
+      const [users] = await DBConnection.query(
+        `SELECT Username, Role, Balance, PayoutPercentage, Status
+         FROM users
+         ORDER BY Username`
       );
-      res.json({ users: rows });
+      res.json({ users });
     } catch (err) {
       console.error("Admin users lookup failed:", err);
       res.status(500).json({ error: "Failed to fetch users" });
@@ -94,10 +96,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     try {
       const [rows] = await DBConnection.query(
         `SELECT
-           SUM(Role = 1) AS admins,
-           SUM(Role = 2) AS workers,
-           SUM(Role = 3) AS clients,
-           COUNT(*) AS total
+           COUNT(*) AS total,
+           COALESCE(SUM(CASE WHEN Role = 1 THEN 1 ELSE 0 END), 0) AS admins,
+           COALESCE(SUM(CASE WHEN Role = 2 THEN 1 ELSE 0 END), 0) AS workers,
+           COALESCE(SUM(CASE WHEN Role = 3 THEN 1 ELSE 0 END), 0) AS clients
          FROM users`
       );
       res.json({ stats: rows[0] || {} });
