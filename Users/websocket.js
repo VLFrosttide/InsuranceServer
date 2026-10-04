@@ -117,7 +117,12 @@ async function handleMessage(ws, data) {
     const email = messageId ? mailStore.get(messageId) : null;
     if (!email) {
       ws.send(
-        JSON.stringify({ type: "claim_email", ok: false, error: "Not found" })
+        JSON.stringify({
+          type: "claim_email",
+          ok: false,
+          messageId,
+          error: "Not found",
+        })
       );
       return;
     }
