@@ -123,7 +123,19 @@ module.exports.persistTokens = function persistTokens(tokens, suffix = "") {
     if (!seen.has(key)) updated.push(`${key}=${value}`);
   }
 
-  fs.writeFileSync(ENV_PATH, updated.join("\n"));
+  try {
+    fs.writeFileSync(ENV_PATH, updated.join("\n"));
+  } catch (err) {
+    // On some hosting setups `.env` is read-only (secrets are injected through
+    // the control panel instead). The refreshed tokens still live in memory for
+    // the lifetime of the process, so not being able to persist them must never
+    // crash the refresh/poll loop.
+    console.warn(
+      "Could not persist refreshed Gmail tokens to .env (continuing with the " +
+        "in-memory tokens):",
+      err && err.message ? err.message : err
+    );
+  }
 };
 
 // Removes the GMAIL_* token variables for one account from both the running
@@ -144,5 +156,14 @@ module.exports.clearTokens = function clearTokens(suffix = "") {
     const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/);
     return !(match && names.has(match[1]));
   });
-  fs.writeFileSync(ENV_PATH, kept.join("\n"));
+  try {
+    fs.writeFileSync(ENV_PATH, kept.join("\n"));
+  } catch (err) {
+    // A read-only `.env` must not crash startup; the variables were already
+    // removed from process.env above, which is enough for this run.
+    console.warn(
+      "Could not update .env while clearing Gmail tokens:",
+      err && err.message ? err.message : err
+    );
+  }
 };
