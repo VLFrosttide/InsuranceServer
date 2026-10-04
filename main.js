@@ -98,7 +98,9 @@ function startGmailPolling() {
 }
 
 async function start() {
-  app.use(express.json());
+  // Accept large JSON bodies (up to 50 MB) so the Electron client can send
+  // dropped files as base64 data along with the insurance form.
+  app.use(express.json({ limit: "50mb" }));
 
   // CORS: the Electron client loads from file:// and calls this server on
   // http://127.0.0.1:5501. Allow JSON + Bearer-token requests across origins.

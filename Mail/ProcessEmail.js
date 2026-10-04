@@ -113,6 +113,8 @@ module.exports.ProcessEmail = async function ProcessEmail(
   const emailInfo = {
     account,
     messageId,
+    threadId: msg.threadId || "",
+    messageIdHeader: headerValue(headers, "Message-ID"),
     from: headerValue(headers, "From"),
     subject: headerValue(headers, "Subject"),
     date: headerValue(headers, "Date"),
@@ -122,7 +124,7 @@ module.exports.ProcessEmail = async function ProcessEmail(
 
   // Skip work we already know about (e.g. because the server restarted before
   // a worker completed the form). The message is only marked read on complete.
-  if (mailStore.has(messageId)) {
+  if (mailStore.has(account, messageId)) {
     return;
   }
 

@@ -203,19 +203,13 @@ async function main() {
       "POST",
       "/worker/insurances",
       {
-        DKN: "TEST123",
         PolicyNumber: "BG/TEST/1",
         BlancNumber: `B${Date.now()}`,
         Duration: "3 месеца",
-        BrokerCode: "9.9",
         Branch: "ГКПП Лесово",
         Otomobil: "Otomobil",
         Price: "120",
         CurrencyType: "EUR",
-        ClientName: "Test Client",
-        ClientAdress: "Test Address",
-        ChassisNumber: "CHASSIS123",
-        VehicleBrand: "Opel",
         Cash: "true",
       },
       workerToken
@@ -229,7 +223,6 @@ async function main() {
       "/worker/insurances",
       {
         BlancNumber: dupBlanc,
-        ClientName: "Test Client",
       },
       workerToken
     );
@@ -239,7 +232,6 @@ async function main() {
       "/worker/insurances",
       {
         BlancNumber: dupBlanc,
-        ClientName: "Test Client",
       },
       workerToken
     );
@@ -424,7 +416,7 @@ async function main() {
       {
         BlancNumber: brokerInsuranceBlanc,
         Price: "500",
-        ClientName: "Broker Test Client",
+        EmailFrom: "demo@broker.example",
       },
       workerToken
     );
@@ -468,7 +460,6 @@ async function main() {
       "/worker/insurances",
       {
         BlancNumber: `CASH${Date.now()}`,
-        ClientName: "Cash Client",
         Price: "300",
         Cash: "true",
       },
@@ -500,7 +491,6 @@ async function main() {
       "/worker/insurances",
       {
         BlancNumber: `CARD${Date.now()}`,
-        ClientName: "Card Client",
         Price: "125",
         Cash: "false",
       },

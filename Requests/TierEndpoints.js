@@ -13,7 +13,11 @@ const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
 const { recordCashMovement, toDecimal } = require("./CurrentCash.js");
 const { recordCardPayment } = require("./CardPayments.js");
-const { resolveBrokerId, decreaseBrokerForInsurance } = require("./Brokers.js");
+const {
+  resolveBrokerByEmail,
+  decreaseBrokerForInsurance,
+} = require("./Brokers.js");
+const { sendReply } = require("../Mail/SendReply.js");
 
 /**
  * Resolve an insurance payment type from the received value.
@@ -383,87 +387,69 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   router.post("/worker/insurances", auth, requireRole(2), async (req, res) => {
     try {
       const b = req.body || {};
-      const dkn = b.DKN ?? b.dkn ?? "";
       const policyNumber = b.PolicyNumber ?? b.policyNumber ?? "";
       const blancNumber = b.BlancNumber ?? b.blancNumber ?? "";
       const price = String(b.Price ?? b.price ?? "0");
       const currencyType = b.CurrencyType ?? b.currencyType ?? "";
       const duration = parseDurationDays(b.Duration ?? b.duration ?? 0);
-      const brokerCode = b.BrokerCode ?? b.brokerCode ?? "";
       const branch = b.Branch ?? b.branch ?? "";
       const otomobil = b.Otomobil ?? b.otomobil ?? "";
-      const paymentType = resolvePaymentType(b.Cash ?? b.cash);
-      const clientName = b.ClientName ?? b.clientName ?? "";
-      const clientAdress = b.ClientAdress ?? b.clientAdress ?? "";
-      const chassisNumber = b.ChassisNumber ?? b.chassisNumber ?? "";
-      const vehicleBrand = b.VehicleBrand ?? b.vehicleBrand ?? "";
-      const broker = b.Broker ?? b.broker ?? req.user.username;
+      const paymentType = resolvePaymentType(
+        b.Cash ?? b.cash ?? b.PaymentType ?? b.paymentType
+      );
+      let startDate = b.StartDate ?? b.startDate ?? null;
+      if (startDate === "") startDate = null;
+
+      // Broker is no longer typed on the form. It is inferred from the sender
+      // ("From" address) of the unread email the policy is created from.
+      const emailFrom = b.EmailFrom ?? b.emailFrom ?? "";
+
+      // Optional return-email handling. When the form was opened from an
+      // unread email, the client sends the original Gmail message ID plus any
+      // files the worker dropped. If the "test" checkbox disables return
+      // emails, we skip replying entirely.
+      const messageId = b.MessageId ?? b.messageId ?? null;
+      const disableReturnEmail = Boolean(
+        b.DisableReturnEmail ?? b.disableReturnEmail ?? false
+      );
+      let attachments = b.Attachments ?? b.attachments ?? [];
+      if (!Array.isArray(attachments)) attachments = [];
 
       if (!blancNumber) {
         return res.status(400).json({ error: "BlancNumber is required" });
       }
-      if (!clientName) {
-        return res.status(400).json({ error: "ClientName is required" });
-      }
-
-      // VehicleBrand column is optional (added by db/setup.js); guard old DBs.
-      const [cols] = await DBConnection.query("SHOW COLUMNS FROM insurance");
-      const hasVehicleBrand = cols.some((c) => c.Field === "VehicleBrand");
-
-      let sql, params;
-      if (hasVehicleBrand) {
-        sql = `INSERT INTO insurance
-            (Author, CreationDate, DKN, PolicyNumber, BlancNumber, Price,
-             CurrencyType, Duration, BrokerCode, Branch, Otomobil, PaymentType,
-             ClientName, ClientAdress, ChassisNumber, VehicleBrand, Broker)
-           VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-        params = [
-          req.user.username,
-          dkn,
-          policyNumber,
-          blancNumber,
-          price,
-          currencyType,
-          duration,
-          brokerCode,
-          branch,
-          otomobil,
-          paymentType,
-          clientName,
-          clientAdress,
-          chassisNumber,
-          vehicleBrand,
-          broker,
-        ];
-      } else {
-        sql = `INSERT INTO insurance
-            (Author, CreationDate, DKN, PolicyNumber, BlancNumber, Price,
-             CurrencyType, Duration, BrokerCode, Branch, Otomobil, PaymentType,
-             ClientName, ClientAdress, ChassisNumber, Broker)
-           VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-        params = [
-          req.user.username,
-          dkn,
-          policyNumber,
-          blancNumber,
-          price,
-          currencyType,
-          duration,
-          brokerCode,
-          branch,
-          otomobil,
-          paymentType,
-          clientName,
-          clientAdress,
-          chassisNumber,
-          broker,
-        ];
-      }
 
       const priceDecimal = toDecimal(price);
 
+      let replyError = null;
       await DBConnection.withTransaction(async (conn) => {
-        await conn.query(sql, params);
+        // Resolve the broker from the email sender. When no broker matches,
+        // the policy is stored without a broker link.
+        const broker = await resolveBrokerByEmail(conn, emailFrom);
+        const brokerId = broker ? broker.id : null;
+        const brokerName = broker ? broker.name : "";
+
+        await conn.query(
+          `INSERT INTO insurance
+              (Author, CreationDate, PolicyNumber, BlancNumber, Price,
+               CurrencyType, Duration, Broker, Branch, Otomobil, PaymentType,
+               StartDate, BrokerId)
+           VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            req.user.username,
+            policyNumber,
+            blancNumber,
+            price,
+            currencyType,
+            duration,
+            brokerName,
+            branch,
+            otomobil,
+            paymentType,
+            startDate,
+            brokerId,
+          ]
+        );
 
         // Every created insurance contributes its value to either current cash
         // (PaymentType = "Cash") or the card balance (PaymentType = "Card").
@@ -489,19 +475,29 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
         // Charge the policy against its broker: reduce the broker balance by
         // price × Percentage / 100 and decrement its InactivePolicies.
-        const brokerId = await resolveBrokerId(conn, {
-          blancNumber,
-          brokerId: b.BrokerId ?? b.brokerId ?? null,
-        });
         if (brokerId !== null) {
           await decreaseBrokerForInsurance(conn, brokerId, price);
         }
       });
 
+      // Reply to the original sender (unless disabled) with the dropped files.
+      // This runs outside the DB transaction; a mailing failure must not roll
+      // back an otherwise successfully saved insurance.
+      if (!disableReturnEmail && messageId && attachments.length) {
+        try {
+          await sendReply(messageId, attachments);
+        } catch (err) {
+          replyError = err && err.message ? err.message : String(err);
+          console.error("Failed to send reply email:", err);
+        }
+      }
+
       res.status(201).json({
         message: "Insurance created",
         blancNumber,
         author: req.user.username,
+        replySkipped: disableReturnEmail,
+        replyError: replyError || undefined,
       });
     } catch (err) {
       if (err?.code === "ER_DUP_ENTRY") {
@@ -621,19 +617,13 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const params = [];
 
         const editable = [
-          ["DKN", b.DKN ?? b.dkn],
           ["PolicyNumber", b.PolicyNumber ?? b.policyNumber],
           ["Price", b.Price ?? b.price],
           ["CurrencyType", b.CurrencyType ?? b.currencyType],
-          ["BrokerCode", b.BrokerCode ?? b.brokerCode],
           ["Branch", b.Branch ?? b.branch],
           ["Otomobil", b.Otomobil ?? b.otomobil],
           ["PaymentType", b.PaymentType ?? b.paymentType ?? b.Cash ?? b.cash],
-          ["ClientName", b.ClientName ?? b.clientName],
-          ["ClientAdress", b.ClientAdress ?? b.clientAdress],
-          ["ChassisNumber", b.ChassisNumber ?? b.chassisNumber],
-          ["VehicleBrand", b.VehicleBrand ?? b.vehicleBrand],
-          ["Broker", b.Broker ?? b.broker],
+          ["StartDate", b.StartDate ?? b.startDate],
         ];
 
         for (const [column, value] of editable) {

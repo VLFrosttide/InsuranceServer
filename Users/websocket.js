@@ -151,8 +151,9 @@ async function handleMessage(ws, data) {
 
     mailStore.remove(messageId);
     // Only now mark the Gmail message read (the worker finished the form).
+    // Pass the account so the correct inbox's API client is used.
     try {
-      await mailStore.markRead(messageId);
+      await mailStore.markRead(email.account, messageId);
     } catch (err) {
       console.error("Failed to mark email as read:", err);
     }

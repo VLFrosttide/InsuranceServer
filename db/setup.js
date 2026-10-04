@@ -87,22 +87,17 @@ async function runSetup(config = {}) {
     CREATE TABLE IF NOT EXISTS insurance (
       Author VARCHAR(45) NOT NULL,
       CreationDate DATETIME NOT NULL,
-      DKN VARCHAR(45) NOT NULL,
       PolicyNumber VARCHAR(45) NOT NULL,
       BlancNumber VARCHAR(45) NOT NULL,
       Price VARCHAR(45) NOT NULL,
       CurrencyType VARCHAR(45) NOT NULL,
       Duration INT NOT NULL,
-      BrokerCode VARCHAR(45) NOT NULL,
+      Broker VARCHAR(100) NULL,
       BrokerId INT NULL,
       Branch VARCHAR(45) NOT NULL,
       Otomobil VARCHAR(45) NOT NULL,
-      VehicleBrand VARCHAR(45) NULL,
+      StartDate DATE NULL,
       PaymentType VARCHAR(45) NOT NULL,
-      ClientName VARCHAR(45) NOT NULL,
-      ClientAdress VARCHAR(45) NOT NULL,
-      ChassisNumber VARCHAR(45) NOT NULL,
-      Broker VARCHAR(45) NOT NULL,
       PRIMARY KEY (BlancNumber),
       UNIQUE KEY BlancNumber_UNIQUE (BlancNumber),
       KEY idx_insurance_broker (BrokerId)
@@ -126,23 +121,45 @@ async function runSetup(config = {}) {
     console.log("Added users.Status column");
   }
 
-  // 3) Ensure insurance.VehicleBrand exists (client collects vehicle brand).
+  // 3) Migrate the insurance table to the reduced schema.
+  //
+  // The add-insurance form now only collects: PolicyNumber, BlancNumber,
+  // Duration, Otomobil, StartDate, Price, CurrencyType, PaymentType. Author and
+  // CreationDate are filled by the server, Branch is selected at login, and
+  // Broker is inferred from the incoming email sender. Drop every legacy column
+  // that no longer exists on the form.
   const [insCols] = await db.query(
     "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
     [DB_NAME, "insurance"]
   );
   const insColNames = new Set(insCols.map((c) => c.COLUMN_NAME));
-  if (!insColNames.has("VehicleBrand")) {
-    await db.query(
-      "ALTER TABLE insurance ADD COLUMN VehicleBrand VARCHAR(45) NULL AFTER Otomobil"
-    );
-    console.log("Added insurance.VehicleBrand column");
+
+  const legacyInsuranceColumns = [
+    "DKN",
+    "BrokerCode",
+    "ClientName",
+    "ClientAdress",
+    "ChassisNumber",
+    "VehicleBrand",
+    "ExpirationDate",
+  ];
+  for (const col of legacyInsuranceColumns) {
+    if (insColNames.has(col)) {
+      await db.query(`ALTER TABLE insurance DROP COLUMN \`${col}\``);
+      console.log(`Dropped insurance.${col} column`);
+    }
   }
+
+  // Broker is now inferred from the email sender and may be unknown until then,
+  // so it must permit NULL (and be wide enough to hold a broker name).
+  await db
+    .query("ALTER TABLE insurance MODIFY COLUMN Broker VARCHAR(100) NULL")
+    .catch(() => {});
 
   // Link insurance policies to a broker (brokers.insurances relationship).
   if (!insColNames.has("BrokerId")) {
     await db.query(
-      "ALTER TABLE insurance ADD COLUMN BrokerId INT NULL AFTER BrokerCode, ADD KEY idx_insurance_broker (BrokerId)"
+      "ALTER TABLE insurance ADD COLUMN BrokerId INT NULL AFTER Broker, ADD KEY idx_insurance_broker (BrokerId)"
     );
     console.log("Added insurance.BrokerId column");
   }
@@ -392,27 +409,21 @@ async function runSetup(config = {}) {
   if (insCount[0].n === 0) {
     await db.query(
       `INSERT INTO insurance
-        (Author, CreationDate, DKN, PolicyNumber, BlancNumber, Price, CurrencyType,
-         Duration, BrokerCode, Branch, Otomobil, PaymentType, ClientName, ClientAdress,
-         ChassisNumber, VehicleBrand, Broker)
-       VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (Author, CreationDate, PolicyNumber, BlancNumber, Price, CurrencyType,
+         Duration, Broker, Branch, Otomobil, PaymentType, StartDate)
+       VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         "list4e",
-        "34HRG539",
         "BG/02/FI26154498",
         "153056",
         "35",
         "EUR",
         15,
-        "2.1",
+        "Demo Broker",
         "ГКПП Лесово",
         "Otomobil",
         "Cash",
-        "Ferhat Aktas",
-        "Merkez/Edirne",
-        "LSJA24U92PN242685",
-        "Toyota",
-        "client",
+        null,
       ]
     );
     console.log("Seeded a sample insurance policy");
@@ -457,28 +468,22 @@ async function runSetup(config = {}) {
   // via insurance.BrokerId, so the broker always has linked insurance.
   await db.query(
     `INSERT INTO insurance
-       (Author, CreationDate, DKN, PolicyNumber, BlancNumber, Price, CurrencyType,
-        Duration, BrokerCode, Branch, Otomobil, PaymentType, ClientName, ClientAdress,
-        ChassisNumber, VehicleBrand, Broker, BrokerId)
-     VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (Author, CreationDate, PolicyNumber, BlancNumber, Price, CurrencyType,
+        Duration, Broker, Branch, Otomobil, PaymentType, StartDate, BrokerId)
+     VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE BrokerId = VALUES(BrokerId)`,
     [
       "list4e",
-      "34TEST539",
       "BG/02/TEST5498",
       "TEST-BROKER-001",
       "99",
       "EUR",
       30,
-      "2.1",
+      "Demo Broker",
       "ГКПП Лесово",
       "Otomobil",
       "Cash",
-      "Sample Broker Client",
-      "Sample Address",
-      "SAMPLE-CHASSIS-001",
-      "Toyota",
-      "client",
+      null,
       brokerId,
     ]
   );
@@ -500,7 +505,7 @@ async function runSetup(config = {}) {
     [brokerId]
   );
   const [insuranceRows] = await db.query(
-    `SELECT PolicyNumber, BlancNumber, ClientName, Price, CurrencyType, BrokerId
+    `SELECT PolicyNumber, BlancNumber, Broker, Price, CurrencyType, BrokerId
      FROM insurance WHERE BrokerId = ?`,
     [brokerId]
   );

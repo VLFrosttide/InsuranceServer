@@ -64,6 +64,41 @@ const resolveBrokerId = (module.exports.resolveBrokerId =
   });
 
 /**
+ * Resolve the broker that an insurance belongs to from the sender of the
+ * incoming email.
+ *
+ * The insurance form no longer asks the worker to pick a broker. Instead the
+ * broker is inferred from the "From" address of the unread email the policy is
+ * created from: the address must match a row in `broker_emails`, which links
+ * back to a `brokers.id`. Accepts both a bare address and a "Name <address>"
+ * header value.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} [email]
+ * @returns {Promise<{id: number, name: string}|null>} The broker id + name, or
+ *   null when the email does not match any broker.
+ */
+const resolveBrokerByEmail = (module.exports.resolveBrokerByEmail =
+  async function resolveBrokerByEmail(conn, email) {
+    const raw = String(email ?? "").trim();
+    if (!raw) return null;
+    let address = raw;
+    const m = raw.match(/<([^>]+)>/);
+    if (m) address = m[1].trim();
+    const [rows] = await conn.query(
+      `SELECT be.BrokerId, b.Name
+         FROM broker_emails be
+         JOIN brokers b ON b.id = be.BrokerId
+        WHERE LOWER(be.Email) = LOWER(?)
+        ORDER BY be.id
+        LIMIT 1`,
+      [address]
+    );
+    if (!rows.length) return null;
+    return { id: rows[0].BrokerId, name: rows[0].Name };
+  });
+
+/**
  * Decrease a broker's balance by `price × Percentage / 100` and decrement
  * InactivePolicies by 1. Runs inside the caller's transaction.
  *

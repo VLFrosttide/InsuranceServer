@@ -57,26 +57,21 @@ broker). `Role` defaults to `3` (client) when added by the migration.
 
 One row per insurance policy.
 
-| Column          | Notes                                     |
-| --------------- | ----------------------------------------- |
-| `Author`        | User who created the policy               |
-| `CreationDate`  | When the policy was created               |
-| `DKN`           | Policy identifier                         |
-| `PolicyNumber`  | Policy number                             |
-| `BlancNumber`   | Blanc number (unique; used for lookups)   |
-| `Price`         | Policy price                              |
-| `CurrencyType`  | e.g. `EUR`                                |
-| `Duration`      | Duration in integer days                  |
-| `BrokerCode`    | Broker code                               |
-| `Branch`        | Branch                                    |
-| `Otomobil`      | Vehicle/car flag value                    |
-| `PaymentType`   | `"Cash"` or `"Card"`                      |
-| `ClientName`    | Insured client name                       |
-| `ClientAdress`  | Insured client address                    |
-| `ChassisNumber` | Vehicle chassis number                    |
-| `VehicleBrand`  | Vehicle brand (added by migration)        |
-| `Broker`        | Client username the policy belongs to     |
-| `BrokerId`      | Link to `brokers.id` (added by migration) |
+| Column         | Notes                                    |
+| -------------- | ---------------------------------------- |
+| `Author`       | User who created the policy              |
+| `CreationDate` | When the policy was created              |
+| `PolicyNumber` | Policy number                            |
+| `BlancNumber`  | Blanc number (unique; used for lookups)  |
+| `Price`        | Policy price                             |
+| `CurrencyType` | e.g. `EUR`                               |
+| `Duration`     | Duration in integer days                 |
+| `Broker`       | Broker name (inferred from email sender) |
+| `BrokerId`     | Link to `brokers.id`                     |
+| `Branch`       | Branch (selected at login)               |
+| `Otomobil`     | Vehicle/car flag value                   |
+| `StartDate`    | Policy start date                        |
+| `PaymentType`  | `"Cash"` or `"Card"`                     |
 
 Use case: the core business entity — created by workers, listed for clients,
 edited by admins/workers, and linked to a broker and to the current-cash
@@ -314,3 +309,53 @@ contains the blanc number, else the single broker if only one exists.
 Enabled by default when `.env` has valid OAuth credentials. It runs in the
 background and does not block the REST/WebSocket server. Attachments are saved
 under `attachments/` unless `SAVE_ATTACHMENTS_TO_DISK=0`.
+
+The server polls up to three Gmail inboxes (`Account1`, `Account2`,
+`Account3`). Only the inboxes whose OAuth credentials are configured are
+started, so you can run with 1, 2, or 3 boxes without erroring. If no Gmail
+credentials are set at all, polling is skipped.
+
+`Account1` uses the base `GMAIL_*` token variables; `Account2` and `Account3`
+use the same names with a `_2` / `_3` suffix:
+
+```env
+# Account1
+GMAIL_ACCESS_TOKEN=...
+GMAIL_REFRESH_TOKEN=...
+GMAIL_SCOPE=...
+GMAIL_TOKEN_TYPE=Bearer
+GMAIL_EXPIRY_DATE=...
+
+# Account2
+GMAIL_ACCESS_TOKEN_2=...
+GMAIL_REFRESH_TOKEN_2=...
+GMAIL_SCOPE_2=...
+GMAIL_TOKEN_TYPE_2=Bearer
+GMAIL_EXPIRY_DATE_2=...
+
+# Account3
+GMAIL_ACCESS_TOKEN_3=...
+GMAIL_REFRESH_TOKEN_3=...
+GMAIL_SCOPE_3=...
+GMAIL_TOKEN_TYPE_3=Bearer
+GMAIL_EXPIRY_DATE_3=...
+```
+
+Each account uses its own OAuth client, so `CLIENT_ID`/`CLIENT_SECRET` are
+account-specific too. `Account1` reads the base names; `Account2`/`Account3`
+read the `_2`/`_3` variants. `REDIRECT_URI` defaults to the shared value but can
+also be overridden per account via `REDIRECT_URI_2` / `REDIRECT_URI_3`.
+
+```env
+# Account1
+CLIENT_ID=...
+CLIENT_SECRET=...
+
+# Account2
+CLIENT_ID_2=...
+CLIENT_SECRET_2=...
+
+# Account3
+CLIENT_ID_3=...
+CLIENT_SECRET_3=...
+```
