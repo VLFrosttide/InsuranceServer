@@ -6,6 +6,7 @@ const {
   accountSuffix,
   hasCredentials,
   clearTokens,
+  loadTokens,
 } = require("./secrets.js");
 const Authorize = require("./Authorize.js");
 const mailStore = require("./mailStore.js");
@@ -58,31 +59,62 @@ function isBrokenTokenError(err) {
 }
 
 // Authorize an inbox and validate its tokens by fetching the Gmail profile.
-// If the stored tokens were rejected, clear them once and re-run authorization
-// so a bad/placeholder token set never permanently disables the inbox.
+// If PRE-EXISTING stored tokens were rejected, clear them once and re-run
+// authorization so a bad/stale token set never permanently disables the
+// inbox.
+//
+// Important: this "clear and retry" recovery must only kick in for tokens
+// that were already sitting in `.env` *before* this attempt (e.g. a revoked
+// or expired refresh token left over from a previous run). If the tokens
+// were instead obtained moments ago in THIS same call via the interactive
+// consent flow, clearing them would delete the user's freshly completed
+// authorization from `.env` and silently restart the interactive flow a
+// second time — whose authorization code is a one-time code, so the first
+// code is already spent and the retry fails too, leaving the account
+// skipped with its tokens wiped. (This is exactly the bug where
+// GMAIL_ACCESS_TOKEN_3/GMAIL_REFRESH_TOKEN_3/etc. disappeared from `.env`
+// right after completing the consent flow for Account3.) We therefore only
+// clear+retry when tokens already existed before the attempt; otherwise the
+// real error is surfaced so the actual problem (wrong CLIENT_ID/CLIENT_SECRET,
+// Gmail API not enabled, declined/insufficient scopes, etc.) can be diagnosed
+// without losing the tokens that are already safely persisted in `.env`.
 async function authorizeAccount(account) {
   const suffix = accountSuffix(account);
   const { clientId, clientSecret, redirectUri } = loadCredentials(suffix);
 
-  const withProfile = async () => {
+  const attempt = async () => {
+    const hadStoredTokensBefore = Boolean(loadTokens(suffix));
     const OAuthClient = CreateOauthClient(clientId, clientSecret, redirectUri);
-    await Authorize(OAuthClient, account, redirectUri);
-    const gmail = google.gmail({ version: "v1", auth: OAuthClient });
-    const Profile = await gmail.users.getProfile({ userId: "me" });
-    return { gmail, email: Profile.data.emailAddress };
+    try {
+      await Authorize(OAuthClient, account, redirectUri);
+      const gmail = google.gmail({ version: "v1", auth: OAuthClient });
+      const Profile = await gmail.users.getProfile({ userId: "me" });
+      return { gmail, email: Profile.data.emailAddress };
+    } catch (err) {
+      err.__insHadStoredTokens = hadStoredTokensBefore;
+      throw err;
+    }
   };
 
   try {
-    return await withProfile();
+    return await attempt();
   } catch (err) {
     if (!isBrokenTokenError(err)) throw err;
+
+    if (!err.__insHadStoredTokens) {
+      // Nothing was stored beforehand for this attempt to "fall back" from —
+      // the rejected tokens are the ones just minted by the interactive flow.
+      // Leave them in `.env` and surface the real error instead of looping
+      // into a second, likely-doomed consent flow.
+      throw err;
+    }
 
     console.warn(
       `Stored Gmail tokens for "${account}" were rejected (${err.message}). ` +
         `Clearing them and starting interactive authorization.`
     );
     clearTokens(suffix);
-    return withProfile();
+    return attempt();
   }
 }
 
