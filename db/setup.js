@@ -164,6 +164,15 @@ async function runSetup(config = {}) {
     console.log("Added insurance.BrokerId column");
   }
 
+  // The add-insurance form now submits StartDate, but `CREATE TABLE IF NOT
+  // EXISTS` above only guarantees it on a brand-new table. Add it to existing
+  // databases that were created before this column was introduced, otherwise
+  // the sample/broker policy seeds below fail with "Unknown column 'StartDate'".
+  if (!insColNames.has("StartDate")) {
+    await db.query("ALTER TABLE insurance ADD COLUMN StartDate DATE NULL");
+    console.log("Added insurance.StartDate column");
+  }
+
   // Rename insurance.Cash -> insurance.PaymentType and store "Cash"/"Card"
   // instead of the legacy "true"/"false" (or "1"/"yes") flag values.
   if (insColNames.has("Cash") && !insColNames.has("PaymentType")) {
