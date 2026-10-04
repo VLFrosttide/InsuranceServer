@@ -39,22 +39,66 @@ function obtainAuthCode(redirectUri) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let server = null;
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
+    let rl = null;
+
+    const cleanup = () => {
+      if (rl) {
+        try {
+          rl.close();
+        } catch {
+          // Ignore close errors; the original failure is more useful.
+        }
+      }
+      if (server) {
+        try {
+          server.close();
+        } catch {
+          // Ignore.
+        }
+        try {
+          server.closeAllConnections?.();
+        } catch {
+          // Ignore.
+        }
+      }
+    };
 
     const done = (err, code) => {
       if (settled) return;
       settled = true;
-      rl.close();
-      if (server) {
-        server.close();
-        server.closeAllConnections?.();
-      }
+      cleanup();
       if (err) reject(err);
       else resolve(code);
     };
+
+    try {
+      rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+      });
+    } catch (err) {
+      done(
+        new Error(
+          `Could not open the terminal to read the authorization code ` +
+            `(${err.code || err.message}). Re-run authorization locally so ` +
+            `tokens are written to .env, or provide valid GMAIL_* values.`
+        )
+      );
+      return;
+    }
+
+    // If the input stream fails asynchronously (e.g. a Windows console handle
+    // that cannot be read), surface the same actionable message instead of a
+    // raw OS error such as `open EEXIST`.
+    rl.on("error", (err) => {
+      done(
+        new Error(
+          `Could not read the authorization code in this environment ` +
+            `(${err.code || err.message}). Re-run authorization locally so ` +
+            `tokens are written to .env, or provide valid GMAIL_* values.`
+        )
+      );
+    });
 
     rl.question("Redirect URL or code: ", (answer) => {
       const pasted = String(answer || "").trim();
