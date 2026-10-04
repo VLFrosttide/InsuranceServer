@@ -249,19 +249,36 @@ async function runSetup(config = {}) {
     console.log("Migrated current cash to multi-currency schema");
   }
 
+  // Migration: current cash is now per-branch. Drop and recreate tables when
+  // the Branch column is missing so existing deployments get a clean schema.
+  const [cashBranchCheck] = await db.query(
+    "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    [DB_NAME, "current_cash"]
+  );
+  const cashBranchColNames = new Set(cashBranchCheck.map((c) => c.COLUMN_NAME));
+  if (!cashBranchColNames.has("Branch")) {
+    await db.query("DROP TABLE IF EXISTS cash_transactions");
+    await db.query("DROP TABLE IF EXISTS cash_resets");
+    await db.query("DROP TABLE IF EXISTS current_cash");
+    console.log("Migrated current cash to per-branch schema");
+  }
+
   await db.query(`
     CREATE TABLE IF NOT EXISTS current_cash (
       id INT NOT NULL,
+      Branch VARCHAR(45) NOT NULL DEFAULT '',
       Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
       CurrentCash DECIMAL(15,2) NOT NULL DEFAULT 0,
       UpdatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      PRIMARY KEY (id, Currency)
+      PRIMARY KEY (id, Branch, Currency),
+      KEY idx_current_cash_branch (Branch)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS cash_transactions (
       id INT NOT NULL AUTO_INCREMENT,
+      Branch VARCHAR(45) NOT NULL DEFAULT '',
       Type VARCHAR(20) NOT NULL,
       Amount DECIMAL(15,2) NOT NULL,
       Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
@@ -269,6 +286,7 @@ async function runSetup(config = {}) {
       Reason VARCHAR(255) NOT NULL,
       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
+      KEY idx_cash_transactions_branch (Branch),
       KEY idx_cash_transactions_username (Username)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
@@ -276,11 +294,13 @@ async function runSetup(config = {}) {
   await db.query(`
     CREATE TABLE IF NOT EXISTS cash_resets (
       id INT NOT NULL AUTO_INCREMENT,
+      Branch VARCHAR(45) NOT NULL DEFAULT '',
       Username VARCHAR(45) NOT NULL,
       Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
       KeptAmount DECIMAL(15,2) NOT NULL DEFAULT 0,
       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
+      KEY idx_cash_resets_branch (Branch),
       KEY idx_cash_resets_username (Username)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);

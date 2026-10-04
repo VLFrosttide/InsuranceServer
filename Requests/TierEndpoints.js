@@ -590,32 +590,71 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // Shared insurance endpoints (roles 1 and 2)
   // ---------------------------------------------------------------------
 
-  // GET /insurances?author=X&date=Y
-  // Returns insurances created by the given author on the given date.
+  // GET /insurances?author=&date=&policyNumber=&blancNumber=&carNumber=
+  // Returns insurances matching any combination of the supplied filters.
+  // At least one filter must be provided. Author/date match exactly (date
+  // compares only the calendar day); policyNumber/blancNumber/carNumber use a
+  // partial (substring) match so partially-remembered numbers still work.
   router.get("/insurances", auth, requireRole(1, 2), async (req, res) => {
     try {
-      const author = req.query.author;
-      const date = req.query.date;
+      const author = req.query.author ? String(req.query.author).trim() : "";
+      const date = req.query.date ? String(req.query.date).trim() : "";
+      const policyNumber = req.query.policyNumber
+        ? String(req.query.policyNumber).trim()
+        : "";
+      const blancNumber = req.query.blancNumber
+        ? String(req.query.blancNumber).trim()
+        : "";
+      const carNumber = req.query.carNumber
+        ? String(req.query.carNumber).trim()
+        : "";
 
-      if (!author || !date) {
-        return res
-          .status(400)
-          .json({ error: "author and date query parameters are required" });
+      if (!author && !date && !policyNumber && !blancNumber && !carNumber) {
+        return res.status(400).json({
+          error:
+            "At least one search parameter is required (author, date, policyNumber, blancNumber or carNumber)",
+        });
       }
 
-      if (!/^\d{4}-\d{2}-\d{2}/.test(date)) {
+      if (date && !/^\d{4}-\d{2}-\d{2}/.test(date)) {
         return res
           .status(400)
           .json({ error: "date must be in YYYY-MM-DD format" });
       }
 
+      const conditions = [];
+      const params = [];
+
+      if (author) {
+        conditions.push("Author = ?");
+        params.push(author);
+      }
+      if (date) {
+        conditions.push("DATE(CreationDate) = DATE(?)");
+        params.push(date);
+      }
+      if (policyNumber) {
+        conditions.push("PolicyNumber LIKE ?");
+        params.push(`%${policyNumber}%`);
+      }
+      if (blancNumber) {
+        conditions.push("BlancNumber LIKE ?");
+        params.push(`%${blancNumber}%`);
+      }
+      if (carNumber) {
+        conditions.push("CarNumber LIKE ?");
+        params.push(`%${carNumber}%`);
+      }
+
       const [rows] = await DBConnection.query(
-        "SELECT * FROM insurance WHERE Author = ? AND DATE(CreationDate) = DATE(?)",
-        [author, date]
+        `SELECT * FROM insurance WHERE ${conditions.join(
+          " AND "
+        )} ORDER BY CreationDate DESC`,
+        params
       );
       res.json({ insurances: rows });
     } catch (err) {
-      console.error("Insurance by author/date lookup failed:", err);
+      console.error("Insurance search lookup failed:", err);
       res.status(500).json({ error: "Failed to fetch insurances" });
     }
   });

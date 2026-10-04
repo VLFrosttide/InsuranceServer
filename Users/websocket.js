@@ -41,6 +41,10 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
     ws.username = null;
     ws.role = null;
     ws.isAlive = true;
+    // Email cards claimed through this specific connection. Used to release
+    // them if the worker client drops (power loss / network failure) so other
+    // workers can pick them up again.
+    ws.claimedEmails = new Set();
 
     ws.on("pong", () => {
       ws.isAlive = true;
@@ -49,7 +53,20 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
     ws.on("message", (data) => handleMessage(ws, data));
 
     ws.on("close", () => {
-      // Socket cleanup is implicit; the client set is maintained by `ws`.
+      // Release every email card this connection still holds. A worker that is
+      // no longer connected must not keep cards reserved forever; return them
+      // to the shared pool so another worker can claim them.
+      for (const messageId of ws.claimedEmails) {
+        const email = mailStore.get(messageId);
+        if (!email) continue;
+        // Only release if this connection is still the actual claimer. The
+        // card may have been released/completed and re-claimed by someone else
+        // in the meantime.
+        if (mailStore.getClaimer(messageId) === ws.username) {
+          mailStore.unclaim(messageId);
+          broadcast({ type: "email_released", data: email });
+        }
+      }
     });
   });
 
@@ -128,6 +145,7 @@ async function handleMessage(ws, data) {
     }
     const ok = mailStore.claim(messageId, ws.username);
     if (ok) {
+      ws.claimedEmails.add(messageId);
       broadcast({ type: "email_claimed", messageId });
     }
     ws.send(JSON.stringify({ type: "claim_email", ok, messageId }));
@@ -141,6 +159,7 @@ async function handleMessage(ws, data) {
     // the full email so clients without it can reconstruct the card.
     if (!claimer || claimer === ws.username) {
       mailStore.unclaim(messageId);
+      ws.claimedEmails.delete(messageId);
       if (claimer === ws.username) {
         const email = mailStore.get(messageId);
         if (email) broadcast({ type: "email_released", data: email });
@@ -155,6 +174,7 @@ async function handleMessage(ws, data) {
     if (!email) return;
 
     mailStore.remove(messageId);
+    ws.claimedEmails.delete(messageId);
     // Only now mark the Gmail message read (the worker finished the form).
     // Pass the account so the correct inbox's API client is used.
     try {
