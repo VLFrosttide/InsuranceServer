@@ -12,7 +12,24 @@ async function Authorize(MyClient, Account, RedirectUri) {
     MyClient.on("tokens", (fresh) => {
       persistTokens({ ...existing, ...fresh }, suffix);
     });
-    console.log("Using an existing token for account: " + Account);
+
+    // Never trust a stored access token blindly. It can be stale (Google
+    // rejects it while its `expiry_date` still looks like it is in the future)
+    // or truncated/corrupted, which surfaces as a 401 "Request had invalid
+    // authentication credentials". Because the request then carries an
+    // expiry_date, google-auth-library will NOT retry with a refresh, so the
+    // inbox gets permanently skipped. Minting a fresh access token from the
+    // refresh token here makes that impossible.
+    //
+    // `forceRefreshOnFailure` additionally makes any unexpected 401 mid-run
+    // refresh once and retry, rather than failing the whole poll cycle.
+    //
+    // If the refresh token itself is dead this throws `invalid_grant`, which
+    // the caller treats as a broken token: it clears the tokens and re-runs the
+    // interactive consent flow.
+    MyClient.forceRefreshOnFailure = true;
+    await MyClient.refreshAccessToken();
+    console.log("Refreshed access token for account: " + Account);
     return MyClient;
   }
 
@@ -55,6 +72,8 @@ async function Authorize(MyClient, Account, RedirectUri) {
 
   MyClient.setCredentials(tokens);
   persistTokens(tokens, suffix);
+  // Keep a fresh token flowing even if a later request is rejected.
+  MyClient.forceRefreshOnFailure = true;
   MyClient.on("tokens", (fresh) => {
     persistTokens({ ...tokens, ...fresh }, suffix);
   });
