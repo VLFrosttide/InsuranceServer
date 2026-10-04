@@ -205,6 +205,7 @@ async function main() {
       {
         PolicyNumber: "BG/TEST/1",
         BlancNumber: `B${Date.now()}`,
+        CarNumber: "CB 1234 AB",
         Duration: "3 месеца",
         Branch: "ГКПП Лесово",
         Otomobil: "Otomobil",
@@ -223,6 +224,7 @@ async function main() {
       "/worker/insurances",
       {
         BlancNumber: dupBlanc,
+        CarNumber: "CB 1111 AA",
       },
       workerToken
     );
@@ -232,6 +234,7 @@ async function main() {
       "/worker/insurances",
       {
         BlancNumber: dupBlanc,
+        CarNumber: "CB 1111 AA",
       },
       workerToken
     );
@@ -353,11 +356,12 @@ async function main() {
       JSON.stringify(demoBroker)
     );
 
-    // Worker can increase a broker balance.
+    // Worker can increase a broker balance. The movement is mirrored into
+    // current cash (reason/currency are required).
     r = await req(
       "POST",
       `/brokers/${brokerId}/increase`,
-      { amount: 100 },
+      { amount: 100, reason: "test broker increase", currency: "EUR" },
       workerToken
     );
     check(
@@ -366,16 +370,17 @@ async function main() {
       JSON.stringify(r.data)
     );
 
-    // Worker can reduce a broker balance (may go negative).
+    // Worker can reduce a broker balance. The reduction is mirrored out of
+    // current cash, so it must stay within the available current cash.
     r = await req(
       "POST",
       `/brokers/${brokerId}/reduce`,
-      { amount: 200 },
+      { amount: 50, reason: "test broker reduce", currency: "EUR" },
       workerToken
     );
     check(
       "POST /brokers/:id/reduce (worker)",
-      r.status === 200 && r.data.amount === 200,
+      r.status === 200 && r.data.amount === 50,
       JSON.stringify(r.data)
     );
 
@@ -415,6 +420,7 @@ async function main() {
       "/worker/insurances",
       {
         BlancNumber: brokerInsuranceBlanc,
+        CarNumber: "CB 5678 CD",
         Price: "500",
         EmailFrom: "demo@broker.example",
       },
@@ -460,6 +466,7 @@ async function main() {
       "/worker/insurances",
       {
         BlancNumber: `CASH${Date.now()}`,
+        CarNumber: "CB 2222 BB",
         Price: "300",
         Cash: "true",
       },
@@ -491,6 +498,7 @@ async function main() {
       "/worker/insurances",
       {
         BlancNumber: `CARD${Date.now()}`,
+        CarNumber: "CB 3333 CC",
         Price: "125",
         Cash: "false",
       },

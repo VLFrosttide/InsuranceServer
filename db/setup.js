@@ -89,6 +89,7 @@ async function runSetup(config = {}) {
       CreationDate DATETIME NOT NULL,
       PolicyNumber VARCHAR(45) NOT NULL,
       BlancNumber VARCHAR(45) NOT NULL,
+      CarNumber VARCHAR(45) NOT NULL DEFAULT '',
       Price VARCHAR(45) NOT NULL,
       CurrencyType VARCHAR(45) NOT NULL,
       Duration INT NOT NULL,
@@ -171,6 +172,14 @@ async function runSetup(config = {}) {
   if (!insColNames.has("StartDate")) {
     await db.query("ALTER TABLE insurance ADD COLUMN StartDate DATE NULL");
     console.log("Added insurance.StartDate column");
+  }
+
+  // Car number / Номер автомобил: required on the add-insurance form.
+  if (!insColNames.has("CarNumber")) {
+    await db.query(
+      "ALTER TABLE insurance ADD COLUMN CarNumber VARCHAR(45) NOT NULL DEFAULT ''"
+    );
+    console.log("Added insurance.CarNumber column");
   }
 
   // Rename insurance.Cash -> insurance.PaymentType and store "Cash"/"Card"

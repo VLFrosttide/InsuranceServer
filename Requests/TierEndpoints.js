@@ -389,6 +389,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       const b = req.body || {};
       const policyNumber = b.PolicyNumber ?? b.policyNumber ?? "";
       const blancNumber = b.BlancNumber ?? b.blancNumber ?? "";
+      const carNumber = b.CarNumber ?? b.carNumber ?? "";
       const price = String(b.Price ?? b.price ?? "0");
       const currencyType = b.CurrencyType ?? b.currencyType ?? "";
       const duration = parseDurationDays(b.Duration ?? b.duration ?? 0);
@@ -418,6 +419,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       if (!blancNumber) {
         return res.status(400).json({ error: "BlancNumber is required" });
       }
+      if (!String(carNumber).trim()) {
+        return res.status(400).json({ error: "CarNumber is required" });
+      }
 
       const priceDecimal = toDecimal(price);
 
@@ -431,14 +435,15 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
         await conn.query(
           `INSERT INTO insurance
-              (Author, CreationDate, PolicyNumber, BlancNumber, Price,
+              (Author, CreationDate, PolicyNumber, BlancNumber, CarNumber, Price,
                CurrencyType, Duration, Broker, Branch, Otomobil, PaymentType,
                StartDate, BrokerId)
-           VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             req.user.username,
             policyNumber,
             blancNumber,
+            String(carNumber).trim(),
             price,
             currencyType,
             duration,
@@ -510,6 +515,39 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       res.status(500).json({ error: "Failed to create insurance" });
     }
   });
+
+  // POST /worker/insurances/reply
+  // Send a text reply back to the original sender of an unread email. Used by
+  // the dedicated reply field at the bottom of the add-insurance form when it
+  // was opened from an email card.
+  router.post(
+    "/worker/insurances/reply",
+    auth,
+    requireRole(2),
+    async (req, res) => {
+      try {
+        const messageId = req.body?.messageId ?? req.body?.MessageId ?? null;
+        const bodyText = String(
+          req.body?.bodyText ?? req.body?.BodyText ?? ""
+        ).trim();
+
+        if (!messageId) {
+          return res.status(400).json({ error: "messageId is required" });
+        }
+        if (!bodyText) {
+          return res.status(400).json({ error: "bodyText is required" });
+        }
+
+        await sendReply(messageId, [], bodyText);
+        res.json({ message: "Reply sent" });
+      } catch (err) {
+        console.error("Worker insurance reply failed:", err);
+        res.status(500).json({
+          error: err && err.message ? err.message : "Failed to send reply",
+        });
+      }
+    }
+  );
 
   // ---------------------------------------------------------------------
   // Client tier (role 3)

@@ -11,7 +11,11 @@
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
-const { toDecimal } = require("./CurrentCash.js");
+const {
+  toDecimal,
+  recordCashMovement,
+  normalizeCurrency,
+} = require("./CurrentCash.js");
 
 /**
  * Parse and validate a positive amount (returns null when invalid).
@@ -288,7 +292,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     }
   });
 
-  // POST /brokers/:id/increase  { amount }
+  // POST /brokers/:id/increase  { amount, reason, currency }
   router.post(
     "/brokers/:id/increase",
     auth,
@@ -305,12 +309,37 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             .status(400)
             .json({ error: "amount must be a positive number" });
         }
+        const reason = (
+          typeof req.body?.reason === "string" ? req.body.reason : ""
+        ).trim();
+        if (!reason) {
+          return res.status(400).json({ error: "reason is required" });
+        }
+        const currency = normalizeCurrency(req.body?.currency);
 
-        const [result] = await DBConnection.query(
-          "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
-          [amount, brokerId]
+        // Update the broker balance and mirror the movement into current cash in
+        // one transaction, so the two ledgers can never diverge.
+        const affectedRows = await DBConnection.withTransaction(
+          async (conn) => {
+            const [r] = await conn.query(
+              "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
+              [amount, brokerId]
+            );
+            if (r.affectedRows === 0) return r.affectedRows;
+
+            await recordCashMovement(
+              conn,
+              req.user.username,
+              "increase",
+              amount,
+              reason,
+              currency
+            );
+            return r.affectedRows;
+          }
         );
-        if (result.affectedRows === 0) {
+
+        if (affectedRows === 0) {
           return res.status(404).json({ error: "Broker not found" });
         }
 
@@ -318,15 +347,26 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
           [brokerId]
         );
-        res.json({ message: "Broker balance increased", amount, broker });
+        res.json({
+          message: "Broker balance increased",
+          amount,
+          currency,
+          broker,
+        });
       } catch (err) {
+        const msg = (err && err.message) || "";
+        if (msg.includes("amount") || msg.includes("reason")) {
+          return res.status(400).json({ error: msg });
+        }
         console.error("Broker increase failed:", err);
         res.status(500).json({ error: "Failed to increase broker balance" });
       }
     }
   );
 
-  // POST /brokers/:id/reduce  { amount } — balance may go negative.
+  // POST /brokers/:id/reduce  { amount, reason, currency } — balance may go
+  // negative. The equivalent amount is also reduced from current cash, so the
+  // reduction cannot exceed the available current cash.
   router.post(
     "/brokers/:id/reduce",
     auth,
@@ -343,12 +383,35 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             .status(400)
             .json({ error: "amount must be a positive number" });
         }
+        const reason = (
+          typeof req.body?.reason === "string" ? req.body.reason : ""
+        ).trim();
+        if (!reason) {
+          return res.status(400).json({ error: "reason is required" });
+        }
+        const currency = normalizeCurrency(req.body?.currency);
 
-        const [result] = await DBConnection.query(
-          "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
-          [amount, brokerId]
+        const affectedRows = await DBConnection.withTransaction(
+          async (conn) => {
+            const [r] = await conn.query(
+              "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
+              [amount, brokerId]
+            );
+            if (r.affectedRows === 0) return r.affectedRows;
+
+            await recordCashMovement(
+              conn,
+              req.user.username,
+              "reduce",
+              amount,
+              reason,
+              currency
+            );
+            return r.affectedRows;
+          }
         );
-        if (result.affectedRows === 0) {
+
+        if (affectedRows === 0) {
           return res.status(404).json({ error: "Broker not found" });
         }
 
@@ -356,8 +419,20 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
           [brokerId]
         );
-        res.json({ message: "Broker balance reduced", amount, broker });
+        res.json({
+          message: "Broker balance reduced",
+          amount,
+          currency,
+          broker,
+        });
       } catch (err) {
+        const msg = (err && err.message) || "";
+        if (msg.includes("amount") || msg.includes("reason")) {
+          return res.status(400).json({ error: msg });
+        }
+        if (msg.includes("insufficient")) {
+          return res.status(400).json({ error: msg });
+        }
         console.error("Broker reduce failed:", err);
         res.status(500).json({ error: "Failed to reduce broker balance" });
       }
