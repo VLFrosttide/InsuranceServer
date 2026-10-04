@@ -461,7 +461,8 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               req.user.username,
               "increase",
               priceDecimal,
-              blancNumber
+              blancNumber,
+              currencyType
             );
           } else {
             await recordCardPayment(

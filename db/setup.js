@@ -224,12 +224,29 @@ async function runSetup(config = {}) {
     console.log("Migrated current_cash from per-day to single-balance schema");
   }
 
+  // Migration: the old single-currency tables never stored a Currency, so we
+  // rebuild them when the column is missing. The previous table shape (plain
+  // `current_cash(id, CurrentCash)`) holds only a demo balance and is safe to
+  // drop and recreate with the per-currency composite key.
+  const [cashTxCols] = await db.query(
+    "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    [DB_NAME, "cash_transactions"]
+  );
+  const cashTxColNames = new Set(cashTxCols.map((c) => c.COLUMN_NAME));
+  if (!cashTxColNames.has("Currency")) {
+    await db.query("DROP TABLE IF EXISTS cash_transactions");
+    await db.query("DROP TABLE IF EXISTS cash_resets");
+    await db.query("DROP TABLE IF EXISTS current_cash");
+    console.log("Migrated current cash to multi-currency schema");
+  }
+
   await db.query(`
     CREATE TABLE IF NOT EXISTS current_cash (
       id INT NOT NULL,
+      Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
       CurrentCash DECIMAL(15,2) NOT NULL DEFAULT 0,
       UpdatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      PRIMARY KEY (id)
+      PRIMARY KEY (id, Currency)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
 
@@ -238,6 +255,7 @@ async function runSetup(config = {}) {
       id INT NOT NULL AUTO_INCREMENT,
       Type VARCHAR(20) NOT NULL,
       Amount DECIMAL(15,2) NOT NULL,
+      Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
       Username VARCHAR(45) NOT NULL,
       Reason VARCHAR(255) NOT NULL,
       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -250,6 +268,7 @@ async function runSetup(config = {}) {
     CREATE TABLE IF NOT EXISTS cash_resets (
       id INT NOT NULL AUTO_INCREMENT,
       Username VARCHAR(45) NOT NULL,
+      Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
       KeptAmount DECIMAL(15,2) NOT NULL DEFAULT 0,
       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id),

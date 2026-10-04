@@ -244,7 +244,7 @@ async function main() {
     r = await req("GET", "/currentcash", null, workerToken);
     check(
       "GET /currentcash (worker)",
-      r.status === 200 && typeof r.data.currentCash === "number",
+      r.status === 200 && typeof r.data.balances.EUR === "number",
       JSON.stringify(r.data)
     );
 
@@ -299,7 +299,7 @@ async function main() {
     r = await req("POST", "/currentcash/reset", null, workerToken);
     check(
       "POST /currentcash/reset (worker)",
-      r.status === 200 && typeof r.data.keptAmount === "number",
+      r.status === 200 && r.data.kept && typeof r.data.kept.EUR === "number",
       JSON.stringify(r.data)
     );
 
@@ -308,7 +308,7 @@ async function main() {
     check(
       "GET /currentcash after reset -> 0 with reset record",
       r.status === 200 &&
-        r.data.currentCash === 0 &&
+        r.data.balances.EUR === 0 &&
         Array.isArray(r.data.resets) &&
         r.data.resets.length >= 1,
       JSON.stringify(r.data)
@@ -325,7 +325,7 @@ async function main() {
     r = await req("GET", "/currentcash", null, adminToken);
     check(
       "GET /currentcash (admin)",
-      r.status === 200 && typeof r.data.currentCash === "number",
+      r.status === 200 && typeof r.data.balances.EUR === "number",
       JSON.stringify(r.data)
     );
 
@@ -450,7 +450,7 @@ async function main() {
     // instead of current cash. Measure both balances before/after to verify
     // the split.
     const cashBeforeCard = (await req("GET", "/currentcash", null, workerToken))
-      .data.currentCash;
+      .data.balances.EUR;
     const cardBefore = (await req("GET", "/cardpayments", null, workerToken))
       .data.cardBalance;
 
@@ -471,7 +471,7 @@ async function main() {
       JSON.stringify(r.data)
     );
     let cashNow = (await req("GET", "/currentcash", null, workerToken)).data
-      .currentCash;
+      .balances.EUR;
     let cardNow = (await req("GET", "/cardpayments", null, workerToken)).data
       .cardBalance;
     check(
@@ -502,7 +502,7 @@ async function main() {
       JSON.stringify(r.data)
     );
     const cashAfterCard = (await req("GET", "/currentcash", null, workerToken))
-      .data.currentCash;
+      .data.balances.EUR;
     const cardAfter = (await req("GET", "/cardpayments", null, workerToken))
       .data.cardBalance;
     check(
