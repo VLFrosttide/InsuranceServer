@@ -16,6 +16,18 @@ async function Authorize(MyClient, Account, RedirectUri) {
     return MyClient;
   }
 
+  // The consent flow is interactive: it prints a URL and waits for a code on
+  // stdin. On non-interactive hosting (no TTY) that wait would hang forever,
+  // so fail fast with an actionable message instead.
+  if (!process.stdin.isTTY) {
+    throw new Error(
+      `No tokens stored for "${Account}" and no interactive terminal is ` +
+        `available to complete Google OAuth. Run the authorization once ` +
+        `locally so tokens are written to .env, or provide valid GMAIL_*` +
+        `${suffix} values.`
+    );
+  }
+
   const AuthUrl = MyClient.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",

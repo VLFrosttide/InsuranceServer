@@ -5,6 +5,7 @@ const {
   loadCredentials,
   accountSuffix,
   hasCredentials,
+  clearTokens,
 } = require("./secrets.js");
 const Authorize = require("./Authorize.js");
 const mailStore = require("./mailStore.js");
@@ -48,6 +49,43 @@ async function processUnreadMessages(gmail, account) {
   }
 }
 
+// Google rejects a stale/revoked credential with one of these OAuth errors. In
+// that case the stored tokens can never be refreshed, so the only recovery is
+// to clear them and run the interactive consent flow again.
+function isBrokenTokenError(err) {
+  const message = (err && err.message) || String(err);
+  return /invalid_grant|unauthorized_client|invalid_client/.test(message);
+}
+
+// Authorize an inbox and validate its tokens by fetching the Gmail profile.
+// If the stored tokens were rejected, clear them once and re-run authorization
+// so a bad/placeholder token set never permanently disables the inbox.
+async function authorizeAccount(account) {
+  const suffix = accountSuffix(account);
+  const { clientId, clientSecret, redirectUri } = loadCredentials(suffix);
+
+  const withProfile = async () => {
+    const OAuthClient = CreateOauthClient(clientId, clientSecret, redirectUri);
+    await Authorize(OAuthClient, account, redirectUri);
+    const gmail = google.gmail({ version: "v1", auth: OAuthClient });
+    const Profile = await gmail.users.getProfile({ userId: "me" });
+    return { gmail, email: Profile.data.emailAddress };
+  };
+
+  try {
+    return await withProfile();
+  } catch (err) {
+    if (!isBrokenTokenError(err)) throw err;
+
+    console.warn(
+      `Stored Gmail tokens for "${account}" were rejected (${err.message}). ` +
+        `Clearing them and starting interactive authorization.`
+    );
+    clearTokens(suffix);
+    return withProfile();
+  }
+}
+
 /**
  * Initialize the Gmail integration. This is called dynamically from main.js
  * so the REST + WebSocket server can start immediately even if OAuth fails.
@@ -76,20 +114,8 @@ async function init() {
 }
 
 async function initAccount(account) {
-  const { clientId, clientSecret, redirectUri } = loadCredentials(
-    accountSuffix(account)
-  );
-
-  const OAuthClient = await Authorize(
-    CreateOauthClient(clientId, clientSecret, redirectUri),
-    account,
-    redirectUri
-  );
-
-  const gmail = google.gmail({ version: "v1", auth: OAuthClient });
-  const Profile = await gmail.users.getProfile({ userId: "me" });
-  const Email = Profile.data.emailAddress;
-  console.log(`Profile log (${account}): `, Email);
+  const { gmail, email } = await authorizeAccount(account);
+  console.log(`Profile log (${account}): `, email);
 
   // Register this inbox's client so completion can mark the message read
   // against the correct account.

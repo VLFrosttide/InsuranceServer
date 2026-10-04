@@ -49,6 +49,29 @@ module.exports.loadCredentials = function loadCredentials(suffix = "") {
   return { clientId, clientSecret, redirectUri };
 };
 
+// Values that are occasionally pasted into `.env` before a real authorization
+// run. They are never usable OAuth tokens and must be treated as "not set".
+function parseTokenValue(tokenKey, rawValue) {
+  if (rawValue === undefined || rawValue === null) return undefined;
+  const str = String(rawValue).trim();
+  if (!str) return undefined;
+
+  if (tokenKey === "access_token" || tokenKey === "refresh_token") {
+    // Real Google tokens are far longer than any placeholder such as "awd".
+    if (str.length < 20) return undefined;
+    return str;
+  }
+
+  if (tokenKey === "expiry_date") {
+    const n = Number(str);
+    if (!Number.isFinite(n) || n <= 0) return undefined;
+    return n;
+  }
+
+  // scope and token_type are informational.
+  return str;
+}
+
 // `suffix` selects which Gmail account inbox the tokens belong to. Account1
 // uses the base `GMAIL_*` names (backwards compatible with existing `.env`
 // files); Account2/Account3 append `_2`/`_3` (e.g. `GMAIL_ACCESS_TOKEN_2`).
@@ -56,13 +79,17 @@ module.exports.loadTokens = function loadTokens(suffix = "") {
   const tokens = {};
 
   for (const [tokenKey, baseEnvKey] of Object.entries(TOKEN_ENV_KEYS)) {
-    const value = process.env[baseEnvKey + suffix];
-    if (value !== undefined && value !== "") {
-      tokens[tokenKey] = tokenKey === "expiry_date" ? Number(value) : value;
+    const value = parseTokenValue(tokenKey, process.env[baseEnvKey + suffix]);
+    if (value !== undefined) {
+      tokens[tokenKey] = value;
     }
   }
 
-  return Object.keys(tokens).length > 0 ? tokens : null;
+  // An inbox counts as authorized only when both pieces needed for refresh are
+  // present. A partial/stale set (e.g. placeholder values) must go through the
+  // interactive consent flow.
+  if (!tokens.access_token || !tokens.refresh_token) return null;
+  return tokens;
 };
 
 // Writes refreshed/updated tokens back into the .env file so tokens only ever
@@ -97,4 +124,25 @@ module.exports.persistTokens = function persistTokens(tokens, suffix = "") {
   }
 
   fs.writeFileSync(ENV_PATH, updated.join("\n"));
+};
+
+// Removes the GMAIL_* token variables for one account from both the running
+// process and `.env`, so a follow-up call to loadTokens() returns null and the
+// interactive authorization flow runs from scratch.
+module.exports.clearTokens = function clearTokens(suffix = "") {
+  for (const baseEnvKey of Object.values(TOKEN_ENV_KEYS)) {
+    delete process.env[baseEnvKey + suffix];
+  }
+
+  if (!fs.existsSync(ENV_PATH)) return;
+
+  const names = new Set(
+    Object.values(TOKEN_ENV_KEYS).map((base) => base + suffix)
+  );
+  const lines = fs.readFileSync(ENV_PATH, "utf8").split(/\r?\n/);
+  const kept = lines.filter((line) => {
+    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+    return !(match && names.has(match[1]));
+  });
+  fs.writeFileSync(ENV_PATH, kept.join("\n"));
 };
