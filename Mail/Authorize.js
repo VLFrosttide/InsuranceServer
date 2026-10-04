@@ -2,6 +2,21 @@ const { SCOPES } = require("./constants.js");
 const { loadTokens, persistTokens, accountSuffix } = require("./secrets.js");
 const obtainAuthCode = require("./ObtainCode.js");
 
+// Merely *referencing* `process.stdin` lazily constructs the underlying
+// tty/pipe stream for file descriptor 0. On non-interactive hosting (e.g. a
+// Node app manager with no attached console) that lazy construction can throw
+// a raw OS error — commonly `Error: EEXIST, open ...` on Windows-based hosts —
+// instead of simply yielding a stream whose `isTTY` is `false`/`undefined`.
+// Guarding the access means any such failure is treated the same as "no
+// interactive terminal available" instead of crashing with an opaque OS error.
+function stdinIsInteractive() {
+  try {
+    return Boolean(process.stdin && process.stdin.isTTY);
+  } catch {
+    return false;
+  }
+}
+
 async function Authorize(MyClient, Account, RedirectUri) {
   // Each account keeps its tokens under `GMAIL_*` (Account1) or a suffixed
   // variant (`GMAIL_*_2`/`GMAIL_*_3`), all read from the environment (.env).
@@ -34,9 +49,10 @@ async function Authorize(MyClient, Account, RedirectUri) {
   }
 
   // The consent flow is interactive: it prints a URL and waits for a code on
-  // stdin. On non-interactive hosting (no TTY) that wait would hang forever,
-  // so fail fast with an actionable message instead.
-  if (!process.stdin.isTTY) {
+  // stdin. On non-interactive hosting (no TTY, or where merely touching
+  // `process.stdin` throws an OS error) that wait would hang forever or crash
+  // with an opaque error, so fail fast with an actionable message instead.
+  if (!stdinIsInteractive()) {
     throw new Error(
       `No tokens stored for "${Account}" and no interactive terminal is ` +
         `available to complete Google OAuth. Run the authorization once ` +
