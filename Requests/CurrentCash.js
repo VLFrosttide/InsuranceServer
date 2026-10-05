@@ -268,6 +268,39 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
   const reasonText = (reason) =>
     typeof reason === "string" ? reason.trim() : "";
 
+  // GET /currentcash/branches — all branches with cash (branches that have any
+  // non-zero balance in any currency).
+  router.get(
+    "/currentcash/branches",
+    auth,
+    requireCashRole,
+    async (req, res) => {
+      try {
+        const [rows] = await DBConnection.query(
+          `SELECT DISTINCT Branch FROM current_cash WHERE CurrentCash != 0 ORDER BY Branch`
+        );
+        const branches = rows.map((r) => r.Branch);
+
+        // Fetch balances for each branch
+        const branchData = {};
+        for (const branch of branches) {
+          const balances = await getCurrentCash(DBConnection, branch);
+          const nonZero = Object.entries(balances).filter(
+            ([, value]) => Number(value) !== 0
+          );
+          if (nonZero.length > 0) {
+            branchData[branch] = Object.fromEntries(nonZero);
+          }
+        }
+
+        res.json({ branches: branchData });
+      } catch (err) {
+        console.error("CurrentCash branches lookup failed:", err);
+        res.status(500).json({ error: "Failed to fetch branches" });
+      }
+    }
+  );
+
   // GET /currentcash — per-currency balances, transaction and reset history
   // for the branch specified in the query string (?branch=...).
   router.get("/currentcash", auth, requireCashRole, async (req, res) => {
