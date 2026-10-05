@@ -34,6 +34,7 @@ let Huseyin = [
   "abyesilsigorta@gmail.com",
   "info@abyesilsigorta.com",
   "1976haci.huseyin@gmail.com",
+  "abyesilsigorta@gmail.com",
 ];
 let BalkanTravel = [
   "abdullahozturk@balkantravel.com.tr",
