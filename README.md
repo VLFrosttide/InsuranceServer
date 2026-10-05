@@ -272,12 +272,22 @@ an insurance with `PaymentType = "Card"` (the `Cash` request field set to
 
 Each broker has a cash balance. Only admins
 (role 1) and workers (role 2) can view or change a broker balance (unlike
-current cash, a broker balance may go negative).
+current cash, a broker balance may go infinitely negative).
+
+Current cash and broker balance are intentionally asymmetric:
+
+- `POST /brokers/:id/increase` mirrors the same amount into current cash
+  (money is actually coming in), so current cash goes up too.
+- `POST /brokers/:id/reduce`, and the automatic per-policy deduction made when
+  an insurance is created from an email card, never touch current cash.
+  Current cash never decreases as a side effect of a broker balance
+  reduction, and a reduction is never blocked by how much current cash
+  happens to be available.
 
 - `GET /brokers` — list all brokers with balance and inactive policies
 - `GET /brokers/:id` — single broker
-- `POST /brokers/:id/increase` — body `{ "amount": 100 }`
-- `POST /brokers/:id/reduce` — body `{ "amount": 50 }` (may go negative)
+- `POST /brokers/:id/increase` — body `{ "amount": 100 }` (mirrors into current cash)
+- `POST /brokers/:id/reduce` — body `{ "amount": 50 }` (may go infinitely negative; does not touch current cash)
 
 Admin-only (`role 1`) broker management:
 
@@ -287,7 +297,7 @@ Admin-only (`role 1`) broker management:
 - `PATCH /brokers/:id` — update a broker's fields and/or its emails
 - `DELETE /brokers/:id` — delete a broker (detaches any linked insurances)
 
-Each created insurance whose email sender is associated with a broker charges that broker a flat fee: the broker balance is reduced by the full Price (it may go negative) and the broker InactivePolicies is decremented by 1.
+Each created insurance whose email sender is associated with a broker charges that broker a flat fee: the broker balance is reduced by the full Price (it may go infinitely negative, and this never touches current cash) and the broker InactivePolicies is decremented by 1.
 
 ## WebSocket
 

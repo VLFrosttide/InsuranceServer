@@ -3,7 +3,17 @@
 //
 // Each broker has a cash balance that only admins (role 1) and workers
 // (role 2) can increase/reduce. Unlike daily current cash, a broker balance
-// may go negative.
+// may go infinitely negative.
+//
+// Current cash and broker balance are intentionally asymmetric:
+//   - Increasing a broker's balance mirrors the same amount into current
+//     cash (money is actually coming in), so current cash goes up too.
+//   - Reducing a broker's balance (including the per-policy deduction made
+//     when an insurance is created from an email card, see
+//     decreaseBrokerForInsurance below) never touches current cash. Current
+//     cash must never decrease as a side effect of a broker balance
+//     reduction, and a broker reduction must never be blocked by how much
+//     current cash happens to be available.
 //
 // Creating an insurance whose email sender is associated with a broker
 // deducts a flat fee (the policy price) from that broker's balance and
@@ -397,8 +407,10 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   );
 
   // POST /brokers/:id/reduce  { amount, reason, currency } — balance may go
-  // negative. The equivalent amount is also reduced from current cash, so the
-  // reduction cannot exceed the available current cash.
+  // infinitely negative. Unlike the increase endpoint, this does NOT touch
+  // current cash: current cash only ever increases when a broker balance is
+  // increased (money actually coming in), so reducing a broker balance must
+  // never decrease current cash or be blocked by its availability.
   router.post(
     "/brokers/:id/reduce",
     auth,
@@ -422,30 +434,13 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           return res.status(400).json({ error: "reason is required" });
         }
         const currency = normalizeCurrency(req.body?.currency);
-        const branch = normalizeBranch(req.body?.branch);
 
-        const affectedRows = await DBConnection.withTransaction(
-          async (conn) => {
-            const [r] = await conn.query(
-              "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
-              [amount, brokerId]
-            );
-            if (r.affectedRows === 0) return r.affectedRows;
-
-            await recordCashMovement(
-              conn,
-              branch,
-              req.user.username,
-              "reduce",
-              amount,
-              reason,
-              currency
-            );
-            return r.affectedRows;
-          }
+        const [r] = await DBConnection.query(
+          "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
+          [amount, brokerId]
         );
 
-        if (affectedRows === 0) {
+        if (r.affectedRows === 0) {
           return res.status(404).json({ error: "Broker not found" });
         }
 
@@ -462,9 +457,6 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       } catch (err) {
         const msg = (err && err.message) || "";
         if (msg.includes("amount") || msg.includes("reason")) {
-          return res.status(400).json({ error: msg });
-        }
-        if (msg.includes("insufficient")) {
           return res.status(400).json({ error: msg });
         }
         console.error("Broker reduce failed:", err);

@@ -370,8 +370,13 @@ async function main() {
       JSON.stringify(r.data)
     );
 
-    // Worker can reduce a broker balance. The reduction is mirrored out of
-    // current cash, so it must stay within the available current cash.
+    // Worker can reduce a broker balance. Unlike the increase endpoint, this
+    // never touches current cash: current cash only ever goes up when a
+    // broker balance is increased, never down when it is reduced.
+    const cashBeforeBrokerReduce = (
+      await req("GET", "/currentcash", null, workerToken)
+    ).data.balances.EUR;
+
     r = await req(
       "POST",
       `/brokers/${brokerId}/reduce`,
@@ -381,6 +386,29 @@ async function main() {
     check(
       "POST /brokers/:id/reduce (worker)",
       r.status === 200 && r.data.amount === 50,
+      JSON.stringify(r.data)
+    );
+
+    const cashAfterBrokerReduce = (
+      await req("GET", "/currentcash", null, workerToken)
+    ).data.balances.EUR;
+    check(
+      "Broker reduce does not change current cash",
+      cashAfterBrokerReduce === cashBeforeBrokerReduce,
+      `${cashBeforeBrokerReduce} -> ${cashAfterBrokerReduce}`
+    );
+
+    // Reducing a broker balance by more than the available current cash must
+    // still succeed and may push the broker balance infinitely negative.
+    r = await req(
+      "POST",
+      `/brokers/${brokerId}/reduce`,
+      { amount: 999999999, reason: "massive reduce", currency: "EUR" },
+      workerToken
+    );
+    check(
+      "POST /brokers/:id/reduce beyond current cash -> 200 (broker may go negative)",
+      r.status === 200 && r.data.amount === 999999999,
       JSON.stringify(r.data)
     );
 
