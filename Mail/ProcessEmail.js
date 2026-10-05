@@ -4,6 +4,7 @@ const path = require("node:path");
 const walkParts = require("./walkParts.js");
 const { notifyUnreadEmail } = require("../Users/websocket.js");
 const mailStore = require("./mailStore.js");
+const { isKnownBrokerSender } = require("./brokerSenders.js");
 
 const SAVE_TO_DISK = process.env.SAVE_ATTACHMENTS_TO_DISK !== "0";
 const ATTACHMENTS_DIR = path.resolve(
@@ -125,6 +126,12 @@ module.exports.ProcessEmail = async function ProcessEmail(
   // Skip work we already know about (e.g. because the server restarted before
   // a worker completed the form). The message is only marked read on complete.
   if (mailStore.has(account, messageId)) {
+    return;
+  }
+
+  // Only emails from a known broker (database / BrokerInfo.js) are shown to
+  // clients. Anything else is ignored: never stored, broadcast, or marked read.
+  if (!(await isKnownBrokerSender(emailInfo.from))) {
     return;
   }
 

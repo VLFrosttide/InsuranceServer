@@ -1,5 +1,6 @@
 const { WebSocketServer, WebSocket } = require("ws");
 const mailStore = require("../Mail/mailStore.js");
+const { canSeeEmail } = require("../Mail/branchRouting.js");
 
 let wss = null;
 let db = null;
@@ -40,6 +41,7 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
   wss.on("connection", (ws) => {
     ws.username = null;
     ws.role = null;
+    ws.branch = "";
     ws.isAlive = true;
     // Email cards claimed through this specific connection. Used to release
     // them if the worker client drops (power loss / network failure) so other
@@ -64,7 +66,7 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
         // in the meantime.
         if (mailStore.getClaimer(messageId) === ws.username) {
           mailStore.unclaim(messageId);
-          broadcast({ type: "email_released", data: email });
+          broadcast({ type: "email_released", data: email }, email);
         }
       }
     });
@@ -104,6 +106,9 @@ async function handleMessage(ws, data) {
         const username = rows[0].Username;
         ws.username = username;
         ws.role = rows[0].Role;
+        // Branch the worker selected at login; used to restrict which
+        // brokers' emails this worker may see.
+        ws.branch = typeof msg.branch === "string" ? msg.branch : "";
         ws.send(JSON.stringify({ type: "auth_ok", username }));
       } else {
         ws.send(
@@ -124,7 +129,9 @@ async function handleMessage(ws, data) {
       ws.send(JSON.stringify({ type: "list_emails", data: [] }));
       return;
     }
-    const data = mailStore.listAll();
+    const data = mailStore
+      .listAll()
+      .filter((email) => canSeeEmail(ws.branch, email));
     ws.send(JSON.stringify({ type: "list_emails", data }));
   } else if (msg.type === "claim_email") {
     if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
@@ -143,10 +150,21 @@ async function handleMessage(ws, data) {
       );
       return;
     }
+    if (!canSeeEmail(ws.branch, email)) {
+      ws.send(
+        JSON.stringify({
+          type: "claim_email",
+          ok: false,
+          messageId,
+          error: "Not found",
+        })
+      );
+      return;
+    }
     const ok = mailStore.claim(messageId, ws.username);
     if (ok) {
       ws.claimedEmails.add(messageId);
-      broadcast({ type: "email_claimed", messageId });
+      broadcast({ type: "email_claimed", messageId }, email);
     }
     ws.send(JSON.stringify({ type: "claim_email", ok, messageId }));
   } else if (msg.type === "release_email") {
@@ -154,6 +172,8 @@ async function handleMessage(ws, data) {
       return;
     }
     const messageId = msg.messageId || null;
+    const releasable = messageId ? mailStore.get(messageId) : null;
+    if (releasable && !canSeeEmail(ws.branch, releasable)) return;
     const claimer = mailStore.getClaimer(messageId);
     // Only the worker that holds the claim may return it to everyone. Carry
     // the full email so clients without it can reconstruct the card.
@@ -162,7 +182,7 @@ async function handleMessage(ws, data) {
       ws.claimedEmails.delete(messageId);
       if (claimer === ws.username) {
         const email = mailStore.get(messageId);
-        if (email) broadcast({ type: "email_released", data: email });
+        if (email) broadcast({ type: "email_released", data: email }, email);
       }
     }
   } else if (msg.type === "complete_email") {
@@ -172,6 +192,7 @@ async function handleMessage(ws, data) {
     const messageId = msg.messageId || null;
     const email = messageId ? mailStore.get(messageId) : null;
     if (!email) return;
+    if (!canSeeEmail(ws.branch, email)) return;
 
     mailStore.remove(messageId);
     ws.claimedEmails.delete(messageId);
@@ -182,7 +203,7 @@ async function handleMessage(ws, data) {
     } catch (err) {
       console.error("Failed to mark email as read:", err);
     }
-    broadcast({ type: "email_completed", messageId });
+    broadcast({ type: "email_completed", messageId }, email);
   }
 }
 
@@ -194,7 +215,7 @@ async function handleMessage(ws, data) {
  * @returns {number} Number of clients the notification was delivered to.
  */
 module.exports.notifyUnreadEmail = function notifyUnreadEmail(emailInfo) {
-  return broadcast({ type: "new_email", data: emailInfo });
+  return broadcast({ type: "new_email", data: emailInfo }, emailInfo);
 };
 
 /**
@@ -202,9 +223,11 @@ module.exports.notifyUnreadEmail = function notifyUnreadEmail(emailInfo) {
  * designated email-update role.
  *
  * @param {Object} payload  Message to deliver to workers.
+ * @param {Object} [email]  When given, only workers whose branch is allowed to
+ *   see this email (see Mail/branchRouting.js) receive the payload.
  * @returns {number} Number of clients the notification was delivered to.
  */
-function broadcast(payload) {
+function broadcast(payload, email) {
   if (!wss) return 0;
 
   let delivered = 0;
@@ -215,7 +238,8 @@ function broadcast(payload) {
     if (
       client.readyState === WebSocket.OPEN &&
       client.username &&
-      String(client.role) === EMAIL_UPDATE_ROLE
+      String(client.role) === EMAIL_UPDATE_ROLE &&
+      (!email || canSeeEmail(client.branch, email))
     ) {
       client.send(message);
       delivered++;

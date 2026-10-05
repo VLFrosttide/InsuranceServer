@@ -1,7 +1,6 @@
 let Ahmed = [
   "derincorlu@gmail.com",
   "ahmetozgur.muhtar@gmail.com",
-  "fatmaayaz306@gmail.com",
   "karakoc.alfa@gmail.com",
 ];
 let Yuksel = ["yukselfenerli@gmail.com"];
@@ -16,7 +15,7 @@ let Gursel = [
   "gursel_deniz@abv.bg",
 ];
 let Nevin = ["nevinisikoglu@hotmail.com"];
-let Izet = ["uzunardali@yahoo.com"];
+let Izet = ["uzunardali@yahoo.com", "uzunaedali@gmail.com"];
 let Nejat = ["1.15@materra.eu", "info@materra.eu"];
 let AhmetSemsek = ["ahmethaskovo5@gmail.com", "naciyeosman@hotmail.com"];
 let Sunay = ["sunaybest@gmail.com"];

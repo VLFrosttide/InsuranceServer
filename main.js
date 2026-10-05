@@ -226,6 +226,8 @@ async function start() {
     console.log("Connected to MySQL database.");
 
     initWsServer(httpServer, DBConnection);
+    // Let the mail pipeline check senders against the broker emails in the DB.
+    require("./Mail/brokerSenders.js").setDb(DBConnection);
     startGmailPolling();
 
     console.log(`Server listening on http://${HOST}:${PORT}`);
