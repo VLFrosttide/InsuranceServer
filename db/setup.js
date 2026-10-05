@@ -8,6 +8,7 @@
 // Requires .env to contain DB_PASSWORD (MySQL root password).
 const mysql = require("mysql2/promise");
 const bcrypt = require("bcrypt");
+const { seedBrokersFromInfo } = require("./BrokerInfo.js");
 
 /**
  * Run the idempotent schema creation + test-data seed.
@@ -474,6 +475,14 @@ async function runSetup(config = {}) {
   await db.query(
     "ALTER TABLE brokers MODIFY COLUMN CashBalance DECIMAL(15,2) NOT NULL DEFAULT 0"
   );
+
+  // Seed brokers + their tariffs from BrokerInfo.js. Idempotent: existing
+  // brokers/tariffs are never overwritten.
+  try {
+    await seedBrokersFromInfo(db);
+  } catch (err) {
+    console.warn("Broker seed from BrokerInfo.js failed:", err.message || err);
+  }
 
   console.log("Database setup complete.");
 

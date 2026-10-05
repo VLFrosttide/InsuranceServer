@@ -806,6 +806,40 @@ const BrokerData = {
 };
 
 /**
+ * Seed the tariffs of one broker from the Pricing table above, but only when
+ * the database holds no tariffs for that broker yet (never overwrites data).
+ *
+ * @param {import("mysql2/promise").Connection} db
+ * @param {number} brokerId
+ * @param {string} brokerName
+ * @returns {Promise<number>} number of tariff rows inserted
+ */
+async function seedBrokerTariffsIfMissing(db, brokerId, brokerName) {
+  const brokerPricing = Pricing[brokerName];
+  if (!brokerPricing) return 0;
+
+  const [[{ n }]] = await db.query(
+    "SELECT COUNT(*) AS n FROM broker_tariffs WHERE BrokerId = ?",
+    [brokerId]
+  );
+  if (n > 0) return 0;
+
+  let inserted = 0;
+  for (const [insuranceType, durations] of Object.entries(brokerPricing)) {
+    for (const [duration, price] of Object.entries(durations)) {
+      await db.query(
+        `INSERT INTO broker_tariffs (BrokerId, InsuranceType, Duration, Price)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE Price = Price`,
+        [brokerId, insuranceType, parseInt(duration, 10), parseFloat(price)]
+      );
+      inserted++;
+    }
+  }
+  return inserted;
+}
+
+/**
  * Seed brokers from BrokerInfo.js into the database with their emails and tariffs.
  * This function seeds brokers only if they don't already exist (idempotent).
  *
@@ -814,10 +848,16 @@ const BrokerData = {
 async function seedBrokersFromInfo(db) {
   // Get existing brokers to avoid duplicates
   const [existingBrokers] = await db.query(
-    "SELECT Name FROM brokers WHERE Name IN (?)",
+    "SELECT id, Name FROM brokers WHERE Name IN (?)",
     [Object.keys(BrokerData)]
   );
   const existingBrokerNames = new Set(existingBrokers.map((b) => b.Name));
+
+  // Existing brokers keep their data; only fill in tariffs when the database
+  // has none for them yet.
+  for (const b of existingBrokers) {
+    await seedBrokerTariffsIfMissing(db, b.id, b.Name);
+  }
 
   let seedCount = 0;
 
@@ -849,20 +889,7 @@ async function seedBrokersFromInfo(db) {
     }
 
     // Insert broker tariffs from Pricing data
-    if (Pricing[brokerName]) {
-      const brokerPricing = Pricing[brokerName];
-      for (const [insuranceType, durations] of Object.entries(brokerPricing)) {
-        for (const [duration, price] of Object.entries(durations)) {
-          await db.query(
-            `INSERT INTO broker_tariffs
-               (BrokerId, InsuranceType, Duration, Price)
-             VALUES (?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE Price = VALUES(Price)`,
-            [brokerId, insuranceType, parseInt(duration), parseFloat(price)]
-          );
-        }
-      }
-    }
+    await seedBrokerTariffsIfMissing(db, brokerId, brokerName);
 
     seedCount++;
   }
@@ -876,4 +903,5 @@ module.exports = {
   Pricing,
   BrokerData,
   seedBrokersFromInfo,
+  seedBrokerTariffsIfMissing,
 };

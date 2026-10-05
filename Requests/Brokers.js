@@ -10,6 +10,7 @@
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
+const { Pricing, seedBrokerTariffsIfMissing } = require("../db/BrokerInfo.js");
 const {
   toDecimal,
   recordCashMovement,
@@ -684,7 +685,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   router.get(
     "/brokers/:brokerId/pricing",
     auth,
-    requireAdmin,
+    requireBrokerRole,
     async (req, res) => {
       try {
         const brokerId = parseBrokerId(req.params.brokerId);
@@ -694,38 +695,62 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
         // Check if broker exists
         const [brokerCheck] = await DBConnection.query(
-          "SELECT id FROM brokers WHERE id = ?",
+          "SELECT id, Name FROM brokers WHERE id = ?",
           [brokerId]
         );
 
         if (brokerCheck.length === 0) {
           return res.status(404).json({ error: "Broker not found" });
         }
+        const brokerName = brokerCheck[0].Name;
 
-        // Fetch all pricing for this broker
-        const [rows] = await DBConnection.query(
-          `SELECT vehicle_type, duration, price
-            FROM broker_pricing
-            WHERE broker_id = ?
-            ORDER BY vehicle_type, duration`,
-          [brokerId]
-        );
-
-        // Structure pricing data: { vehicleType: { duration: price, ... }, ... }
-        const pricing = {};
-        for (const row of rows) {
-          const vehicleType = row.vehicle_type;
-          const duration = String(row.duration);
-          const price = parseFloat(row.price);
-
-          if (!pricing[vehicleType]) {
-            pricing[vehicleType] = {};
+        const loadPricing = async () => {
+          const [rows] = await DBConnection.query(
+            `SELECT InsuranceType, Duration, Price
+               FROM broker_tariffs
+              WHERE BrokerId = ?
+              ORDER BY InsuranceType, Duration`,
+            [brokerId]
+          );
+          // Structure: { vehicleType: { duration: price, ... }, ... }
+          const result = {};
+          for (const row of rows) {
+            if (!result[row.InsuranceType]) result[row.InsuranceType] = {};
+            result[row.InsuranceType][String(row.Duration)] = parseFloat(
+              row.Price
+            );
           }
-          pricing[vehicleType][duration] = price;
+          return result;
+        };
+
+        let pricing = await loadPricing();
+        let source = "database";
+
+        // Nothing in the database yet: fall back to BrokerInfo.js and seed it.
+        if (Object.keys(pricing).length === 0 && Pricing[brokerName]) {
+          try {
+            await seedBrokerTariffsIfMissing(DBConnection, brokerId, brokerName);
+            pricing = await loadPricing();
+          } catch (seedErr) {
+            console.warn("Broker tariff seed failed:", seedErr.message);
+          }
+          if (Object.keys(pricing).length === 0) {
+            // Seeding failed: still show the BrokerInfo.js values.
+            for (const [type, durations] of Object.entries(Pricing[brokerName])) {
+              pricing[type] = {};
+              for (const [d, p] of Object.entries(durations)) {
+                pricing[type][String(d)] = Number(p);
+              }
+            }
+          }
+          source = "BrokerInfo";
         }
 
         res.json({
           success: true,
+          brokerId,
+          brokerName,
+          source,
           pricing: pricing,
         });
       } catch (err) {
@@ -777,7 +802,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         const updatedPricing = await DBConnection.withTransaction(
           async (conn) => {
             // Delete existing pricing for this broker
-            await conn.query("DELETE FROM broker_pricing WHERE broker_id = ?", [
+            await conn.query("DELETE FROM broker_tariffs WHERE BrokerId = ?", [
               brokerId,
             ]);
 
@@ -815,7 +840,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
                 // Insert pricing
                 await conn.query(
-                  `INSERT INTO broker_pricing (broker_id, vehicle_type, duration, price)
+                  `INSERT INTO broker_tariffs (BrokerId, InsuranceType, Duration, Price)
                     VALUES (?, ?, ?, ?)`,
                   [brokerId, vehicleType, duration, price]
                 );
@@ -824,18 +849,18 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
             // Fetch updated pricing to return
             const [updatedRows] = await conn.query(
-              `SELECT vehicle_type, duration, price
-                FROM broker_pricing
-                WHERE broker_id = ?
-                ORDER BY vehicle_type, duration`,
+              `SELECT InsuranceType, Duration, Price
+                FROM broker_tariffs
+                WHERE BrokerId = ?
+                ORDER BY InsuranceType, Duration`,
               [brokerId]
             );
 
             const updatedPricing = {};
             for (const row of updatedRows) {
-              const vehicleType = row.vehicle_type;
-              const duration = String(row.duration);
-              const price = parseFloat(row.price);
+              const vehicleType = row.InsuranceType;
+              const duration = String(row.Duration);
+              const price = parseFloat(row.Price);
 
               if (!updatedPricing[vehicleType]) {
                 updatedPricing[vehicleType] = {};
