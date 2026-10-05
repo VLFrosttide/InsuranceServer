@@ -131,16 +131,6 @@ module.exports.ProcessEmail = async function ProcessEmail(
   // Store the email so workers can list/claim it after the broadcast.
   mailStore.add(emailInfo);
 
-  console.log("======== UNREAD MESSAGE ========");
-  console.log(`Account: ${account}`);
-  console.log(`ID:      ${messageId}`);
-  console.log(`From:    ${emailInfo.from}`);
-  console.log(`Subject: ${emailInfo.subject}`);
-  console.log(`Date:    ${emailInfo.date}`);
-  console.log("-------- BODY --------");
-  console.log(body || "(empty body)");
-  console.log("-------- ATTACHMENTS --------");
-
   const usedNames = new Set();
   for (const meta of bag.attachmentParts) {
     try {
@@ -155,7 +145,6 @@ module.exports.ProcessEmail = async function ProcessEmail(
         data,
       };
       attachments.push(item);
-      console.log(`- ${item.filename} (${item.mimeType}, ${item.size} bytes)`);
 
       // Expose the attachment to the Electron clients. Only inline a base64
       // payload when it is reasonably small; large files are still saved to
@@ -176,8 +165,6 @@ module.exports.ProcessEmail = async function ProcessEmail(
       console.error(`Failed to process attachment "${meta.filename}":`, err);
     }
   }
-  if (!bag.attachmentParts.length) console.log("(none)");
-  console.log("===============================\n");
 
   // Broadcast only after attachments are attached so cards carry the full
   // email (body + pictures) when a worker opens it.

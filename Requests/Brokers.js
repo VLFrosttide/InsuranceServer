@@ -676,5 +676,191 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     }
   });
 
+  // ---------------------------------------------------------------
+  // Broker Pricing endpoints (admin-only)
+  // ---------------------------------------------------------------
+
+  // GET /brokers/:brokerId/pricing — retrieve all pricing for a broker
+  router.get(
+    "/brokers/:brokerId/pricing",
+    auth,
+    requireAdmin,
+    async (req, res) => {
+      try {
+        const brokerId = parseBrokerId(req.params.brokerId);
+        if (brokerId === null) {
+          return res.status(400).json({ error: "Invalid broker ID" });
+        }
+
+        // Check if broker exists
+        const [brokerCheck] = await DBConnection.query(
+          "SELECT id FROM brokers WHERE id = ?",
+          [brokerId]
+        );
+
+        if (brokerCheck.length === 0) {
+          return res.status(404).json({ error: "Broker not found" });
+        }
+
+        // Fetch all pricing for this broker
+        const [rows] = await DBConnection.query(
+          `SELECT vehicle_type, duration, price
+            FROM broker_pricing
+            WHERE broker_id = ?
+            ORDER BY vehicle_type, duration`,
+          [brokerId]
+        );
+
+        // Structure pricing data: { vehicleType: { duration: price, ... }, ... }
+        const pricing = {};
+        for (const row of rows) {
+          const vehicleType = row.vehicle_type;
+          const duration = String(row.duration);
+          const price = parseFloat(row.price);
+
+          if (!pricing[vehicleType]) {
+            pricing[vehicleType] = {};
+          }
+          pricing[vehicleType][duration] = price;
+        }
+
+        res.json({
+          success: true,
+          pricing: pricing,
+        });
+      } catch (err) {
+        console.error("Error fetching broker pricing:", err);
+        res.status(500).json({
+          success: false,
+          error: err.message || "Database error",
+        });
+      }
+    }
+  );
+
+  // PUT /brokers/:brokerId/pricing — update pricing for a broker
+  router.put(
+    "/brokers/:brokerId/pricing",
+    auth,
+    requireAdmin,
+    async (req, res) => {
+      try {
+        const brokerId = parseBrokerId(req.params.brokerId);
+        if (brokerId === null) {
+          return res.status(400).json({ error: "Invalid broker ID" });
+        }
+
+        const { pricing } = req.body;
+
+        // Validate request data
+        if (!pricing || typeof pricing !== "object") {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid pricing data format",
+          });
+        }
+
+        // Check if broker exists
+        const [brokerCheck] = await DBConnection.query(
+          "SELECT id FROM brokers WHERE id = ?",
+          [brokerId]
+        );
+
+        if (brokerCheck.length === 0) {
+          return res.status(404).json({
+            success: false,
+            error: "Broker not found",
+          });
+        }
+
+        // Update pricing in transaction
+        const updatedPricing = await DBConnection.withTransaction(
+          async (conn) => {
+            // Delete existing pricing for this broker
+            await conn.query("DELETE FROM broker_pricing WHERE broker_id = ?", [
+              brokerId,
+            ]);
+
+            // Insert new pricing
+            for (const vehicleType in pricing) {
+              // Validate vehicle type
+              if (typeof vehicleType !== "string" || !vehicleType.trim()) {
+                throw new Error(`Invalid vehicle type: ${vehicleType}`);
+              }
+
+              const durations = pricing[vehicleType];
+
+              // Validate durations object
+              if (!durations || typeof durations !== "object") {
+                throw new Error(
+                  `Invalid durations for vehicle type: ${vehicleType}`
+                );
+              }
+
+              for (const durationStr in durations) {
+                const duration = parseInt(durationStr);
+                const price = parseFloat(durations[durationStr]);
+
+                // Validate duration
+                if (isNaN(duration) || duration <= 0) {
+                  throw new Error(`Invalid duration: ${durationStr}`);
+                }
+
+                // Validate price
+                if (isNaN(price) || price < 0) {
+                  throw new Error(
+                    `Price cannot be negative for ${vehicleType} ${duration} days`
+                  );
+                }
+
+                // Insert pricing
+                await conn.query(
+                  `INSERT INTO broker_pricing (broker_id, vehicle_type, duration, price)
+                    VALUES (?, ?, ?, ?)`,
+                  [brokerId, vehicleType, duration, price]
+                );
+              }
+            }
+
+            // Fetch updated pricing to return
+            const [updatedRows] = await conn.query(
+              `SELECT vehicle_type, duration, price
+                FROM broker_pricing
+                WHERE broker_id = ?
+                ORDER BY vehicle_type, duration`,
+              [brokerId]
+            );
+
+            const updatedPricing = {};
+            for (const row of updatedRows) {
+              const vehicleType = row.vehicle_type;
+              const duration = String(row.duration);
+              const price = parseFloat(row.price);
+
+              if (!updatedPricing[vehicleType]) {
+                updatedPricing[vehicleType] = {};
+              }
+              updatedPricing[vehicleType][duration] = price;
+            }
+
+            return updatedPricing;
+          }
+        );
+
+        res.json({
+          success: true,
+          message: "Pricing updated successfully",
+          pricing: updatedPricing,
+        });
+      } catch (err) {
+        console.error("Error updating broker pricing:", err);
+        res.status(500).json({
+          success: false,
+          error: err.message || "Error updating pricing",
+        });
+      }
+    }
+  );
+
   return router;
 };
