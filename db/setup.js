@@ -77,7 +77,6 @@ async function runSetup(config = {}) {
       Password VARCHAR(200) NOT NULL,
       Role INT NOT NULL DEFAULT 3,
       Balance DECIMAL(15,2) NOT NULL DEFAULT 0,
-      PayoutPercentage DECIMAL(5,2) NULL,
       Status VARCHAR(20) NOT NULL DEFAULT 'active',
       PRIMARY KEY (Username),
       UNIQUE KEY Username_UNIQUE (Username)
@@ -121,6 +120,11 @@ async function runSetup(config = {}) {
       "ALTER TABLE users ADD COLUMN Status VARCHAR(20) NOT NULL DEFAULT 'active'"
     );
     console.log("Added users.Status column");
+  }
+  // Prune the legacy payout percentage column. No percentages are used.
+  if (userColNames.has("PayoutPercentage")) {
+    await db.query("ALTER TABLE users DROP COLUMN PayoutPercentage");
+    console.log("Dropped users.PayoutPercentage column");
   }
 
   // 3) Migrate the insurance table to the reduced schema.
@@ -395,7 +399,6 @@ async function runSetup(config = {}) {
        id INT NOT NULL AUTO_INCREMENT,
        Name VARCHAR(100) NOT NULL,
        CashBalance DECIMAL(15,2) NOT NULL DEFAULT 0,
-       Percentage DECIMAL(5,2) NOT NULL DEFAULT 0,
        PolicyRangeStart INT NOT NULL,
        PolicyRangeEnd INT NOT NULL,
        InactivePolicies INT NOT NULL DEFAULT 0,
@@ -450,7 +453,7 @@ async function runSetup(config = {}) {
 
   // Migrate brokers to the current schema on existing databases.
   // - Rename TotalGivenPolicies -> InactivePolicies.
-  // - Add the Percentage column (commission charged per policy).
+  // - Drop the legacy Percentage column (no percentages; flat fee per policy).
   // - Widen CashBalance to a decimal so fractional charges are preserved.
   const [brokerCols] = await db.query(
     "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
@@ -466,11 +469,9 @@ async function runSetup(config = {}) {
     );
     console.log("Renamed brokers.TotalGivenPolicies to InactivePolicies");
   }
-  if (!brokerColNames.has("Percentage")) {
-    await db.query(
-      "ALTER TABLE brokers ADD COLUMN Percentage DECIMAL(5,2) NOT NULL DEFAULT 0 AFTER PolicyRangeEnd"
-    );
-    console.log("Added brokers.Percentage column");
+  if (brokerColNames.has("Percentage")) {
+    await db.query("ALTER TABLE brokers DROP COLUMN Percentage");
+    console.log("Dropped brokers.Percentage column");
   }
   await db.query(
     "ALTER TABLE brokers MODIFY COLUMN CashBalance DECIMAL(15,2) NOT NULL DEFAULT 0"

@@ -79,7 +79,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   router.get("/admin/users", auth, requireRole(1), async (req, res) => {
     try {
       const [users] = await DBConnection.query(
-        `SELECT Username, Role, Balance, PayoutPercentage, Status
+        `SELECT Username, Role, Balance, Status
          FROM users
          ORDER BY Username`
       );
@@ -124,7 +124,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     async (req, res) => {
       try {
         const { username } = req.params;
-        const { role, balance, payoutPercentage } = req.body;
+        const { role, balance } = req.body;
 
         const [existing] = await DBConnection.query(
           "SELECT Username FROM users WHERE Username = ?",
@@ -154,17 +154,6 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           sets.push("Balance = ?");
           params.push(b);
         }
-        if (payoutPercentage !== undefined) {
-          const p = Number(payoutPercentage);
-          if (!Number.isFinite(p) || p < 0 || p > 100) {
-            return res
-              .status(400)
-              .json({ error: "payoutPercentage must be between 0 and 100" });
-          }
-          sets.push("PayoutPercentage = ?");
-          params.push(p);
-        }
-
         if (sets.length === 0) {
           return res.status(400).json({ error: "Nothing to update" });
         }
@@ -176,7 +165,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         );
 
         const [rows] = await DBConnection.query(
-          "SELECT Username, Role, Balance, PayoutPercentage FROM users WHERE Username = ?",
+          "SELECT Username, Role, Balance FROM users WHERE Username = ?",
           [username]
         );
         res.json({ message: "User updated", user: rows[0] });
@@ -198,8 +187,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // Only admins (role 1) may use these. Actions against other admins are
   // disallowed so an admin cannot be silently removed or demoted.
 
-  const ADMIN_USER_COLUMNS =
-    "Username, Role, Balance, PayoutPercentage, Status";
+  const ADMIN_USER_COLUMNS = "Username, Role, Balance, Status";
 
   function parseRole(value) {
     const n = Number(value);
@@ -335,7 +323,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   router.get("/worker/clients", auth, requireRole(2), async (req, res) => {
     try {
       const [rows] = await DBConnection.query(
-        "SELECT Username, Balance, PayoutPercentage FROM users WHERE Role = 3"
+        "SELECT Username, Balance FROM users WHERE Role = 3"
       );
       res.json({ clients: rows });
     } catch (err) {
@@ -439,7 +427,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               (Author, CreationDate, PolicyNumber, BlancNumber, CarNumber, Price,
                CurrencyType, Duration, Broker, Branch, Otomobil, PaymentType,
                StartDate, BrokerId)
-           VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             req.user.username,
             policyNumber,
@@ -464,6 +452,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           if (paymentType === "Cash") {
             await recordCashMovement(
               conn,
+              branch,
               req.user.username,
               "increase",
               priceDecimal,
@@ -480,8 +469,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           }
         }
 
-        // Charge the policy against its broker: reduce the broker balance by
-        // the full price and decrement its InactivePolicies.
+        // Flat fee: when the sender's email is associated with a broker, the
+        // policy price is deducted from that broker's balance (which may go
+        // negative) and its InactivePolicies is decremented.
         if (brokerId !== null) {
           await decreaseBrokerForInsurance(conn, brokerId, price);
         }
@@ -564,7 +554,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   router.get("/client/profile", auth, requireRole(3), async (req, res) => {
     try {
       const [rows] = await DBConnection.query(
-        "SELECT Username, Role, Balance, PayoutPercentage FROM users WHERE Username = ?",
+        "SELECT Username, Role, Balance FROM users WHERE Username = ?",
         [req.user.username]
       );
       res.json({ profile: rows[0] || null });

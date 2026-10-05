@@ -9,7 +9,6 @@ Sample broker:
   "id": 1,
   "Name": "Demo Broker",
   "CashBalance": "1000.00",
-  "Percentage": "10.00",
   "PolicyRangeStart": 100,
   "PolicyRangeEnd": 500,
   "InactivePolicies": 400,

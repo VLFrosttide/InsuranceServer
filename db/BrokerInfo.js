@@ -31,7 +31,11 @@ let Sabit = [
   "tlgtktms123@hotmail.com",
   "trabip123@hotmail.com",
 ];
-let Huseyin = ["abyesilsigorta@gmail.com", "info@abyesilsigorta.com"];
+let Huseyin = [
+  "abyesilsigorta@gmail.com",
+  "info@abyesilsigorta.com",
+  "1976haci.huseyin@gmail.com",
+];
 let BalkanTravel = [
   "abdullahozturk@balkantravel.com.tr",
   "fatmagulbuyukarda@gmail.com",
@@ -871,9 +875,9 @@ async function seedBrokersFromInfo(db) {
     // Insert broker (default policy range and values, can be updated later)
     const [result] = await db.query(
       `INSERT INTO brokers
-         (Name, CashBalance, Percentage, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [brokerName, 0, 0, 0, 0, 0]
+         (Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
+       VALUES (?, ?, ?, ?, ?)`,
+      [brokerName, 0, 0, 0, 0]
     );
 
     const brokerId = result.insertId;

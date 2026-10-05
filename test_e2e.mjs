@@ -399,10 +399,9 @@ async function main() {
       r.status === 403 || r.status === 401
     );
 
-    // Creating insurance reduces the broker balance (price × Percentage/100)
-    // and decrements InactivePolicies. Use a unique blanc number.
-    // Seed broker has Percentage = 10 and a policy range 100..500, so a blanc
-    // inside that range resolves to it.
+    // Creating insurance from an email associated with the broker deducts a
+    // flat fee (the full price) from the broker balance and decrements
+    // InactivePolicies. The balance may go negative.
     const brokerBefore = await req(
       "GET",
       `/brokers/${brokerId}`,
@@ -440,10 +439,10 @@ async function main() {
     );
     const afterBalance = Number(brokerAfter.data.broker.CashBalance);
     const afterInactive = Number(brokerAfter.data.broker.InactivePolicies);
-    // price 500 × 10% = 50
+    // flat fee: price 500 is deducted in full
     check(
-      "Broker balance decreased by price × Percentage/100",
-      Math.abs(beforeBalance - afterBalance - 50) < 0.01,
+      "Broker balance decreased by the flat price",
+      Math.abs(beforeBalance - afterBalance - 500) < 0.01,
       `${beforeBalance} -> ${afterBalance}`
     );
     check(

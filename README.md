@@ -50,7 +50,7 @@ Stores every account on the system (admins, workers, clients).
 | `Status`   | `VARCHAR(20)` | `active` or `suspended`           |
 
 Use case: authentication, authorization, admin/worker dashboards, and client
-profiles. Balances and payouts live on `brokers` (a client can also be a
+profiles. Balances live on `brokers` (a client can also be a
 broker). `Role` defaults to `3` (client) when added by the migration.
 
 ### `insurance`
@@ -158,16 +158,13 @@ Broker accounts.
 | `id`               | `INT`           | Auto-increment PK                            |
 | `Name`             | `VARCHAR(100)`  | Unique broker name                           |
 | `CashBalance`      | `DECIMAL(15,2)` | Broker cash balance (may go neg.)            |
-| `Percentage`       | `DECIMAL(5,2)`  | Deprecated: commission rate (no longer used) |
 | `PolicyRangeStart` | `INT`           | Start of blanc-number range                  |
 | `PolicyRangeEnd`   | `INT`           | End of blanc-number range                    |
 | `InactivePolicies` | `INT`           | Remaining inactive policies                  |
 | `CreatedAt`        | `DATETIME`      | Creation time                                |
 
 Use case: broker management. Admins/workers can increase/reduce a broker
-balance. Creating an insurance resolves its broker (by `BrokerId`, then by the
-policy range containing the blanc number, then the single broker) and charges
-it the full `Price` while decrementing `InactivePolicies`.
+balance. Creating an insurance resolves its broker from the sender email (broker_emails) and deducts a flat fee (the full Price) from its balance while decrementing InactivePolicies. No percentages are used anywhere.
 
 ### `broker_emails`
 
@@ -273,11 +270,11 @@ an insurance with `PaymentType = "Card"` (the `Cash` request field set to
 
 ## Broker balance
 
-Each broker has a cash balance plus a `Percentage` commission rate. Only admins
+Each broker has a cash balance. Only admins
 (role 1) and workers (role 2) can view or change a broker balance (unlike
 current cash, a broker balance may go negative).
 
-- `GET /brokers` — list all brokers with balance, percentage and inactive policies
+- `GET /brokers` — list all brokers with balance and inactive policies
 - `GET /brokers/:id` — single broker
 - `POST /brokers/:id/increase` — body `{ "amount": 100 }`
 - `POST /brokers/:id/reduce` — body `{ "amount": 50 }` (may go negative)
@@ -290,10 +287,7 @@ Admin-only (`role 1`) broker management:
 - `PATCH /brokers/:id` — update a broker's fields and/or its emails
 - `DELETE /brokers/:id` — delete a broker (detaches any linked insurances)
 
-Each created insurance charges its broker: the broker balance is reduced by
-the full `Price` and the broker's `InactivePolicies` is decremented
-by 1. The broker is resolved by `BrokerId`, else by the policy range that
-contains the blanc number, else the single broker if only one exists.
+Each created insurance whose email sender is associated with a broker charges that broker a flat fee: the broker balance is reduced by the full Price (it may go negative) and the broker InactivePolicies is decremented by 1.
 
 ## WebSocket
 

@@ -5,8 +5,9 @@
 // (role 2) can increase/reduce. Unlike daily current cash, a broker balance
 // may go negative.
 //
-// Creating an insurance reduces its broker's balance by the full price
-// and decrements the broker's InactivePolicies by 1.
+// Creating an insurance whose email sender is associated with a broker
+// deducts a flat fee (the policy price) from that broker's balance and
+// decrements the broker's InactivePolicies by 1. No percentages are involved.
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
@@ -15,6 +16,7 @@ const {
   toDecimal,
   recordCashMovement,
   normalizeCurrency,
+  normalizeBranch,
 } = require("./CurrentCash.js");
 
 /**
@@ -103,8 +105,9 @@ const resolveBrokerByEmail = (module.exports.resolveBrokerByEmail =
   });
 
 /**
- * Decrease a broker's balance by the full price and decrement
- * InactivePolicies by 1. Runs inside the caller's transaction.
+ * Deduct the flat fee (the policy price) from a broker's balance and
+ * decrement InactivePolicies by 1. The balance is allowed to go negative.
+ * Runs inside the caller's transaction.
  *
  * @param {import("mysql2/promise").Connection} conn
  * @param {number} brokerId
@@ -176,7 +179,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   const requireBrokerRole = requireRole(1, 2);
 
   const BROKER_COLUMNS =
-    "id, Name, CashBalance, Percentage, PolicyRangeStart, PolicyRangeEnd, InactivePolicies";
+    "id, Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies";
 
   function parseBrokerId(param) {
     const id = Number(param);
@@ -261,7 +264,6 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           "id",
           "Name",
           "CashBalance",
-          "Percentage",
           "PolicyRangeStart",
           "PolicyRangeEnd",
           "InactivePolicies",
@@ -276,7 +278,6 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               b.id,
               esc(b.Name),
               b.CashBalance,
-              b.Percentage,
               b.PolicyRangeStart,
               b.PolicyRangeEnd,
               b.InactivePolicies,
@@ -345,6 +346,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           return res.status(400).json({ error: "reason is required" });
         }
         const currency = normalizeCurrency(req.body?.currency);
+        const branch = normalizeBranch(req.body?.branch);
 
         // Update the broker balance and mirror the movement into current cash in
         // one transaction, so the two ledgers can never diverge.
@@ -358,6 +360,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
             await recordCashMovement(
               conn,
+              branch,
               req.user.username,
               "increase",
               amount,
@@ -419,6 +422,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           return res.status(400).json({ error: "reason is required" });
         }
         const currency = normalizeCurrency(req.body?.currency);
+        const branch = normalizeBranch(req.body?.branch);
 
         const affectedRows = await DBConnection.withTransaction(
           async (conn) => {
@@ -430,6 +434,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
             await recordCashMovement(
               conn,
+              branch,
               req.user.username,
               "reduce",
               amount,
@@ -494,8 +499,6 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
       const cashBalance =
         toNumber(req.body?.CashBalance ?? req.body?.cashBalance) ?? 0;
-      const percentage =
-        toNumber(req.body?.Percentage ?? req.body?.percentage) ?? 0;
       const rangeStart = toNumber(
         req.body?.PolicyRangeStart ?? req.body?.policyRangeStart
       );
@@ -523,9 +526,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         brokerId = await DBConnection.withTransaction(async (conn) => {
           const [result] = await conn.query(
             `INSERT INTO brokers
-               (Name, CashBalance, Percentage, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [name, cashBalance, percentage, rangeStart, rangeEnd, inactive]
+               (Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
+             VALUES (?, ?, ?, ?, ?)`,
+            [name, cashBalance, rangeStart, rangeEnd, inactive]
           );
           const id = result.insertId;
           for (const email of emails) {
@@ -576,7 +579,6 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       const fieldMap = [
         ["Name", b.Name ?? b.name],
         ["CashBalance", b.CashBalance ?? b.cashBalance],
-        ["Percentage", b.Percentage ?? b.percentage],
         ["PolicyRangeStart", b.PolicyRangeStart ?? b.policyRangeStart],
         ["PolicyRangeEnd", b.PolicyRangeEnd ?? b.policyRangeEnd],
         ["InactivePolicies", b.InactivePolicies ?? b.inactivePolicies],
@@ -729,14 +731,20 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         // Nothing in the database yet: fall back to BrokerInfo.js and seed it.
         if (Object.keys(pricing).length === 0 && Pricing[brokerName]) {
           try {
-            await seedBrokerTariffsIfMissing(DBConnection, brokerId, brokerName);
+            await seedBrokerTariffsIfMissing(
+              DBConnection,
+              brokerId,
+              brokerName
+            );
             pricing = await loadPricing();
           } catch (seedErr) {
             console.warn("Broker tariff seed failed:", seedErr.message);
           }
           if (Object.keys(pricing).length === 0) {
             // Seeding failed: still show the BrokerInfo.js values.
-            for (const [type, durations] of Object.entries(Pricing[brokerName])) {
+            for (const [type, durations] of Object.entries(
+              Pricing[brokerName]
+            )) {
               pricing[type] = {};
               for (const [d, p] of Object.entries(durations)) {
                 pricing[type][String(d)] = Number(p);
