@@ -110,6 +110,54 @@ const reduceCardBalance = (module.exports.reduceCardBalance =
   });
 
 /**
+ * Reset the card balance to zero and record who did it and how much was kept
+ * at the time of the reset.
+ *
+ * NOTE: this runs inside the caller's transaction (the caller is responsible
+ * for `beginTransaction` / `commit` / `rollback`).
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} username  Username who performed the reset.
+ * @returns {Promise<number>} The amount that was kept (i.e. the balance just
+ *   before it was zeroed).
+ */
+const resetCardBalance = (module.exports.resetCardBalance =
+  async function resetCardBalance(conn, username) {
+    await ensureCardRow(conn);
+
+    const [rows] = await conn.query(
+      "SELECT CardBalance FROM CardBalance WHERE id = ?",
+      [CARD_ROW_ID]
+    );
+    const kept = rows.length ? Number(rows[0].CardBalance) : 0;
+
+    await conn.query("UPDATE CardBalance SET CardBalance = 0 WHERE id = ?", [
+      CARD_ROW_ID,
+    ]);
+
+    await conn.query(
+      "INSERT INTO card_resets (Username, KeptAmount) VALUES (?, ?)",
+      [username, kept]
+    );
+
+    return kept;
+  });
+
+/**
+ * Read the card balance reset history, most recent first.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @returns {Promise<Array>}
+ */
+const getCardResets = (module.exports.getCardResets =
+  async function getCardResets(conn) {
+    const [rows] = await conn.query(
+      "SELECT * FROM card_resets ORDER BY id DESC"
+    );
+    return rows;
+  });
+
+/**
  * Create the CardPayments router.
  *
  * @param {import("mysql2/promise").Connection} DBConnection
@@ -122,17 +170,44 @@ module.exports.createCardPaymentsRouter = function createCardPaymentsRouter(
   const auth = requireAuth(DBConnection);
 
   const requireCardRole = requireRole(1, 2);
+  // Clearing the card balance is a destructive, admin-only action.
+  const requireCardAdmin = requireRole(1);
 
-  // GET /cardpayments — current card balance total.
+  // GET /cardpayments — current card balance total + reset history.
   router.get("/cardpayments", auth, requireCardRole, async (req, res) => {
     try {
       const cardBalance = await getCardPayments(DBConnection);
-      res.json({ cardBalance });
+      const resets = await getCardResets(DBConnection);
+      res.json({ cardBalance, resets });
     } catch (err) {
       console.error("CardPayments lookup failed:", err);
       res.status(500).json({ error: "Failed to fetch card payments" });
     }
   });
+
+  // POST /cardpayments/reset — zero the card balance and record the kept
+  // amount. Admin only.
+  router.post(
+    "/cardpayments/reset",
+    auth,
+    requireCardAdmin,
+    async (req, res) => {
+      try {
+        const kept = await DBConnection.withTransaction((conn) =>
+          resetCardBalance(conn, req.user.username)
+        );
+
+        res.status(200).json({
+          message: "Card balance reset",
+          kept,
+          author: req.user.username,
+        });
+      } catch (err) {
+        console.error("CardPayments reset failed:", err);
+        res.status(500).json({ error: "Failed to reset card balance" });
+      }
+    }
+  );
 
   return router;
 };

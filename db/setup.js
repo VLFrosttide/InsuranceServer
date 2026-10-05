@@ -393,6 +393,19 @@ async function runSetup(config = {}) {
     console.log("Renamed CardBalance.CardPayments to CardBalance");
   }
 
+  // `card_resets` records who cleared the card balance and how much was kept
+  // (i.e. the balance just before it was zeroed), mirroring `cash_resets`.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS card_resets (
+      id INT NOT NULL AUTO_INCREMENT,
+      Username VARCHAR(45) NOT NULL,
+      KeptAmount DECIMAL(15,2) NOT NULL DEFAULT 0,
+      CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_card_resets_username (Username)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  `);
+
   // 4b) Create brokers + broker_emails tables.
   await db.query(`
      CREATE TABLE IF NOT EXISTS brokers (
