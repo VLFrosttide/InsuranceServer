@@ -76,6 +76,40 @@ const recordCardPayment = (module.exports.recordCardPayment =
   });
 
 /**
+ * Reduce the card balance (e.g. refunding part of an annulled policy that was
+ * originally paid by card). Unlike current cash, the card balance is allowed
+ * to go negative (it is a running ledger, not a physical cash drawer).
+ *
+ * NOTE: this runs inside the caller's transaction (the caller is responsible
+ * for `beginTransaction` / `commit` / `rollback`).
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} username  Username associated with the refund.
+ * @param {number|string} amount  Positive value to subtract.
+ * @param {string} reason  Human-readable reason for the refund.
+ * @returns {Promise<number>} The applied amount (rounded to 2 decimals).
+ */
+const reduceCardBalance = (module.exports.reduceCardBalance =
+  async function reduceCardBalance(conn, username, amount, reason) {
+    const decimal = toDecimal(amount);
+    if (decimal === null || decimal <= 0) {
+      throw new Error("amount must be a positive number");
+    }
+    if (typeof reason !== "string" || !reason.trim()) {
+      throw new Error("reason is required");
+    }
+
+    await ensureCardRow(conn);
+
+    await conn.query(
+      "UPDATE CardBalance SET CardBalance = CardBalance - ? WHERE id = ?",
+      [decimal, CARD_ROW_ID]
+    );
+
+    return decimal;
+  });
+
+/**
  * Create the CardPayments router.
  *
  * @param {import("mysql2/promise").Connection} DBConnection

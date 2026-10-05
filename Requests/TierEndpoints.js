@@ -12,10 +12,11 @@
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
 const { recordCashMovement, toDecimal } = require("./CurrentCash.js");
-const { recordCardPayment } = require("./CardPayments.js");
+const { recordCardPayment, reduceCardBalance } = require("./CardPayments.js");
 const {
   resolveBrokerByEmail,
   decreaseBrokerForInsurance,
+  restoreBrokerForAnnulment,
 } = require("./Brokers.js");
 const { sendReply } = require("../Mail/SendReply.js");
 
@@ -743,6 +744,125 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       } catch (err) {
         console.error("Insurance update failed:", err);
         res.status(500).json({ error: "Failed to update insurance" });
+      }
+    }
+  );
+
+  // Annulment fees (flat amount, in the policy's own currency) per fault
+  // reason. "broker" and "worker" faults still charge a small fee to cover
+  // processing costs; "none" (no fault) refunds the full price.
+  const ANNUL_FEES = {
+    broker: 8,
+    worker: 1,
+    none: 0,
+  };
+
+  // POST /insurances/:blancNumber/annul  { reason: "broker"|"worker"|"none" }
+  // Annuls a policy: refunds its price (minus the fee for the given fault
+  // reason) out of current cash (or the card balance, depending on how it was
+  // originally paid) and reverses its effect on the linked broker's balance,
+  // if any. A policy can only be annulled once. Admins (role 1) can annul any
+  // policy; workers (role 2) can only annul policies they created themselves.
+  router.post(
+    "/insurances/:blancNumber/annul",
+    auth,
+    requireRole(1, 2),
+    async (req, res) => {
+      try {
+        const { blancNumber } = req.params;
+        const reason = String(req.body?.reason ?? req.body?.Reason ?? "")
+          .trim()
+          .toLowerCase();
+
+        if (!Object.prototype.hasOwnProperty.call(ANNUL_FEES, reason)) {
+          return res.status(400).json({
+            error: "reason must be one of 'broker', 'worker' or 'none'",
+          });
+        }
+
+        const [existing] = await DBConnection.query(
+          "SELECT * FROM insurance WHERE BlancNumber = ?",
+          [blancNumber]
+        );
+        if (existing.length === 0) {
+          return res.status(404).json({ error: "Insurance not found" });
+        }
+
+        const insurance = existing[0];
+
+        if (
+          String(req.user.role) === "2" &&
+          insurance.Author !== req.user.username
+        ) {
+          return res
+            .status(403)
+            .json({ error: "Forbidden: can only annul your own insurances" });
+        }
+
+        if (insurance.Annulled) {
+          return res.status(400).json({ error: "Insurance already annulled" });
+        }
+
+        const price = toDecimal(insurance.Price) || 0;
+        const fee = ANNUL_FEES[reason];
+        const refund = Math.max(0, Math.round((price - fee) * 100) / 100);
+
+        await DBConnection.withTransaction(async (conn) => {
+          if (refund > 0) {
+            if (insurance.PaymentType === "Cash") {
+              await recordCashMovement(
+                conn,
+                insurance.Branch,
+                req.user.username,
+                "reduce",
+                refund,
+                `Annul ${blancNumber}`,
+                insurance.CurrencyType
+              );
+            } else {
+              await reduceCardBalance(
+                conn,
+                req.user.username,
+                refund,
+                `Annul ${blancNumber}`
+              );
+            }
+          }
+
+          if (insurance.BrokerId !== null && insurance.BrokerId !== undefined) {
+            await restoreBrokerForAnnulment(
+              conn,
+              insurance.BrokerId,
+              insurance.Price
+            );
+          }
+
+          await conn.query(
+            `UPDATE insurance
+                SET Annulled = 1, AnnulReason = ?, AnnulFee = ?, AnnulDate = NOW(), AnnulBy = ?
+              WHERE BlancNumber = ?`,
+            [reason, fee, req.user.username, blancNumber]
+          );
+        });
+
+        const [rows] = await DBConnection.query(
+          "SELECT * FROM insurance WHERE BlancNumber = ?",
+          [blancNumber]
+        );
+        res.json({
+          message: "Insurance annulled",
+          refund,
+          fee,
+          reason,
+          insurance: rows[0],
+        });
+      } catch (err) {
+        const msg = (err && err.message) || "";
+        if (msg.includes("insufficient")) {
+          return res.status(400).json({ error: msg });
+        }
+        console.error("Insurance annulment failed:", err);
+        res.status(500).json({ error: "Failed to annul insurance" });
       }
     }
   );

@@ -136,7 +136,44 @@ const decreaseBrokerForInsurance = (module.exports.decreaseBrokerForInsurance =
   });
 
 /**
+ * Restore a broker's balance after an insurance policy linked to it is
+ * annulled: increases CashBalance by `price × Percentage / 100` (the inverse
+ * of {@link decreaseBrokerForInsurance}) and increments InactivePolicies by 1
+ * since the policy is no longer counted as active. Runs inside the caller's
+ * transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @param {number|string} price
+ * @returns {Promise<number|null>} The amount restored, or null if broker missing.
+ */
+const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
+  async function restoreBrokerForAnnulment(conn, brokerId, price) {
+    const [[broker]] = await conn.query(
+      "SELECT Percentage FROM brokers WHERE id = ?",
+      [brokerId]
+    );
+    if (!broker) return null;
+
+    const percentage = Number(broker.Percentage) || 0;
+    const priceNum = toDecimal(price) || 0;
+    // price × Percentage / 100
+    const charge = Math.round(priceNum * percentage) / 100;
+
+    await conn.query(
+      `UPDATE brokers
+            SET CashBalance = CashBalance + ?,
+                InactivePolicies = InactivePolicies + 1
+          WHERE id = ?`,
+      [charge, brokerId]
+    );
+
+    return charge;
+  });
+
+/**
  * Create the broker router.
+
  *
  * @param {import("mysql2/promise").Connection} DBConnection
  * @returns {import("express").Router}

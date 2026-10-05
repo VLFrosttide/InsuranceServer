@@ -195,7 +195,38 @@ async function runSetup(config = {}) {
     "UPDATE insurance SET PaymentType = 'Card' WHERE PaymentType NOT IN ('Cash', 'Card')"
   );
 
+  // Annulment support: a worker/admin can annul a policy, refunding its price
+  // (minus a fee that depends on the fault reason) and reversing its effect
+  // on the broker balance (if any). Add the columns to existing databases.
+  if (!insColNames.has("Annulled")) {
+    await db.query(
+      "ALTER TABLE insurance ADD COLUMN Annulled TINYINT(1) NOT NULL DEFAULT 0"
+    );
+    console.log("Added insurance.Annulled column");
+  }
+  if (!insColNames.has("AnnulReason")) {
+    await db.query(
+      "ALTER TABLE insurance ADD COLUMN AnnulReason VARCHAR(20) NULL"
+    );
+    console.log("Added insurance.AnnulReason column");
+  }
+  if (!insColNames.has("AnnulFee")) {
+    await db.query(
+      "ALTER TABLE insurance ADD COLUMN AnnulFee DECIMAL(15,2) NULL"
+    );
+    console.log("Added insurance.AnnulFee column");
+  }
+  if (!insColNames.has("AnnulDate")) {
+    await db.query("ALTER TABLE insurance ADD COLUMN AnnulDate DATETIME NULL");
+    console.log("Added insurance.AnnulDate column");
+  }
+  if (!insColNames.has("AnnulBy")) {
+    await db.query("ALTER TABLE insurance ADD COLUMN AnnulBy VARCHAR(45) NULL");
+    console.log("Added insurance.AnnulBy column");
+  }
+
   // 4) Create the tokens table.
+
   await db.query(`
     CREATE TABLE IF NOT EXISTS tokens (
       Token VARCHAR(64) NOT NULL,
