@@ -481,7 +481,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
 
         // Charge the policy against its broker: reduce the broker balance by
-        // price × Percentage / 100 and decrement its InactivePolicies.
+        // the full price and decrement its InactivePolicies.
         if (brokerId !== null) {
           await decreaseBrokerForInsurance(conn, brokerId, price);
         }

@@ -390,30 +390,62 @@ async function runSetup(config = {}) {
 
   // 4b) Create brokers + broker_emails tables.
   await db.query(`
-    CREATE TABLE IF NOT EXISTS brokers (
-      id INT NOT NULL AUTO_INCREMENT,
-      Name VARCHAR(100) NOT NULL,
-      CashBalance DECIMAL(15,2) NOT NULL DEFAULT 0,
-      Percentage DECIMAL(5,2) NOT NULL DEFAULT 0,
-      PolicyRangeStart INT NOT NULL,
-      PolicyRangeEnd INT NOT NULL,
-      InactivePolicies INT NOT NULL DEFAULT 0,
-      CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (id),
-      UNIQUE KEY uq_brokers_name (Name)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
-  `);
+     CREATE TABLE IF NOT EXISTS brokers (
+       id INT NOT NULL AUTO_INCREMENT,
+       Name VARCHAR(100) NOT NULL,
+       CashBalance DECIMAL(15,2) NOT NULL DEFAULT 0,
+       Percentage DECIMAL(5,2) NOT NULL DEFAULT 0,
+       PolicyRangeStart INT NOT NULL,
+       PolicyRangeEnd INT NOT NULL,
+       InactivePolicies INT NOT NULL DEFAULT 0,
+       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       PRIMARY KEY (id),
+       UNIQUE KEY uq_brokers_name (Name)
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+   `);
 
   await db.query(`
-    CREATE TABLE IF NOT EXISTS broker_emails (
-      id INT NOT NULL AUTO_INCREMENT,
-      BrokerId INT NOT NULL,
-      Email VARCHAR(255) NOT NULL,
-      PRIMARY KEY (id),
-      UNIQUE KEY uq_broker_email (BrokerId, Email),
-      KEY idx_broker_emails_broker (BrokerId)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
-  `);
+     CREATE TABLE IF NOT EXISTS broker_emails (
+       id INT NOT NULL AUTO_INCREMENT,
+       BrokerId INT NOT NULL,
+       Email VARCHAR(255) NOT NULL,
+       PRIMARY KEY (id),
+       UNIQUE KEY uq_broker_email (BrokerId, Email),
+       KEY idx_broker_emails_broker (BrokerId)
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+   `);
+
+  // Broker pricing tariffs (per broker, insurance type, duration)
+  await db.query(`
+     CREATE TABLE IF NOT EXISTS broker_tariffs (
+       id INT NOT NULL AUTO_INCREMENT,
+       BrokerId INT NOT NULL,
+       InsuranceType VARCHAR(45) NOT NULL,
+       Duration INT NOT NULL,
+       Price DECIMAL(10,2) NOT NULL,
+       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       UpdatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+       PRIMARY KEY (id),
+       UNIQUE KEY uq_broker_tariff (BrokerId, InsuranceType, Duration),
+       KEY idx_broker_tariffs_broker (BrokerId)
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+   `);
+
+  // Walk-in pricing for each branch
+  await db.query(`
+     CREATE TABLE IF NOT EXISTS branch_tariffs (
+       id INT NOT NULL AUTO_INCREMENT,
+       Branch VARCHAR(100) NOT NULL,
+       InsuranceType VARCHAR(45) NOT NULL,
+       Duration INT NOT NULL,
+       Price DECIMAL(10,2) NOT NULL,
+       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       UpdatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+       PRIMARY KEY (id),
+       UNIQUE KEY uq_branch_tariff (Branch, InsuranceType, Duration),
+       KEY idx_branch_tariffs_branch (Branch)
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+   `);
 
   // Migrate brokers to the current schema on existing databases.
   // - Rename TotalGivenPolicies -> InactivePolicies.
@@ -581,7 +613,11 @@ async function runSetup(config = {}) {
     brokerId,
   ]);
 
-  // 8) Console log a sample broker with its multiple emails and linked
+  // 8) Seed brokers from BrokerInfo.js with their emails and pricing tariffs.
+  const { seedBrokersFromInfo } = require("./BrokerInfo");
+  await seedBrokersFromInfo(db);
+
+  // 9) Console log a sample broker with its multiple emails and linked
   //    insurance policies from the insurance table.
   const [brokers] = await db.query(
     `SELECT id, Name, CashBalance, Percentage, PolicyRangeStart, PolicyRangeEnd, InactivePolicies

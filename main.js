@@ -10,6 +10,7 @@ const { createTierRouter } = require("./Requests/TierEndpoints.js");
 const { createCurrentCashRouter } = require("./Requests/CurrentCash.js");
 const { createCardPaymentsRouter } = require("./Requests/CardPayments.js");
 const { createBrokerRouter } = require("./Requests/Brokers.js");
+const { createTariffsRouter } = require("./Requests/Tariffs.js");
 const { createTestRouter } = require("./Requests/Test.js");
 const { initWsServer } = require("./Users/websocket.js");
 const { runSetup } = require("./db/setup.js");
@@ -169,6 +170,7 @@ async function start() {
   app.use(createCurrentCashRouter(DBConnection));
   app.use(createCardPaymentsRouter(DBConnection));
   app.use(createBrokerRouter(DBConnection));
+  app.use(createTariffsRouter(DBConnection));
   app.use(createTestRouter(DBConnection));
 
   // Live state used by /health. It becomes true only after a successful

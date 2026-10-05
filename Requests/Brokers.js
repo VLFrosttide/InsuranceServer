@@ -5,8 +5,7 @@
 // (role 2) can increase/reduce. Unlike daily current cash, a broker balance
 // may go negative.
 //
-// Creating an insurance reduces its broker's balance by
-//   policy price × broker.Percentage / 100
+// Creating an insurance reduces its broker's balance by the full price
 // and decrements the broker's InactivePolicies by 1.
 
 const express = require("express");
@@ -103,7 +102,7 @@ const resolveBrokerByEmail = (module.exports.resolveBrokerByEmail =
   });
 
 /**
- * Decrease a broker's balance by `price × Percentage / 100` and decrement
+ * Decrease a broker's balance by the full price and decrement
  * InactivePolicies by 1. Runs inside the caller's transaction.
  *
  * @param {import("mysql2/promise").Connection} conn
@@ -113,31 +112,27 @@ const resolveBrokerByEmail = (module.exports.resolveBrokerByEmail =
  */
 const decreaseBrokerForInsurance = (module.exports.decreaseBrokerForInsurance =
   async function decreaseBrokerForInsurance(conn, brokerId, price) {
-    const [[broker]] = await conn.query(
-      "SELECT Percentage FROM brokers WHERE id = ?",
-      [brokerId]
-    );
+    const [[broker]] = await conn.query("SELECT id FROM brokers WHERE id = ?", [
+      brokerId,
+    ]);
     if (!broker) return null;
 
-    const percentage = Number(broker.Percentage) || 0;
     const priceNum = toDecimal(price) || 0;
-    // price × Percentage / 100
-    const charge = Math.round(priceNum * percentage) / 100;
 
     await conn.query(
       `UPDATE brokers
             SET CashBalance = CashBalance - ?,
                 InactivePolicies = InactivePolicies - 1
           WHERE id = ?`,
-      [charge, brokerId]
+      [priceNum, brokerId]
     );
 
-    return charge;
+    return priceNum;
   });
 
 /**
  * Restore a broker's balance after an insurance policy linked to it is
- * annulled: increases CashBalance by `price × Percentage / 100` (the inverse
+ * annulled: increases CashBalance by the full price (the inverse
  * of {@link decreaseBrokerForInsurance}) and increments InactivePolicies by 1
  * since the policy is no longer counted as active. Runs inside the caller's
  * transaction.
@@ -149,26 +144,22 @@ const decreaseBrokerForInsurance = (module.exports.decreaseBrokerForInsurance =
  */
 const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
   async function restoreBrokerForAnnulment(conn, brokerId, price) {
-    const [[broker]] = await conn.query(
-      "SELECT Percentage FROM brokers WHERE id = ?",
-      [brokerId]
-    );
+    const [[broker]] = await conn.query("SELECT id FROM brokers WHERE id = ?", [
+      brokerId,
+    ]);
     if (!broker) return null;
 
-    const percentage = Number(broker.Percentage) || 0;
     const priceNum = toDecimal(price) || 0;
-    // price × Percentage / 100
-    const charge = Math.round(priceNum * percentage) / 100;
 
     await conn.query(
       `UPDATE brokers
             SET CashBalance = CashBalance + ?,
                 InactivePolicies = InactivePolicies + 1
           WHERE id = ?`,
-      [charge, brokerId]
+      [priceNum, brokerId]
     );
 
-    return charge;
+    return priceNum;
   });
 
 /**

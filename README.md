@@ -153,21 +153,21 @@ created with `PaymentType = "Card"`.
 
 Broker accounts.
 
-| Column             | Type            | Notes                             |
-| ------------------ | --------------- | --------------------------------- |
-| `id`               | `INT`           | Auto-increment PK                 |
-| `Name`             | `VARCHAR(100)`  | Unique broker name                |
-| `CashBalance`      | `DECIMAL(15,2)` | Broker cash balance (may go neg.) |
-| `Percentage`       | `DECIMAL(5,2)`  | Commission rate per policy        |
-| `PolicyRangeStart` | `INT`           | Start of blanc-number range       |
-| `PolicyRangeEnd`   | `INT`           | End of blanc-number range         |
-| `InactivePolicies` | `INT`           | Remaining inactive policies       |
-| `CreatedAt`        | `DATETIME`      | Creation time                     |
+| Column             | Type            | Notes                                        |
+| ------------------ | --------------- | -------------------------------------------- |
+| `id`               | `INT`           | Auto-increment PK                            |
+| `Name`             | `VARCHAR(100)`  | Unique broker name                           |
+| `CashBalance`      | `DECIMAL(15,2)` | Broker cash balance (may go neg.)            |
+| `Percentage`       | `DECIMAL(5,2)`  | Deprecated: commission rate (no longer used) |
+| `PolicyRangeStart` | `INT`           | Start of blanc-number range                  |
+| `PolicyRangeEnd`   | `INT`           | End of blanc-number range                    |
+| `InactivePolicies` | `INT`           | Remaining inactive policies                  |
+| `CreatedAt`        | `DATETIME`      | Creation time                                |
 
 Use case: broker management. Admins/workers can increase/reduce a broker
 balance. Creating an insurance resolves its broker (by `BrokerId`, then by the
 policy range containing the blanc number, then the single broker) and charges
-it `Price × Percentage / 100` while decrementing `InactivePolicies`.
+it the full `Price` while decrementing `InactivePolicies`.
 
 ### `broker_emails`
 
@@ -291,7 +291,7 @@ Admin-only (`role 1`) broker management:
 - `DELETE /brokers/:id` — delete a broker (detaches any linked insurances)
 
 Each created insurance charges its broker: the broker balance is reduced by
-`Price × Percentage / 100` and the broker's `InactivePolicies` is decremented
+the full `Price` and the broker's `InactivePolicies` is decremented
 by 1. The broker is resolved by `BrokerId`, else by the policy range that
 contains the blanc number, else the single broker if only one exists.
 
