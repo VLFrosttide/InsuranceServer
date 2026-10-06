@@ -227,12 +227,21 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     return broker;
   }
 
-  // GET /brokers — list every broker with its balance and inactive policies.
+  // GET /brokers — list every broker with its balance, inactive policies and emails.
   router.get("/brokers", auth, requireBrokerRole, async (req, res) => {
     try {
       const [rows] = await DBConnection.query(
         `SELECT ${BROKER_COLUMNS} FROM brokers ORDER BY id`
       );
+      const [emailRows] = await DBConnection.query(
+        "SELECT BrokerId, Email FROM broker_emails ORDER BY BrokerId, id"
+      );
+      const emailsByBroker = new Map();
+      for (const e of emailRows) {
+        if (!emailsByBroker.has(e.BrokerId)) emailsByBroker.set(e.BrokerId, []);
+        emailsByBroker.get(e.BrokerId).push(e.Email);
+      }
+      for (const b of rows) b.emails = emailsByBroker.get(b.id) || [];
       res.json({ brokers: rows });
     } catch (err) {
       console.error("Broker list failed:", err);
@@ -318,13 +327,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       if (brokerId === null) {
         return res.status(400).json({ error: "Invalid broker id" });
       }
-      const [[broker]] = await DBConnection.query(
-        `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
-        [brokerId]
-      );
-      if (!broker) {
-        return res.status(404).json({ error: "Broker not found" });
-      }
+      const broker = await fetchBroker(res, brokerId);
+      if (!broker) return;
       res.json({ broker });
     } catch (err) {
       console.error("Broker lookup failed:", err);

@@ -861,6 +861,7 @@ async function seedBrokersFromInfo(db) {
   // has none for them yet.
   for (const b of existingBrokers) {
     await seedBrokerTariffsIfMissing(db, b.id, b.Name);
+    await seedBrokerEmailsIfMissing(db, b.id, b.Name);
   }
 
   let seedCount = 0;
@@ -903,7 +904,40 @@ async function seedBrokersFromInfo(db) {
   }
 }
 
+/**
+ * Seed the emails of one broker from BrokerData, but only when the database
+ * holds no emails for that broker yet (never overwrites admin edits).
+ *
+ * @param {import("mysql2/promise").Connection} db
+ * @param {number} brokerId
+ * @param {string} brokerName
+ * @returns {Promise<number>} number of email rows inserted
+ */
+async function seedBrokerEmailsIfMissing(db, brokerId, brokerName) {
+  const emails = BrokerData[brokerName];
+  if (!emails) return 0;
+
+  const [[{ n }]] = await db.query(
+    "SELECT COUNT(*) AS n FROM broker_emails WHERE BrokerId = ?",
+    [brokerId]
+  );
+  if (n > 0) return 0;
+
+  let inserted = 0;
+  for (const email of emails) {
+    const trimmed = String(email).trim();
+    if (!trimmed) continue;
+    const [r] = await db.query(
+      "INSERT IGNORE INTO broker_emails (BrokerId, Email) VALUES (?, ?)",
+      [brokerId, trimmed]
+    );
+    inserted += r.affectedRows || 0;
+  }
+  return inserted;
+}
+
 module.exports = {
+  seedBrokerEmailsIfMissing,
   Pricing,
   BrokerData,
   seedBrokersFromInfo,
