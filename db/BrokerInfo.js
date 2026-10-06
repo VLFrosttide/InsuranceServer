@@ -843,6 +843,50 @@ async function seedBrokerTariffsIfMissing(db, brokerId, brokerName) {
   return inserted;
 }
 
+// The Pricing entries that are not brokers (they have no email list in
+// BrokerData) are the walk-in prices of the branches. Map each of them to the
+// branch name selected at login (see renderer/LoginPage/index.html).
+const BranchPricingKeys = {
+  "ГКПП Капитан Андреево": "KapAndreevo",
+  "ГКПП Лесово": "Lesovo",
+  "Офис Харманли": "Nikolay",
+};
+
+/**
+ * Seed the walk-in tariffs (branch_tariffs) of every branch from the Pricing
+ * table, but only for branches that have no tariffs in the database yet (never
+ * overwrites admin edits).
+ *
+ * @param {import("mysql2/promise").Connection} db
+ * @returns {Promise<number>} number of tariff rows inserted
+ */
+async function seedBranchTariffsIfMissing(db) {
+  let inserted = 0;
+  for (const [branch, pricingKey] of Object.entries(BranchPricingKeys)) {
+    const branchPricing = Pricing[pricingKey];
+    if (!branchPricing) continue;
+
+    const [[{ n }]] = await db.query(
+      "SELECT COUNT(*) AS n FROM branch_tariffs WHERE Branch = ?",
+      [branch]
+    );
+    if (n > 0) continue;
+
+    for (const [insuranceType, durations] of Object.entries(branchPricing)) {
+      for (const [duration, price] of Object.entries(durations)) {
+        await db.query(
+          `INSERT INTO branch_tariffs (Branch, InsuranceType, Duration, Price)
+           VALUES (?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE Price = Price`,
+          [branch, insuranceType, parseInt(duration, 10), parseFloat(price)]
+        );
+        inserted++;
+      }
+    }
+  }
+  return inserted;
+}
+
 /**
  * Seed brokers from BrokerInfo.js into the database with their emails and tariffs.
  * This function seeds brokers only if they don't already exist (idempotent).
@@ -850,6 +894,12 @@ async function seedBrokerTariffsIfMissing(db, brokerId, brokerName) {
  * @param {import("mysql2/promise").Connection} db
  */
 async function seedBrokersFromInfo(db) {
+  // Walk-in (branch) prices used for insurances that are not from a broker.
+  const branchRows = await seedBranchTariffsIfMissing(db);
+  if (branchRows > 0) {
+    console.log(`Seeded ${branchRows} branch tariffs from BrokerInfo.js`);
+  }
+
   // Get existing brokers to avoid duplicates
   const [existingBrokers] = await db.query(
     "SELECT id, Name FROM brokers WHERE Name IN (?)",
@@ -942,4 +992,5 @@ module.exports = {
   BrokerData,
   seedBrokersFromInfo,
   seedBrokerTariffsIfMissing,
+  seedBranchTariffsIfMissing,
 };
