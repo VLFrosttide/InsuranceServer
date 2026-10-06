@@ -99,6 +99,8 @@ async function runSetup(config = {}) {
       Otomobil VARCHAR(45) NOT NULL,
       StartDate DATE NULL,
       PaymentType VARCHAR(45) NOT NULL,
+      NonTurk TINYINT(1) NOT NULL DEFAULT 0,
+      CardFee TINYINT(1) NOT NULL DEFAULT 0,
       PRIMARY KEY (BlancNumber),
       UNIQUE KEY BlancNumber_UNIQUE (BlancNumber),
       KEY idx_insurance_broker (BrokerId)
@@ -199,6 +201,22 @@ async function runSetup(config = {}) {
   await db.query(
     "UPDATE insurance SET PaymentType = 'Card' WHERE PaymentType NOT IN ('Cash', 'Card')"
   );
+
+  // Optional surcharges chosen on the add-insurance form. Their amounts
+  // (+5 for NonTurk, +2 for CardFee) are already included in Price; these
+  // flags record which ones were applied.
+  if (!insColNames.has("NonTurk")) {
+    await db.query(
+      "ALTER TABLE insurance ADD COLUMN NonTurk TINYINT(1) NOT NULL DEFAULT 0"
+    );
+    console.log("Added insurance.NonTurk column");
+  }
+  if (!insColNames.has("CardFee")) {
+    await db.query(
+      "ALTER TABLE insurance ADD COLUMN CardFee TINYINT(1) NOT NULL DEFAULT 0"
+    );
+    console.log("Added insurance.CardFee column");
+  }
 
   // Annulment support: a worker/admin can annul a policy, refunding its price
   // (minus a fee that depends on the fault reason) and reversing its effect

@@ -57,21 +57,27 @@ broker). `Role` defaults to `3` (client) when added by the migration.
 
 One row per insurance policy.
 
-| Column         | Notes                                    |
-| -------------- | ---------------------------------------- |
-| `Author`       | User who created the policy              |
-| `CreationDate` | When the policy was created              |
-| `PolicyNumber` | Policy number                            |
-| `BlancNumber`  | Blanc number (unique; used for lookups)  |
-| `Price`        | Policy price                             |
-| `CurrencyType` | e.g. `EUR`                               |
-| `Duration`     | Duration in integer days                 |
-| `Broker`       | Broker name (inferred from email sender) |
-| `BrokerId`     | Link to `brokers.id`                     |
-| `Branch`       | Branch (selected at login)               |
-| `Otomobil`     | Vehicle/car flag value                   |
-| `StartDate`    | Policy start date                        |
-| `PaymentType`  | `"Cash"` or `"Card"`                     |
+| Column         | Notes                                              |
+| -------------- | -------------------------------------------------- |
+| `Author`       | User who created the policy                        |
+| `CreationDate` | When the policy was created                        |
+| `PolicyNumber` | Policy number                                      |
+| `BlancNumber`  | Blanc number (unique; used for lookups)            |
+| `Price`        | Policy price                                       |
+| `CurrencyType` | e.g. `EUR`                                         |
+| `Duration`     | Duration in integer days                           |
+| `Broker`       | Broker name (inferred from email sender)           |
+| `BrokerId`     | Link to `brokers.id`                               |
+| `Branch`       | Branch (selected at login)                         |
+| `Otomobil`     | Vehicle/car flag value                             |
+| `StartDate`    | Policy start date                                  |
+| `PaymentType`  | `"Cash"` or `"Card"`                               |
+| `NonTurk`      | `1` if the +5 non-Turk surcharge applied           |
+| `CardFee`      | `1` if the +2 card fee applied (never with `Cash`) |
+
+`NonTurk` and `CardFee` are flags only: their amounts (+5 / +2) are already
+included in `Price` by the client. The server ignores `CardFee` for `Cash`
+policies. Both columns are added automatically by `db/setup.js`.
 
 Use case: the core business entity — created by workers, listed for clients,
 edited by admins/workers, and linked to a broker and to the current-cash
@@ -153,15 +159,15 @@ created with `PaymentType = "Card"`.
 
 Broker accounts.
 
-| Column             | Type            | Notes                                        |
-| ------------------ | --------------- | -------------------------------------------- |
-| `id`               | `INT`           | Auto-increment PK                            |
-| `Name`             | `VARCHAR(100)`  | Unique broker name                           |
-| `CashBalance`      | `DECIMAL(15,2)` | Broker cash balance (may go neg.)            |
-| `PolicyRangeStart` | `INT`           | Start of blanc-number range                  |
-| `PolicyRangeEnd`   | `INT`           | End of blanc-number range                    |
-| `InactivePolicies` | `INT`           | Remaining inactive policies                  |
-| `CreatedAt`        | `DATETIME`      | Creation time                                |
+| Column             | Type            | Notes                             |
+| ------------------ | --------------- | --------------------------------- |
+| `id`               | `INT`           | Auto-increment PK                 |
+| `Name`             | `VARCHAR(100)`  | Unique broker name                |
+| `CashBalance`      | `DECIMAL(15,2)` | Broker cash balance (may go neg.) |
+| `PolicyRangeStart` | `INT`           | Start of blanc-number range       |
+| `PolicyRangeEnd`   | `INT`           | End of blanc-number range         |
+| `InactivePolicies` | `INT`           | Remaining inactive policies       |
+| `CreatedAt`        | `DATETIME`      | Creation time                     |
 
 Use case: broker management. Admins/workers can increase/reduce a broker
 balance. Creating an insurance resolves its broker from the sender email (broker_emails) and deducts a flat fee (the full Price) from its balance while decrementing InactivePolicies. No percentages are used anywhere.

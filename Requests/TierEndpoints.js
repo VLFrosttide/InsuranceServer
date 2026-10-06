@@ -41,6 +41,16 @@ function resolvePaymentType(value) {
 }
 
 /**
+ * Coerce a checkbox-like value (boolean, "true", "1", 1, "yes") to a boolean.
+ */
+function toFlag(value) {
+  if (typeof value === "boolean") return value;
+  if (value === undefined || value === null) return false;
+  const s = String(value).trim().toLowerCase();
+  return s === "true" || s === "1" || s === "yes";
+}
+
+/**
  * Parse a human/duration value into an integer number of days.
  * Accepts "15", "15 дена", "3 месеца", "1 година", etc.
  */
@@ -390,6 +400,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       let startDate = b.StartDate ?? b.startDate ?? null;
       if (startDate === "") startDate = null;
 
+      // Optional surcharges (already included in Price). The card fee is only
+      // valid when the payment is NOT cash.
+      const nonTurk = toFlag(b.NonTurk ?? b.nonTurk);
+      const cardFee = paymentType !== "Cash" && toFlag(b.CardFee ?? b.cardFee);
+
       // Broker is no longer typed on the form. It is inferred from the sender
       // ("From" address) of the unread email the policy is created from.
       const emailFrom = b.EmailFrom ?? b.emailFrom ?? "";
@@ -426,8 +441,8 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           `INSERT INTO insurance
               (Author, CreationDate, PolicyNumber, BlancNumber, CarNumber, Price,
                CurrencyType, Duration, Broker, Branch, Otomobil, PaymentType,
-               StartDate, BrokerId)
-           VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               StartDate, BrokerId, NonTurk, CardFee)
+           VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             req.user.username,
             policyNumber,
@@ -442,6 +457,8 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             paymentType,
             startDate,
             brokerId,
+            nonTurk ? 1 : 0,
+            cardFee ? 1 : 0,
           ]
         );
 
@@ -693,19 +710,39 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           ["Otomobil", b.Otomobil ?? b.otomobil],
           ["PaymentType", b.PaymentType ?? b.paymentType ?? b.Cash ?? b.cash],
           ["StartDate", b.StartDate ?? b.startDate],
+          ["NonTurk", b.NonTurk ?? b.nonTurk],
+          ["CardFee", b.CardFee ?? b.cardFee],
         ];
+
+        // Resulting payment type after this edit; the card fee is only valid
+        // when the payment is NOT cash.
+        const newPaymentRaw =
+          b.PaymentType ?? b.paymentType ?? b.Cash ?? b.cash;
+        const finalPayment =
+          newPaymentRaw !== undefined && newPaymentRaw !== null
+            ? resolvePaymentType(newPaymentRaw)
+            : insurance.PaymentType;
+        let cardFeeHandled = false;
 
         for (const [column, value] of editable) {
           if (value !== undefined && value !== null) {
-            const v =
-              column === "PaymentType"
-                ? resolvePaymentType(value)
-                : column === "Price"
-                ? String(value)
-                : value;
+            let v;
+            if (column === "PaymentType") v = resolvePaymentType(value);
+            else if (column === "Price") v = String(value);
+            else if (column === "NonTurk") v = toFlag(value) ? 1 : 0;
+            else if (column === "CardFee") {
+              v = finalPayment !== "Cash" && toFlag(value) ? 1 : 0;
+              cardFeeHandled = true;
+            } else v = value;
             sets.push(`${column} = ?`);
             params.push(v);
           }
+        }
+
+        // Switching to Cash clears a previously stored card fee flag.
+        if (!cardFeeHandled && finalPayment === "Cash" && insurance.CardFee) {
+          sets.push("CardFee = ?");
+          params.push(0);
         }
 
         // Duration is stored as integer days, so parse it the same way the
