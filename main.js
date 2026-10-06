@@ -122,6 +122,12 @@ async function start() {
   // CORS: the Electron client loads from file:// and calls this server on
   // http://127.0.0.1:5501. Allow JSON + Bearer-token requests across origins.
   app.use((req, res, next) => {
+    // Every response from this API is dynamic (auth, balances, live email
+    // state). The site sits behind Hostinger's CDN, which will otherwise store
+    // whatever it sees - including a transient error page generated at the edge
+    // while this process restarts. `no-store` keeps the CDN from ever serving a
+    // stale response for these routes.
+    res.setHeader("Cache-Control", "no-store");
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader(
       "Access-Control-Allow-Methods",
@@ -200,6 +206,21 @@ async function start() {
     return res
       .status(503)
       .json({ status: "degraded", error: "Database unavailable" });
+  });
+
+  // Plain-HTTP probe for the WebSocket route. The upgrade itself cannot be
+  // exercised from a browser address bar or curl, and Express' HTML
+  // "Cannot GET /ws" is indistinguishable from "this route does not exist"
+  // while diagnosing a reverse proxy. Answering with JSON proves the request
+  // reached this process - exactly what needs to be known when a client
+  // reports a failed handshake (e.g. a 3xx produced by the CDN in front).
+  app.get("/ws", (req, res) => {
+    res.json({
+      status: "ok",
+      service: "InsuranceServer",
+      upgrade: "websocket",
+      hint: "Send 'Connection: Upgrade' + 'Upgrade: websocket' to this path.",
+    });
   });
 
   // Bind the socket immediately. Hostinger's startup watchdog requires

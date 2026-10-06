@@ -28,7 +28,17 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
     }
 
     if (pathname !== "/ws") {
-      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+      // Reject with a complete, self-terminating response. A bare status line
+      // carries no Content-Length and no Connection header, so a reverse proxy
+      // in front of this process can mis-frame it and leave the socket in an
+      // ambiguous state for the client.
+      console.warn(`Rejected WebSocket upgrade for unknown path: ${pathname}`);
+      socket.write(
+        "HTTP/1.1 404 Not Found\r\n" +
+          "Content-Length: 0\r\n" +
+          "Connection: close\r\n" +
+          "\r\n"
+      );
       socket.destroy();
       return;
     }
