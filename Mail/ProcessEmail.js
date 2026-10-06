@@ -1,15 +1,10 @@
 "use strict";
-const fs = require("node:fs");
 const path = require("node:path");
 const walkParts = require("./walkParts.js");
 const { notifyUnreadEmail } = require("../Users/websocket.js");
 const mailStore = require("./mailStore.js");
 const { isKnownBrokerSender } = require("./brokerSenders.js");
 
-const SAVE_TO_DISK = process.env.SAVE_ATTACHMENTS_TO_DISK !== "0";
-const ATTACHMENTS_DIR = path.resolve(
-  process.env.GMAIL_ATTACHMENTS_DIR || path.join(process.cwd(), "attachments")
-);
 const RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
 function headerValue(headers, name) {
@@ -66,9 +61,8 @@ function decodeBase64Url(data) {
 }
 
 // Inline attachments at most this large as base64 in the WebSocket response.
-// Larger attachments are written to disk and referenced by filename, matching
-// the previous eager behaviour.
-const INLINE_ATTACHMENT_LIMIT = 5 * 1024 * 1024;
+// Larger attachments are not inlined (the client shows their filename only).
+const INLINE_ATTACHMENT_LIMIT = 10 * 1024 * 1024;
 
 /**
  * Lazily resolve one attachment of an email card to its bytes.
@@ -116,10 +110,6 @@ module.exports.getAttachment = async function getAttachment(email, id) {
   let base64 = null;
   if (data.length <= INLINE_ATTACHMENT_LIMIT) {
     base64 = data.toString("base64");
-  } else if (SAVE_TO_DISK) {
-    const dir = path.join(ATTACHMENTS_DIR, email.account, email.messageId);
-    await fs.promises.mkdir(dir, { recursive: true });
-    await fs.promises.writeFile(path.join(dir, att.filename), data);
   }
 
   return {

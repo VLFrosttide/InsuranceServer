@@ -330,15 +330,14 @@ Each created insurance whose email sender is associated with a broker charges th
    `{ "type": "get_attachment", "messageId": "<email message id>", "id": "<attachment id>" }`
    to fetch one attachment's bytes; the server replies with
    `{ "type": "get_attachment", ok, id, filename, mimeType, size, base64 }`.
-   `base64` is `null` for files larger than 5 MB, which are instead written to
-   disk under `attachments/` (see below).
+   `base64` is `null` for files larger than 10 MB, which are not inlined (the
+   client shows the filename only).
 
 ## Gmail polling
 
 Enabled by default when `.env` has valid OAuth credentials. It runs in the
 background and does not block the REST/WebSocket server. Attachments are loaded
-lazily — saved under `attachments/` (unless `SAVE_ATTACHMENTS_TO_DISK=0`) only
-when a worker actually opens the card and the file is too large to inline.
+lazily and returned inline as base64; nothing is written to disk.
 
 The server polls up to three Gmail inboxes (`Account1`, `Account2`,
 `Account3`). Only the inboxes whose OAuth credentials are configured are
