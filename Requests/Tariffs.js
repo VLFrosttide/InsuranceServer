@@ -48,8 +48,37 @@ module.exports.createTariffsRouter = function createTariffsRouter(
       const brokerName = req.user.username;
       const brokerId = await getBrokerIdByName(brokerName);
 
+      // The logged-in user is not a broker (e.g. a worker or admin). That is a
+      // normal situation, not an error: fall back to the walk-in tariffs of the
+      // requested branch (?branch=...), or an empty price list when no branch
+      // was given, instead of answering 404.
       if (!brokerId) {
-        return res.status(404).json({ error: "Broker not found" });
+        const branch =
+          typeof req.query.branch === "string" ? req.query.branch.trim() : "";
+        const fallback = {};
+        if (branch) {
+          const [branchTariffs] = await DBConnection.query(
+            `SELECT InsuranceType, Duration, Price
+               FROM branch_tariffs
+              WHERE Branch = ?
+              ORDER BY InsuranceType, Duration`,
+            [branch]
+          );
+          for (const tariff of branchTariffs) {
+            if (!fallback[tariff.InsuranceType]) {
+              fallback[tariff.InsuranceType] = {};
+            }
+            fallback[tariff.InsuranceType][tariff.Duration] = parseFloat(
+              tariff.Price
+            );
+          }
+        }
+        return res.json({
+          brokerName: null,
+          brokerId: null,
+          source: branch ? "branch" : "none",
+          pricing: fallback,
+        });
       }
 
       const [tariffs] = await DBConnection.query(
