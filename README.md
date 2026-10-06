@@ -6,7 +6,7 @@ Electron client (`InsuranceClient`).
 ## Prerequisites
 
 - Node.js 20.12+ (tested with 24.x)
-- MySQL 8 running on port `5500` (database `insurancedb`)
+- MySQL 8 running on port `3306` (database `insurancedb`)
 - A `.env` file in the repo root with at least:
 
   ```env

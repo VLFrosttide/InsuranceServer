@@ -12,6 +12,7 @@
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
+const { resolveBrokerByEmail } = require("./Brokers.js");
 
 /**
  * Create the tariffs router.
@@ -110,6 +111,75 @@ module.exports.createTariffsRouter = function createTariffsRouter(
       res.status(500).json({ error: "Failed to fetch pricing" });
     }
   });
+
+  // GET /tariffs/policy-pricing?from=<email sender>&branch=<branch>
+  // Pricing used by the add-insurance form:
+  //  - Insurance created from an email card: the broker is resolved from the
+  //    sender address and the broker's tariffs are returned.
+  //  - Walk-ins (no sender, or sender is not a known broker / has no tariffs):
+  //    the branch walk-in tariffs are returned.
+  router.get(
+    "/tariffs/policy-pricing",
+    auth,
+    requireWorkerOrAdmin,
+    async (req, res) => {
+      try {
+        const from = typeof req.query.from === "string" ? req.query.from : "";
+        const branch =
+          typeof req.query.branch === "string" ? req.query.branch.trim() : "";
+
+        const toPricing = (rows) => {
+          const pricing = {};
+          for (const tariff of rows) {
+            if (!pricing[tariff.InsuranceType]) {
+              pricing[tariff.InsuranceType] = {};
+            }
+            pricing[tariff.InsuranceType][tariff.Duration] = parseFloat(
+              tariff.Price
+            );
+          }
+          return pricing;
+        };
+
+        if (from.trim()) {
+          const broker = await resolveBrokerByEmail(DBConnection, from);
+          if (broker) {
+            const [rows] = await DBConnection.query(
+              `SELECT InsuranceType, Duration, Price
+                 FROM broker_tariffs
+                WHERE BrokerId = ?
+                ORDER BY InsuranceType, Duration`,
+              [broker.id]
+            );
+            if (rows.length) {
+              return res.json({
+                source: "broker",
+                brokerId: broker.id,
+                brokerName: broker.name,
+                pricing: toPricing(rows),
+              });
+            }
+          }
+        }
+
+        let pricing = {};
+        if (branch) {
+          const [rows] = await DBConnection.query(
+            `SELECT InsuranceType, Duration, Price
+               FROM branch_tariffs
+              WHERE Branch = ?
+              ORDER BY InsuranceType, Duration`,
+            [branch]
+          );
+          pricing = toPricing(rows);
+        }
+        res.json({ source: "branch", branch, pricing });
+      } catch (err) {
+        console.error("Failed to fetch policy pricing:", err);
+        res.status(500).json({ error: "Failed to fetch pricing" });
+      }
+    }
+  );
 
   // GET /tariffs/broker/:brokerId — admin view a specific broker's tariffs
   router.get(
