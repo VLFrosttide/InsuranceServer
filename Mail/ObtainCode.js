@@ -120,7 +120,15 @@ function obtainAuthCode(redirectUri) {
 
     server = http.createServer((req, res) => {
       res.setHeader("Connection", "close");
-      const reqUrl = new URL(req.url, `http://127.0.0.1:${port}`);
+      let reqUrl;
+      try {
+        reqUrl = new URL(req.url, `http://127.0.0.1:${port}`);
+      } catch (err) {
+        console.error("OAuth callback received an invalid request URL:", err);
+        res.writeHead(400);
+        res.end("Bad request");
+        return;
+      }
       if (expectedPath !== "/" && reqUrl.pathname !== expectedPath) {
         res.writeHead(404);
         res.end("Not found");
@@ -156,7 +164,12 @@ function obtainAuthCode(redirectUri) {
       server = null;
     });
 
-    server.listen(port, "127.0.0.1");
+    try {
+      server.listen(port, "127.0.0.1");
+    } catch (err) {
+      console.error("Could not start OAuth callback listener:", err);
+      server = null;
+    }
   });
 }
 

@@ -62,7 +62,15 @@ async function processUnreadMessages(gmail, account) {
     // them, so every poll returns the whole backlog again. Skip anything we
     // already hold in the mail store before paying for a full message fetch.
     if (mailStore.has(account, messageId)) continue;
-    await ProcessEmail(gmail, messageId, account);
+    try {
+      await ProcessEmail(gmail, messageId, account);
+    } catch (err) {
+      // One malformed/failed message must never abort the rest of the sweep.
+      console.error(
+        `Failed to process Gmail message "${messageId}" (${account}):`,
+        err
+      );
+    }
   }
 }
 

@@ -107,7 +107,13 @@ module.exports.persistTokens = function persistTokens(tokens, suffix = "") {
   }
   if (Object.keys(updates).length === 0) return;
 
-  const lines = fs.readFileSync(ENV_PATH, "utf8").split(/\r?\n/);
+  let lines;
+  try {
+    lines = fs.readFileSync(ENV_PATH, "utf8").split(/\r?\n/);
+  } catch (err) {
+    console.error("Could not read .env to persist Gmail tokens:", err);
+    return;
+  }
   const seen = new Set();
 
   const updated = lines.map((line) => {
@@ -151,7 +157,13 @@ module.exports.clearTokens = function clearTokens(suffix = "") {
   const names = new Set(
     Object.values(TOKEN_ENV_KEYS).map((base) => base + suffix)
   );
-  const lines = fs.readFileSync(ENV_PATH, "utf8").split(/\r?\n/);
+  let lines;
+  try {
+    lines = fs.readFileSync(ENV_PATH, "utf8").split(/\r?\n/);
+  } catch (err) {
+    console.error("Could not read .env to clear Gmail tokens:", err);
+    return;
+  }
   const kept = lines.filter((line) => {
     const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/);
     return !(match && names.has(match[1]));

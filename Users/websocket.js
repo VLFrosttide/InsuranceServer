@@ -33,9 +33,14 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
       return;
     }
 
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
+    try {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit("connection", ws, req);
+      });
+    } catch (err) {
+      console.error("WebSocket upgrade failed:", err);
+      socket.destroy();
+    }
   });
 
   wss.on("connection", (ws) => {
@@ -52,7 +57,11 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
       ws.isAlive = true;
     });
 
-    ws.on("message", (data) => handleMessage(ws, data));
+    ws.on("message", (data) => {
+      handleMessage(ws, data).catch((err) => {
+        console.error("WebSocket message handling failed:", err);
+      });
+    });
 
     ws.on("close", () => {
       // Release every email card this connection still holds. A worker that is
@@ -75,12 +84,21 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
   // Heartbeat to drop dead connections from Electron clients.
   setInterval(() => {
     for (const client of wss.clients) {
-      if (client.isAlive === false) {
-        client.terminate();
-        continue;
+      try {
+        if (client.isAlive === false) {
+          client.terminate();
+          continue;
+        }
+        client.isAlive = false;
+        client.ping();
+      } catch (err) {
+        console.error("WebSocket heartbeat failed:", err);
+        try {
+          client.terminate();
+        } catch {
+          // ignore
+        }
       }
-      client.isAlive = false;
-      client.ping();
     }
   }, 30000);
 
@@ -91,7 +109,8 @@ async function handleMessage(ws, data) {
   let msg;
   try {
     msg = JSON.parse(data.toString());
-  } catch {
+  } catch (err) {
+    console.error("Failed to parse WebSocket message:", err);
     return;
   }
 
@@ -292,8 +311,12 @@ function broadcast(payload, email) {
       String(client.role) === EMAIL_UPDATE_ROLE &&
       (!email || canSeeEmail(client.branch, email))
     ) {
-      client.send(message);
-      delivered++;
+      try {
+        client.send(message);
+        delivered++;
+      } catch (err) {
+        console.error("Failed to broadcast email update to a client:", err);
+      }
     }
   }
 
@@ -317,8 +340,12 @@ module.exports.sendToUser = function sendToUser(username, payload) {
 
   for (const client of wss.clients) {
     if (client.readyState === WebSocket.OPEN && client.username === username) {
-      client.send(message);
-      delivered++;
+      try {
+        client.send(message);
+        delivered++;
+      } catch (err) {
+        console.error("Failed to send WebSocket message to a user:", err);
+      }
     }
   }
 
