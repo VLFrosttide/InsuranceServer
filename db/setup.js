@@ -101,6 +101,14 @@ async function runSetup(config = {}) {
       PaymentType VARCHAR(45) NOT NULL,
       NonTurk TINYINT(1) NOT NULL DEFAULT 0,
       CardFee TINYINT(1) NOT NULL DEFAULT 0,
+      Annulled TINYINT(1) NOT NULL DEFAULT 0,
+      AnnulReason VARCHAR(20) NULL,
+      AnnulFee DECIMAL(15,2) NULL,
+      AnnulDate DATETIME NULL,
+      AnnulBy VARCHAR(45) NULL,
+      Deleted TINYINT(1) NOT NULL DEFAULT 0,
+      DeletedAt DATETIME NULL,
+      DeletedBy VARCHAR(45) NULL,
       PRIMARY KEY (BlancNumber),
       UNIQUE KEY BlancNumber_UNIQUE (BlancNumber),
       KEY idx_insurance_broker (BrokerId)
@@ -246,6 +254,29 @@ async function runSetup(config = {}) {
   if (!insColNames.has("AnnulBy")) {
     await db.query("ALTER TABLE insurance ADD COLUMN AnnulBy VARCHAR(45) NULL");
     console.log("Added insurance.AnnulBy column");
+  }
+
+  // Soft-delete support: an admin can delete a policy from the admin panel.
+  // The row is never physically removed — it is only tagged as Deleted so it
+  // keeps being kept in the database for record-keeping, but is excluded from
+  // every list/search endpoint and from reconciliation/report parsing.
+  if (!insColNames.has("Deleted")) {
+    await db.query(
+      "ALTER TABLE insurance ADD COLUMN Deleted TINYINT(1) NOT NULL DEFAULT 0"
+    );
+    console.log("Added insurance.Deleted column");
+  }
+  if (!insColNames.has("DeletedAt")) {
+    await db.query(
+      "ALTER TABLE insurance ADD COLUMN DeletedAt DATETIME NULL"
+    );
+    console.log("Added insurance.DeletedAt column");
+  }
+  if (!insColNames.has("DeletedBy")) {
+    await db.query(
+      "ALTER TABLE insurance ADD COLUMN DeletedBy VARCHAR(45) NULL"
+    );
+    console.log("Added insurance.DeletedBy column");
   }
 
   // 4) Create the tokens table.

@@ -79,6 +79,15 @@ One row per insurance policy.
 included in `Price` by the client. The server ignores `CardFee` for `Cash`
 policies. Both columns are added automatically by `db/setup.js`.
 
+The table also carries annulment columns (`Annulled`, `AnnulReason`,
+`AnnulFee`, `AnnulDate`, `AnnulBy`) and soft-delete columns (`Deleted`,
+`DeletedAt`, `DeletedBy`). Deleting a policy from the admin panel
+(`DELETE /insurances/:blancNumber`, admin-only) never removes the row: it only
+sets `Deleted = 1` plus `DeletedAt`/`DeletedBy`, so the policy is kept in the
+database for record-keeping but is excluded from `/admin/insurances` (unless
+`?includeDeleted=1` is passed), `/insurances`, and `/client/insurances` — and
+therefore is no longer picked up by reconciliation/report parsing.
+
 Use case: the core business entity — created by workers, listed for clients,
 edited by admins/workers, and linked to a broker and to the current-cash
 ledger. `BlancNumber` is the natural unique key used for create/update/duplicate

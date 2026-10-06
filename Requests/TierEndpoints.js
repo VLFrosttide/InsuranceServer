@@ -117,9 +117,20 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     }
   });
 
+  // Deleted insurances are soft-deleted (Deleted = 1): they stay in the
+  // database for record-keeping, but are hidden from every normal list so
+  // they no longer get parsed (e.g. by the daily-report reconciliation).
+  // Pass ?includeDeleted=1 to also see them (e.g. for an audit view).
   router.get("/admin/insurances", auth, requireRole(1), async (req, res) => {
     try {
-      const [rows] = await DBConnection.query("SELECT * FROM insurance");
+      const includeDeleted = ["1", "true", "yes"].includes(
+        String(req.query.includeDeleted || "").toLowerCase()
+      );
+      const [rows] = await DBConnection.query(
+        includeDeleted
+          ? "SELECT * FROM insurance"
+          : "SELECT * FROM insurance WHERE Deleted = 0"
+      );
       res.json({ insurances: rows });
     } catch (err) {
       console.error("Admin insurances lookup failed:", err);
@@ -584,7 +595,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   router.get("/client/insurances", auth, requireRole(3), async (req, res) => {
     try {
       const [rows] = await DBConnection.query(
-        "SELECT * FROM insurance WHERE Broker = ?",
+        "SELECT * FROM insurance WHERE Broker = ? AND Deleted = 0",
         [req.user.username]
       );
       res.json({ insurances: rows });
@@ -630,7 +641,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           .json({ error: "date must be in YYYY-MM-DD format" });
       }
 
-      const conditions = [];
+      // Deleted (soft-deleted) insurances are always excluded here so they
+      // stop being parsed/surfaced, regardless of the other filters applied.
+      const conditions = ["Deleted = 0"];
       const params = [];
 
       if (author) {
@@ -696,6 +709,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           return res
             .status(403)
             .json({ error: "Forbidden: can only modify your own insurances" });
+        }
+
+        if (insurance.Deleted) {
+          return res
+            .status(400)
+            .json({ error: "Cannot modify a deleted insurance" });
         }
 
         const b = req.body || {};
@@ -826,6 +845,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             .json({ error: "Forbidden: can only annul your own insurances" });
         }
 
+        if (insurance.Deleted) {
+          return res
+            .status(400)
+            .json({ error: "Cannot annul a deleted insurance" });
+        }
+
         if (insurance.Annulled) {
           return res.status(400).json({ error: "Insurance already annulled" });
         }
@@ -890,6 +915,50 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
         console.error("Insurance annulment failed:", err);
         res.status(500).json({ error: "Failed to annul insurance" });
+      }
+    }
+  );
+
+  // DELETE /insurances/:blancNumber  (admin panel "Delete" button)
+  //
+  // Soft-deletes a policy: the row is never physically removed from the
+  // database, it is only tagged (Deleted = 1, DeletedAt, DeletedBy) so it
+  // keeps existing for record-keeping purposes while being excluded from
+  // every normal list/search endpoint (/admin/insurances, /insurances,
+  // /client/insurances) and therefore from reconciliation/report parsing.
+  // Admin-only; a policy can only be deleted once.
+  router.delete(
+    "/insurances/:blancNumber",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      try {
+        const { blancNumber } = req.params;
+
+        const [existing] = await DBConnection.query(
+          "SELECT * FROM insurance WHERE BlancNumber = ?",
+          [blancNumber]
+        );
+        if (existing.length === 0) {
+          return res.status(404).json({ error: "Insurance not found" });
+        }
+
+        const insurance = existing[0];
+        if (insurance.Deleted) {
+          return res.status(400).json({ error: "Insurance already deleted" });
+        }
+
+        await DBConnection.query(
+          `UPDATE insurance
+              SET Deleted = 1, DeletedAt = NOW(), DeletedBy = ?
+            WHERE BlancNumber = ?`,
+          [req.user.username, blancNumber]
+        );
+
+        res.json({ message: "Insurance deleted", blancNumber });
+      } catch (err) {
+        console.error("Insurance deletion failed:", err);
+        res.status(500).json({ error: "Failed to delete insurance" });
       }
     }
   );
