@@ -207,6 +207,14 @@ async function start() {
   // behind the (potentially slow) database setup below.
   httpServer.listen(PORT, HOST);
 
+  // Attach the WebSocket server unconditionally. The handshake must succeed
+  // even while MySQL is unreachable: the app degrades gracefully, but a failed
+  // upgrade that is never handled leaves the reverse proxy with nothing to
+  // forward, so it answers the client with a 504 instead of a clean close.
+  // Auth queries run lazily on the "auth" message, so the DB pool is only
+  // touched once a client actually authenticates.
+  initWsServer(httpServer, DBConnection);
+
   try {
     // Ensure the schema and seed/test data exist BEFORE the pool is verified.
     // `runSetup` creates the database when it is missing, so running it first
@@ -241,7 +249,6 @@ async function start() {
     dbHealthy = true;
     console.log("Connected to MySQL database.");
 
-    initWsServer(httpServer, DBConnection);
     // Let the mail pipeline check senders against the broker emails in the DB.
     require("./Mail/brokerSenders.js").setDb(DBConnection);
     startGmailPolling();
