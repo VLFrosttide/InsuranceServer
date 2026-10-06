@@ -1,6 +1,6 @@
 "use strict";
 const express = require("express");
-const Bcrypt = require("bcrypt");
+const Bcrypt = require("bcryptjs");
 const Crypto = require("crypto");
 
 const ROLE_PAGES = {

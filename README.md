@@ -318,16 +318,27 @@ Each created insurance whose email sender is associated with a broker charges th
 
 `ws://127.0.0.1:5501/ws`
 
-1. Send `{ "type": "auth", "token": "<login token>" }` to authenticate.
+1. Send `{ "type": "auth", "token": "<login token>", "branch": "..." }` to
+   authenticate.
 2. Connected users with role `2` (worker) receive
    `{ "type": "new_email", "data": {...} }` when the Gmail poller finds a new
-   unread message.
+   unread message. Send `{ "type": "list_emails" }` to (re-)fetch the current
+   cards.
+3. Email cards carry only attachment **metadata** (`id`, `filename`,
+   `mimeType`, `size`) — the bytes are not downloaded or sent until requested.
+   When a worker opens a card, send
+   `{ "type": "get_attachment", "messageId": "<email message id>", "id": "<attachment id>" }`
+   to fetch one attachment's bytes; the server replies with
+   `{ "type": "get_attachment", ok, id, filename, mimeType, size, base64 }`.
+   `base64` is `null` for files larger than 5 MB, which are instead written to
+   disk under `attachments/` (see below).
 
 ## Gmail polling
 
 Enabled by default when `.env` has valid OAuth credentials. It runs in the
-background and does not block the REST/WebSocket server. Attachments are saved
-under `attachments/` unless `SAVE_ATTACHMENTS_TO_DISK=0`.
+background and does not block the REST/WebSocket server. Attachments are loaded
+lazily — saved under `attachments/` (unless `SAVE_ATTACHMENTS_TO_DISK=0`) only
+when a worker actually opens the card and the file is too large to inline.
 
 The server polls up to three Gmail inboxes (`Account1`, `Account2`,
 `Account3`). Only the inboxes whose OAuth credentials are configured are

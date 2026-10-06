@@ -133,6 +133,38 @@ async function handleMessage(ws, data) {
       .listAll()
       .filter((email) => canSeeEmail(ws.branch, email));
     ws.send(JSON.stringify({ type: "list_emails", data }));
+  } else if (msg.type === "get_attachment") {
+    if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
+      return;
+    }
+    const messageId = msg.messageId || null;
+    const id = msg.id || null;
+    const email = messageId ? mailStore.get(messageId) : null;
+    if (!email || !id || !canSeeEmail(ws.branch, email)) {
+      ws.send(
+        JSON.stringify({ type: "get_attachment", ok: false, id, error: "Not found" })
+      );
+      return;
+    }
+    try {
+      // Lazy require avoids a circular dependency: ProcessEmail already requires
+      // this module for notifyUnreadEmail, so loading it here (after startup)
+      // is safe and keeps the load-time cycle from breaking that export.
+      const { getAttachment } = require("../Mail/ProcessEmail.js");
+      const result = await getAttachment(email, id);
+      if (!result) {
+        ws.send(
+          JSON.stringify({ type: "get_attachment", ok: false, id, error: "Not found" })
+        );
+        return;
+      }
+      ws.send(JSON.stringify({ type: "get_attachment", ok: true, ...result }));
+    } catch (err) {
+      console.error("Failed to fetch attachment:", err);
+      ws.send(
+        JSON.stringify({ type: "get_attachment", ok: false, id, error: "Fetch failed" })
+      );
+    }
   } else if (msg.type === "claim_email") {
     if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
       return;
@@ -204,6 +236,25 @@ async function handleMessage(ws, data) {
       console.error("Failed to mark email as read:", err);
     }
     broadcast({ type: "email_completed", messageId }, email);
+  } else if (msg.type === "mark_irrelevant") {
+    if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
+      return;
+    }
+    const messageId = msg.messageId || null;
+    const email = messageId ? mailStore.get(messageId) : null;
+    if (!email) return;
+    if (!canSeeEmail(ws.branch, email)) return;
+
+    // Dismissed as irrelevant: drop it from the shared pool and mark the Gmail
+    // message read so it never re-surfaces on a later poll or server restart.
+    mailStore.remove(messageId);
+    ws.claimedEmails.delete(messageId);
+    try {
+      await mailStore.markRead(email.account, messageId);
+    } catch (err) {
+      console.error("Failed to mark irrelevant email as read:", err);
+    }
+    broadcast({ type: "email_irrelevant", messageId }, email);
   }
 }
 

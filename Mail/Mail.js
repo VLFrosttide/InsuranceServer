@@ -17,7 +17,7 @@ function CreateOauthClient(ClientID, ClientSecret, RedirectUri) {
   return new google.auth.OAuth2(ClientID, ClientSecret, RedirectUri);
 }
 
-const POLL_INTERVAL_MS = Number(process.env.MAIL_POLL_INTERVAL_MS) || 30000;
+const POLL_INTERVAL_MS = Number(process.env.MAIL_POLL_INTERVAL_MS) || 120000;
 
 // The up-to-three Gmail inboxes polled by this server. Each maps to a distinct
 // OAuth token set (see Mail/Authorize.js and Mail/secrets.js). Any label whose
@@ -35,17 +35,33 @@ function configuredAccounts() {
 }
 
 async function listUnreadIds(gmail) {
-  const res = await gmail.users.messages.list({
-    userId: "me",
-    q: "is:unread",
-  });
-  return (res.data.messages || []).map((m) => m.id);
+  // `messages.list` is paginated (default maxResults is only 100). Fetch every
+  // page so a large inbox backlog is not silently truncated to the first page.
+  const ids = [];
+  let pageToken;
+  do {
+    const res = await gmail.users.messages.list({
+      userId: "me",
+      q: "is:unread",
+      maxResults: 500,
+      pageToken: pageToken || undefined,
+    });
+    for (const m of res.data.messages || []) {
+      if (m && m.id) ids.push(m.id);
+    }
+    pageToken = res.data.nextPageToken;
+  } while (pageToken);
+  return ids;
 }
 
 // Processes all currently unread messages for one account's inbox.
 async function processUnreadMessages(gmail, account) {
   const unreadIds = await listUnreadIds(gmail);
   for (const messageId of unreadIds) {
+    // Unread messages stay "unread" in Gmail until a worker completes/ignores
+    // them, so every poll returns the whole backlog again. Skip anything we
+    // already hold in the mail store before paying for a full message fetch.
+    if (mailStore.has(account, messageId)) continue;
     await ProcessEmail(gmail, messageId, account);
   }
 }
@@ -158,7 +174,13 @@ async function initAccount(account) {
 
   // Continuously poll this inbox so newly arriving unread emails are picked
   // up and broadcast to connected Electron clients.
+  let polling = false;
   setInterval(async () => {
+    // If a sweep is still running (e.g. a large backlog of new messages with
+    // attachments took longer than one interval), skip this tick instead of
+    // stacking a second, overlapping sweep on top of it.
+    if (polling) return;
+    polling = true;
     try {
       await processUnreadMessages(gmail, account);
     } catch (err) {
@@ -166,6 +188,8 @@ async function initAccount(account) {
         `Error while polling Gmail (${account}) for unread messages:`,
         err
       );
+    } finally {
+      polling = false;
     }
   }, POLL_INTERVAL_MS);
 }

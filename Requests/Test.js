@@ -77,7 +77,27 @@ module.exports.createTestRouter = function createTestRouter(DBConnection) {
       };
 
       const testAttachment = loadTestAttachment();
-      if (testAttachment) email.attachments.push(testAttachment);
+      if (testAttachment) {
+        // Attach lazily like a real Gmail email: expose metadata on the card
+        // and keep the bytes out of the serialized payload until the worker
+        // requests them via get_attachment.
+        const card = {
+          id: "att-test-0",
+          filename: testAttachment.filename,
+          mimeType: testAttachment.mimeType,
+          size: testAttachment.size,
+        };
+        Object.defineProperty(card, "_src", {
+          value: {
+            attachmentId: null,
+            inlineData: null,
+            data: Buffer.from(testAttachment.base64, "base64"),
+          },
+          enumerable: false,
+          writable: true,
+        });
+        email.attachments.push(card);
+      }
 
       mailStore.add(email);
       notifyUnreadEmail(email);

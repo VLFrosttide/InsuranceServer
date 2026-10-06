@@ -2,7 +2,7 @@
 // Self-service registration. Anyone can create a "client" (role 3) account.
 // Admin/worker accounts are seeded via db/setup.js (or created at the DB).
 const express = require("express");
-const Bcrypt = require("bcrypt");
+const Bcrypt = require("bcryptjs");
 
 const VALID_ROLES = new Set(["1", "2", "3"]);
 

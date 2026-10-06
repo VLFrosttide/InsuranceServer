@@ -7,7 +7,6 @@
 //
 // Requires .env to contain DB_PASSWORD (MySQL root password).
 const mysql = require("mysql2/promise");
-const bcrypt = require("bcrypt");
 const { seedBrokersFromInfo } = require("./BrokerInfo.js");
 
 /**

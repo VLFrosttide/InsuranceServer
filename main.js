@@ -48,7 +48,23 @@ function loadEnvFile(file) {
     // `.env` is optional. The host may provide all configuration directly.
   }
 }
-loadEnvFile(path.join(__dirname, ".env"));
+// Look for `.env` in several places so the same entry point works both in the
+// source tree (`node main.js`) and as a packaged executable. Inside a packaged
+// binary `__dirname` points into the embedded snapshot, so also check the
+// process working directory and the directory the executable lives in.
+const ENV_CANDIDATES = [
+  path.join(__dirname, ".env"),
+  path.join(process.cwd(), ".env"),
+  path.join(path.dirname(process.execPath), ".env"),
+];
+const envFile = ENV_CANDIDATES.find((p) => {
+  try {
+    return fs.existsSync(p);
+  } catch {
+    return false;
+  }
+});
+if (envFile) loadEnvFile(envFile);
 
 const app = express();
 const httpServer = http.createServer(app);
