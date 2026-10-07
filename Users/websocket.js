@@ -8,6 +8,68 @@ let db = null;
 // Only clients whose user account has this role receive email updates.
 const EMAIL_UPDATE_ROLE = "2";
 
+// How long a dropped connection's claimed emails stay reserved before they are
+// returned to the pool (and marked unread), giving the worker a moment to
+// reconnect or the next page time to claim the email itself.
+const RELEASE_GRACE_MS = Number(process.env.EMAIL_RELEASE_GRACE_MS) || 3000;
+
+// Whether any currently open connection holds the claim on this email.
+function isHeldByOpenConnection(messageId) {
+  if (!wss) return false;
+  for (const client of wss.clients) {
+    if (
+      client.readyState === WebSocket.OPEN &&
+      client.claimedEmails &&
+      client.claimedEmails.has(messageId)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isNotFoundError(err) {
+  const status = err && (err.code || err.status || err.response?.status);
+  return Number(status) === 404 || Number(status) === 400;
+}
+
+/**
+ * Load an email that is no longer held in memory back into the mail store,
+ * straight from Gmail, without showing a card to other workers. Used when a
+ * worker reconnects with the email's form still open after a server restart.
+ *
+ * Emails completed or dismissed during this server run are never restored.
+ * Each registered inbox is tried in turn, because the message ID alone does
+ * not say which inbox it belongs to.
+ *
+ * @param {string} messageId  Gmail message ID.
+ * @returns {Promise<Object|null>} The stored email, or null when not found
+ *   or not from a known broker.
+ */
+async function restoreEmail(messageId) {
+  if (mailStore.wasHandled(messageId)) return null;
+  // Lazy require: ProcessEmail requires this module (circular dependency).
+  const { ProcessEmail } = require("../Mail/ProcessEmail.js");
+  for (const [account, gmail] of mailStore.listGmail()) {
+    if (!gmail) continue;
+    try {
+      const email = await ProcessEmail(gmail, messageId, account, {
+        notify: false,
+      });
+      if (email) return email;
+      // Already stored meanwhile (e.g. by a poll sweep), or not a broker email.
+      const stored = mailStore.get(messageId);
+      if (stored) return stored;
+      return null;
+    } catch (err) {
+      // Not in this inbox: try the next one. Any other failure is real.
+      if (isNotFoundError(err)) continue;
+      throw err;
+    }
+  }
+  return null;
+}
+
 /**
  * Attach the WebSocket server to the existing HTTP server and keep a
  * reference to the database connection for token verification.
@@ -76,18 +138,33 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
     ws.on("close", () => {
       // Release every email card this connection still holds. A worker that is
       // no longer connected must not keep cards reserved forever; return them
-      // to the shared pool so another worker can claim them.
-      for (const messageId of ws.claimedEmails) {
-        const email = mailStore.get(messageId);
-        if (!email) continue;
-        // Only release if this connection is still the actual claimer. The
-        // card may have been released/completed and re-claimed by someone else
-        // in the meantime.
-        if (mailStore.getClaimer(messageId) === ws.username) {
-          mailStore.unclaim(messageId);
-          broadcast({ type: "email_released", data: email }, email);
+      // to the shared pool (marked unread again) so another worker can claim
+      // them. If the worker reconnects with the form still open, the client
+      // claims the email again, which marks it read and taken once more.
+      //
+      // The release waits a short grace period first. Opening a card closes
+      // the dashboard's connection right before the form page claims the
+      // email on its own connection, and a brief network blip reconnects
+      // within a second or two. Neither should flip the card and the Gmail
+      // read state back and forth.
+      const claimed = Array.from(ws.claimedEmails);
+      ws.claimedEmails.clear();
+      if (claimed.length === 0) return;
+      const username = ws.username;
+      setTimeout(() => {
+        for (const messageId of claimed) {
+          const email = mailStore.get(messageId);
+          if (!email) continue;
+          // Only release if this user still holds the claim and has not
+          // re-claimed it on a newer connection in the meantime. The card may
+          // also have been released/completed and claimed by someone else.
+          if (mailStore.getClaimer(messageId) !== username) continue;
+          if (isHeldByOpenConnection(messageId)) continue;
+          releaseEmail(email, messageId).catch((err) => {
+            console.error("Failed to release email of closed connection:", err);
+          });
         }
-      }
+      }, RELEASE_GRACE_MS);
     });
   });
 
@@ -114,6 +191,31 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
 
   return wss;
 };
+
+/**
+ * Return an email to the shared pool after its worker cancelled the form or
+ * lost the connection: unclaim it, show the card to every worker again and
+ * mark the Gmail message unread.
+ *
+ * The release time is stamped before and after the Gmail request so a poll
+ * sweep that started in the meantime (and may have seen the message as read)
+ * does not drop the card.
+ *
+ * @param {Object} email  The stored email.
+ * @param {string} messageId  Gmail message ID.
+ */
+async function releaseEmail(email, messageId) {
+  mailStore.unclaim(messageId);
+  mailStore.touchReleased(messageId);
+  broadcast({ type: "email_released", data: email }, email);
+  try {
+    await mailStore.syncReadState(email.account, messageId);
+  } catch (err) {
+    console.error("Failed to mark released email as unread:", err);
+  } finally {
+    mailStore.touchReleased(messageId);
+  }
+}
 
 async function handleMessage(ws, data) {
   let msg;
@@ -199,7 +301,18 @@ async function handleMessage(ws, data) {
       return;
     }
     const messageId = msg.messageId || null;
-    const email = messageId ? mailStore.get(messageId) : null;
+    let email = messageId ? mailStore.get(messageId) : null;
+    if (!email && messageId && msg.restore === true) {
+      // A worker reconnected with this email's form still open, but the
+      // server no longer holds it (e.g. it restarted, wiping the in-memory
+      // store; the email is read in Gmail, so polling will not bring it back).
+      // Reload it straight from Gmail so the worker can keep working on it.
+      try {
+        email = await restoreEmail(messageId);
+      } catch (err) {
+        console.error("Failed to restore email for reconnecting worker:", err);
+      }
+    }
     if (!email) {
       ws.send(
         JSON.stringify({
@@ -224,10 +337,27 @@ async function handleMessage(ws, data) {
     }
     const ok = mailStore.claim(messageId, ws.username);
     if (ok) {
+      // The claim now belongs to this connection only. This matters after a
+      // reconnect: the server may notice the old, dead connection only later
+      // (heartbeat), and its close handler must not release the email the
+      // worker has just re-claimed here.
+      for (const client of wss.clients) {
+        if (client !== ws && client.claimedEmails) {
+          client.claimedEmails.delete(messageId);
+        }
+      }
       ws.claimedEmails.add(messageId);
       broadcast({ type: "email_claimed", messageId }, email);
     }
     ws.send(JSON.stringify({ type: "claim_email", ok, messageId }));
+    if (ok) {
+      // Opened (or re-opened after a reconnect) by a worker: mark it read.
+      try {
+        await mailStore.syncReadState(email.account, messageId);
+      } catch (err) {
+        console.error("Failed to mark claimed email as read:", err);
+      }
+    }
   } else if (msg.type === "release_email") {
     if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
       return;
@@ -243,7 +373,8 @@ async function handleMessage(ws, data) {
       ws.claimedEmails.delete(messageId);
       if (claimer === ws.username) {
         const email = mailStore.get(messageId);
-        if (email) broadcast({ type: "email_released", data: email }, email);
+        // The worker cancelled (went back to the dashboard).
+        if (email) await releaseEmail(email, messageId);
       }
     }
   } else if (msg.type === "complete_email") {
@@ -259,8 +390,10 @@ async function handleMessage(ws, data) {
     ws.claimedEmails.delete(messageId);
     // Only now mark the Gmail message read (the worker finished the form).
     // Pass the account so the correct inbox's API client is used.
+    // Queued behind any pending "mark unread" (e.g. from a dropped
+    // connection), so the email always ends up read.
     try {
-      await mailStore.markRead(email.account, messageId);
+      await mailStore.syncReadState(email.account, messageId);
     } catch (err) {
       console.error("Failed to mark email as read:", err);
     }
@@ -279,7 +412,7 @@ async function handleMessage(ws, data) {
     mailStore.remove(messageId);
     ws.claimedEmails.delete(messageId);
     try {
-      await mailStore.markRead(email.account, messageId);
+      await mailStore.syncReadState(email.account, messageId);
     } catch (err) {
       console.error("Failed to mark irrelevant email as read:", err);
     }
@@ -296,6 +429,20 @@ async function handleMessage(ws, data) {
  */
 module.exports.notifyUnreadEmail = function notifyUnreadEmail(emailInfo) {
   return broadcast({ type: "new_email", data: emailInfo }, emailInfo);
+};
+
+/**
+ * Tell workers that an email was read in Gmail outside of this app, so its
+ * card must be removed from their dashboards.
+ *
+ * @param {Object} emailInfo  The email that is no longer unread.
+ * @returns {number} Number of clients the notification was delivered to.
+ */
+module.exports.notifyEmailRead = function notifyEmailRead(emailInfo) {
+  return broadcast(
+    { type: "email_read", messageId: emailInfo.messageId },
+    emailInfo
+  );
 };
 
 /**

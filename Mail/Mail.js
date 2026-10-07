@@ -10,6 +10,7 @@ const {
 } = require("./secrets.js");
 const Authorize = require("./Authorize.js");
 const mailStore = require("./mailStore.js");
+const { notifyEmailRead } = require("../Users/websocket.js");
 
 let MailPhotos = [];
 
@@ -17,7 +18,7 @@ function CreateOauthClient(ClientID, ClientSecret, RedirectUri) {
   return new google.auth.OAuth2(ClientID, ClientSecret, RedirectUri);
 }
 
-const POLL_INTERVAL_MS = Number(process.env.MAIL_POLL_INTERVAL_MS) || 120000;
+const POLL_INTERVAL_MS = Number(process.env.MAIL_POLL_INTERVAL_MS) || 45000;
 
 // The up-to-three Gmail inboxes polled by this server. Each maps to a distinct
 // OAuth token set (see Mail/Authorize.js and Mail/secrets.js). Any label whose
@@ -56,7 +57,18 @@ async function listUnreadIds(gmail) {
 
 // Processes all currently unread messages for one account's inbox.
 async function processUnreadMessages(gmail, account) {
+  // Taken before asking Gmail, so emails released (and re-marked unread) while
+  // this sweep is in flight are not mistaken for read ones.
+  const sweepStartedAt = Date.now();
   const unreadIds = await listUnreadIds(gmail);
+
+  // Drop cards whose Gmail message is no longer unread (e.g. someone read it
+  // directly in Gmail). Claimed emails are left alone: a worker has the form
+  // open, and completing/releasing it is handled through the WebSocket flow.
+  // Cancelling (release_email) marks the Gmail message unread again, so a
+  // cancelled email keeps its card.
+  pruneReadEmails(account, new Set(unreadIds), sweepStartedAt);
+
   for (const messageId of unreadIds) {
     // Unread messages stay "unread" in Gmail until a worker completes/ignores
     // them, so every poll returns the whole backlog again. Skip anything we
@@ -68,6 +80,28 @@ async function processUnreadMessages(gmail, account) {
       // One malformed/failed message must never abort the rest of the sweep.
       console.error(
         `Failed to process Gmail message "${messageId}" (${account}):`,
+        err
+      );
+    }
+  }
+}
+
+// Remove every stored, unclaimed email of `account` that is no longer in the
+// inbox's unread set, and tell connected workers to drop its card. Emails a
+// worker cancelled after this sweep started are skipped: they are being marked
+// unread again and the Gmail list may predate that.
+function pruneReadEmails(account, unreadIdSet, sweepStartedAt) {
+  for (const { email, claimed, releasedAt } of mailStore.listByAccount(
+    account
+  )) {
+    if (claimed || unreadIdSet.has(email.messageId)) continue;
+    if (releasedAt >= sweepStartedAt) continue;
+    mailStore.remove(email.messageId);
+    try {
+      notifyEmailRead(email);
+    } catch (err) {
+      console.error(
+        `Failed to broadcast read email "${email.messageId}" (${account}):`,
         err
       );
     }

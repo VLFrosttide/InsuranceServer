@@ -129,11 +129,18 @@ module.exports.getAttachment = async function getAttachment(email, id) {
  * @param {import("googleapis").gmail_v1.Gmail} gmail
  * @param {string} messageId
  * @param {string} account
+ * @param {Object} [options]
+ * @param {boolean} [options.notify=true]  Broadcast the new card to workers.
+ *   Disabled when a reconnecting worker restores an email it still has open
+ *   (it is claimed straight away, so other workers should not see a card).
+ * @returns {Promise<Object|null>} The stored email, or null when it was
+ *   already stored or is not from a known broker.
  */
 module.exports.ProcessEmail = async function ProcessEmail(
   gmail,
   messageId,
-  account
+  account,
+  { notify = true } = {}
 ) {
   // Skip work we already know about (e.g. because the server restarted before
   // a worker completed the form, or because an earlier poll already stored it).
@@ -142,7 +149,7 @@ module.exports.ProcessEmail = async function ProcessEmail(
   // fetching the full message avoids re-downloading the entire backlog (body +
   // attachments) every poll cycle — the main source of slow card updates.
   if (mailStore.has(account, messageId)) {
-    return;
+    return null;
   }
 
   const res = await gmail.users.messages.get({
@@ -176,11 +183,15 @@ module.exports.ProcessEmail = async function ProcessEmail(
   // Only emails from a known broker (database / BrokerInfo.js) are shown to
   // clients. Anything else is ignored: never stored, broadcast, or marked read.
   if (!(await isKnownBrokerSender(emailInfo.from))) {
-    return;
+    return null;
   }
 
   // Store the email so workers can list/claim it after the broadcast.
   mailStore.add(emailInfo);
+  // A restored email (notify: false) is read in Gmail and about to be claimed
+  // by the reconnecting worker. Stamp it in the same synchronous step as add()
+  // so a poll sweep already in flight does not drop it as "read" first.
+  if (!notify) mailStore.touchReleased(messageId);
 
   // Attachments are lazy: only their metadata goes on the card so workers see
   // names/sizes without the server downloading the bytes. The bytes are fetched
@@ -223,5 +234,6 @@ module.exports.ProcessEmail = async function ProcessEmail(
 
   // Broadcast the card (body + attachment metadata). Attachment bytes are not
   // included; the client fetches them lazily via get_attachment when opened.
-  notifyUnreadEmail(emailInfo);
+  if (notify) notifyUnreadEmail(emailInfo);
+  return emailInfo;
 };

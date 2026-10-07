@@ -3,9 +3,11 @@
 // In-memory store of currently unhandled (unread) emails.
 //
 // - ProcessEmail adds an email here before broadcasting it to workers.
-// - The Gmail message is NOT marked read until a worker actually finishes the
-//   insurance form (complete), so a server restart naturally re-surfaces any
-//   still-unhandled emails on the next poll.
+// - The Gmail read state follows the card (see syncReadState): unread while it
+//   waits on the dashboard, read while a worker has it open (claimed) and once
+//   it is completed/dismissed. Cancelling or a dropped connection marks it
+//   unread again, so a server restart re-surfaces still-unhandled emails on the
+//   next poll. A worker who reconnects with the form open claims it again.
 // - While an email is "claimed" by a worker it is excluded from listAll() so
 //   other workers do not re-render a card for it.
 //
@@ -15,6 +17,15 @@
 const activeEmails = new Map(); // account\u0000messageId -> emailInfo
 const claimedBy = new Map(); // account\u0000messageId -> username
 const gmailByAccount = new Map(); // account label -> Gmail API client
+// account\u0000messageId -> timestamp (ms) of the last time a worker cancelled
+// (released) the email. The poller uses it to avoid dropping a just-released
+// email whose "mark unread" had not reached Gmail yet when the sweep began.
+const releasedAt = new Map();
+// Keys of emails removed from the store (completed, dismissed or read in
+// Gmail). A reconnecting worker must not bring such an email back by
+// re-claiming it. Insertion-ordered and capped so it cannot grow forever.
+const handled = new Set();
+const HANDLED_LIMIT = 5000;
 
 const KEY_SEP = "\u0000";
 
@@ -69,6 +80,22 @@ module.exports.listAll = function listAll() {
   return out;
 };
 
+// Every stored email of one inbox (claimed or not), each paired with whether
+// it is currently claimed by a worker. Used by the poller to drop emails that
+// were read in Gmail outside of this app.
+module.exports.listByAccount = function listByAccount(account) {
+  const out = [];
+  for (const [k, email] of activeEmails) {
+    if ((email.account || "") !== (account || "")) continue;
+    out.push({
+      email,
+      claimed: claimedBy.has(k),
+      releasedAt: releasedAt.get(k) || 0,
+    });
+  }
+  return out;
+};
+
 module.exports.claim = function claim(messageId, username) {
   const email = findByMessageId(messageId);
   if (!email) return false;
@@ -86,6 +113,15 @@ module.exports.unclaim = function unclaim(messageId) {
   claimedBy.delete(key(email.account, email.messageId));
 };
 
+// Record "now" as the latest release time of an email. Called when a worker
+// cancels the email and again once Gmail confirmed it is unread, so any poll
+// sweep that started before either moment will not drop the card.
+module.exports.touchReleased = function touchReleased(messageId) {
+  const email = findByMessageId(messageId);
+  if (!email) return;
+  releasedAt.set(key(email.account, email.messageId), Date.now());
+};
+
 module.exports.getClaimer = function getClaimer(messageId) {
   const email = findByMessageId(messageId);
   if (!email) return null;
@@ -98,6 +134,20 @@ module.exports.remove = function remove(messageId) {
   const k = key(email.account, email.messageId);
   activeEmails.delete(k);
   claimedBy.delete(k);
+  releasedAt.delete(k);
+  handled.add(k);
+  if (handled.size > HANDLED_LIMIT) {
+    handled.delete(handled.values().next().value);
+  }
+};
+
+// Whether an email with this Gmail message ID was removed from the store
+// during this server run (see `handled` above).
+module.exports.wasHandled = function wasHandled(messageId) {
+  for (const k of handled) {
+    if (k.slice(k.indexOf(KEY_SEP) + 1) === messageId) return true;
+  }
+  return false;
 };
 
 module.exports.markRead = async function markRead(account, messageId) {
@@ -107,5 +157,56 @@ module.exports.markRead = async function markRead(account, messageId) {
     userId: "me",
     id: messageId,
     requestBody: { removeLabelIds: ["UNREAD"] },
+  });
+};
+
+// account\u0000messageId -> tail of the queue of pending Gmail label changes.
+const readStateQueues = new Map();
+
+/**
+ * Bring the Gmail read state of one message in line with the store:
+ * - stored and not claimed (a card waiting on the dashboard) -> UNREAD
+ * - claimed by a worker (form open) or no longer stored (completed/dismissed)
+ *   -> READ
+ *
+ * Calls for the same message run one after another, and each one checks the
+ * state when it actually runs (not when it was queued). So the label always
+ * ends up matching the latest state, even when release/claim/complete happen
+ * in quick succession (e.g. a dropped connection followed by a reconnect).
+ *
+ * @returns {Promise<void>} Rejects if the Gmail request fails.
+ */
+module.exports.syncReadState = function syncReadState(account, messageId) {
+  const k = key(account, messageId);
+  const previous = readStateQueues.get(k) || Promise.resolve();
+  const next = previous
+    .catch(() => {
+      // An earlier failure was already reported to its own caller.
+    })
+    .then(async () => {
+      const waiting = activeEmails.has(k) && !claimedBy.has(k);
+      if (waiting) await module.exports.markUnread(account, messageId);
+      else await module.exports.markRead(account, messageId);
+    });
+  readStateQueues.set(k, next);
+  next
+    .finally(() => {
+      if (readStateQueues.get(k) === next) readStateQueues.delete(k);
+    })
+    .catch(() => {
+      // Handled by the caller awaiting `next`.
+    });
+  return next;
+};
+
+// Put the UNREAD label back on a Gmail message (e.g. a worker opened the email
+// in the app or in Gmail and then cancelled without completing the form).
+module.exports.markUnread = async function markUnread(account, messageId) {
+  const gmail = gmailByAccount.get(account);
+  if (!gmail) return;
+  await gmail.users.messages.modify({
+    userId: "me",
+    id: messageId,
+    requestBody: { addLabelIds: ["UNREAD"] },
   });
 };
