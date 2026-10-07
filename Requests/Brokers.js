@@ -177,6 +177,40 @@ const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
   });
 
 /**
+ * Re-sync a broker's balance after the price of a policy linked to it is
+ * corrected: applies the difference between the new and the old price to
+ * CashBalance WITHOUT touching InactivePolicies (the policy is still active,
+ * only its price changed). A positive delta charges the broker more, a negative
+ * one refunds part of the fee. Runs inside the caller's transaction.
+ *
+ * This matters because an insurance created from a broker's email is funded
+ * entirely by the broker's balance - it never touches current cash - so that
+ * balance is the only record of the payment and has to follow price corrections.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @param {number|string} delta  newPrice - oldPrice (may be negative or 0).
+ * @returns {Promise<number|null>} The delta applied, or null if broker missing.
+ */
+const adjustBrokerForPriceChange = (module.exports.adjustBrokerForPriceChange =
+  async function adjustBrokerForPriceChange(conn, brokerId, delta) {
+    const d = toDecimal(delta) || 0;
+    if (d === 0) return 0;
+
+    const [[broker]] = await conn.query("SELECT id FROM brokers WHERE id = ?", [
+      brokerId,
+    ]);
+    if (!broker) return null;
+
+    await conn.query(
+      "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
+      [d, brokerId]
+    );
+
+    return d;
+  });
+
+/**
  * Create the broker router.
 
  *

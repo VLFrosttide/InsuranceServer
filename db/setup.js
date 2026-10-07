@@ -206,7 +206,16 @@ async function runSetup(config = {}) {
     "UPDATE insurance SET PaymentType = 'Cash' WHERE PaymentType IN ('true', '1', 'yes')"
   );
   await db.query(
-    "UPDATE insurance SET PaymentType = 'Card' WHERE PaymentType NOT IN ('Cash', 'Card')"
+    "UPDATE insurance SET PaymentType = 'Card' WHERE PaymentType NOT IN ('Cash', 'Card', 'Broker')"
+  );
+
+  // Email policies are paid ONLY from the broker's balance and carry the
+  // "Broker" payment type. Before that type existed they were stored as "Cash"
+  // (while already being funded by the broker balance), so relabel them. This
+  // moves no money: those rows were never in current cash. Legacy email rows
+  // stored as "Card" are left alone - their price really is in CardBalance.
+  await db.query(
+    "UPDATE insurance SET PaymentType = 'Broker' WHERE BrokerId IS NOT NULL AND PaymentType = 'Cash'"
   );
 
   // Optional surcharges chosen on the add-insurance form. Their amounts
@@ -453,6 +462,94 @@ async function runSetup(config = {}) {
       KEY idx_card_resets_username (Username)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
+
+  // 4a2) Total cash - the second record of cash flow.
+  //
+  // Total cash is a strict superset of current cash: it counts every type of
+  // payment (cash money, card payments and broker-balance payments). It is not
+  // stored as an independent running total; `total_cash` stores only the two
+  // parts that `current_cash` does not already carry, and the total is computed
+  // on every read as
+  //
+  //     TotalCash(branch, currency) = current_cash.CurrentCash
+  //                                 + total_cash.CardPart
+  //                                 + total_cash.BrokerPart
+  //
+  // Reading the cash part live from `current_cash` is what makes the identity
+  // structural: resetting current cash - or clearing the card balance, which
+  // zeroes every CardPart - drags Total cash down automatically.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS total_cash (
+      id INT NOT NULL,
+      Branch VARCHAR(45) NOT NULL DEFAULT '',
+      Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
+      CardPart DECIMAL(15,2) NOT NULL DEFAULT 0,
+      BrokerPart DECIMAL(15,2) NOT NULL DEFAULT 0,
+      UpdatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id, Branch, Currency),
+      KEY idx_total_cash_branch (Branch)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  `);
+
+  // Ledger of every movement counted in Total cash, tagged with the channel
+  // (Source = Cash | Card | Broker) it came through.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS total_cash_transactions (
+      id INT NOT NULL AUTO_INCREMENT,
+      Branch VARCHAR(45) NOT NULL DEFAULT '',
+      Type VARCHAR(20) NOT NULL,
+      Amount DECIMAL(15,2) NOT NULL,
+      Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
+      Source VARCHAR(10) NOT NULL,
+      Username VARCHAR(45) NOT NULL,
+      Reason VARCHAR(255) NOT NULL,
+      CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_total_cash_transactions_branch (Branch),
+      KEY idx_total_cash_transactions_source (Source),
+      KEY idx_total_cash_transactions_username (Username)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  `);
+
+  // One-time backfill of the two parts from the policies that already exist, so
+  // the superset identity holds for historical data too and not only for
+  // payments made after this migration. A non-annulled policy contributed its
+  // full price; an annulled one contributed its price and was then refunded
+  // (price - fee), so its net contribution is the annul fee.
+  //
+  // Guarded on an empty `total_cash` so it never overwrites live parts: once the
+  // tables are in use, a card reset may legitimately have zeroed CardPart while
+  // the policies behind it still exist, and recomputing would resurrect it.
+  const [totalCashRows] = await db.query(
+    "SELECT COUNT(*) AS n FROM total_cash"
+  );
+  if (Number(totalCashRows[0].n) === 0) {
+    await db.query(`
+      INSERT INTO total_cash (id, Branch, Currency, CardPart, BrokerPart)
+      SELECT 1, Branch, CurrencyType,
+             ROUND(SUM(CASE WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2))
+                            ELSE COALESCE(AnnulFee, 0) END), 2),
+             0
+        FROM insurance
+       WHERE PaymentType = 'Card' AND Deleted = 0
+       GROUP BY Branch, CurrencyType
+      ON DUPLICATE KEY UPDATE CardPart = VALUES(CardPart)
+    `);
+
+    // Policies whose sender matched a broker were funded by that broker's
+    // balance (email cash payments), so they belong to the Broker part.
+    await db.query(`
+      INSERT INTO total_cash (id, Branch, Currency, CardPart, BrokerPart)
+      SELECT 1, Branch, CurrencyType, 0,
+             ROUND(SUM(CASE WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2))
+                            ELSE COALESCE(AnnulFee, 0) END), 2)
+        FROM insurance
+       WHERE BrokerId IS NOT NULL AND PaymentType IN ('Cash', 'Broker') AND Deleted = 0
+       GROUP BY Branch, CurrencyType
+      ON DUPLICATE KEY UPDATE BrokerPart = VALUES(BrokerPart)
+    `);
+    console.log("Backfilled total_cash parts from existing insurances");
+  }
 
   // 4b) Create brokers + broker_emails tables.
   await db.query(`

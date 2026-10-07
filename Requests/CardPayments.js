@@ -9,7 +9,7 @@
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
-const { toDecimal } = require("./CurrentCash.js");
+const { toDecimal, zeroAllCardParts } = require("./CurrentCash.js");
 
 // CardBalance is a single-row table keyed by this id.
 const CARD_ROW_ID = 1;
@@ -139,6 +139,13 @@ const resetCardBalance = (module.exports.resetCardBalance =
       "INSERT INTO card_resets (Username, KeptAmount) VALUES (?, ?)",
       [username, kept]
     );
+
+    // Total cash counts card payments as one of its three payment types, stored
+    // per branch/currency in `total_cash.CardPart`. Clearing the card balance
+    // must therefore drag Total cash down by the same amount, otherwise the
+    // superset identity (TotalCash = CurrentCash + CardPart + BrokerPart) would
+    // silently keep the cleared card money in the total.
+    await zeroAllCardParts(conn, username);
 
     return kept;
   });
