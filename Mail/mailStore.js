@@ -47,6 +47,46 @@ module.exports.setGmail = function setGmail(account, client) {
   gmailByAccount.set(account, client);
 };
 
+// Startup readiness of the Gmail integration. The HTTP server starts listening
+// before the inboxes are authorized (DB setup + OAuth refresh take a moment),
+// so a request arriving right after a restart (e.g. a worker submitting a form
+// that triggers a reply) must wait for the inboxes instead of failing with
+// "no Gmail inbox is connected". Resolved once every configured inbox was
+// authorized (or skipped), or when Gmail is disabled/unavailable.
+let gmailReady = false;
+let resolveGmailReady;
+const gmailReadyPromise = new Promise((resolve) => {
+  resolveGmailReady = resolve;
+});
+
+module.exports.markGmailReady = function markGmailReady() {
+  if (gmailReady) return;
+  gmailReady = true;
+  resolveGmailReady();
+};
+
+module.exports.isGmailReady = function isGmailReady() {
+  return gmailReady;
+};
+
+/**
+ * Wait until the Gmail integration finished starting up.
+ *
+ * @param {number} timeoutMs  Maximum time to wait.
+ * @returns {Promise<boolean>} true when ready, false when the wait timed out.
+ */
+module.exports.waitForGmail = function waitForGmail(timeoutMs) {
+  if (gmailReady) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs));
+    if (typeof timer.unref === "function") timer.unref();
+    gmailReadyPromise.then(() => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+};
+
 module.exports.getGmail = function getGmail(account) {
   return gmailByAccount.get(account) || null;
 };

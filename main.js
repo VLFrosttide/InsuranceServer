@@ -100,6 +100,7 @@ function startGmailPolling() {
   // Set DISABLE_GMAIL=1 to skip it entirely (e.g. automated tests).
   if (process.env.DISABLE_GMAIL === "1") {
     console.log("Gmail integration disabled via DISABLE_GMAIL=1.");
+    require("./Mail/mailStore.js").markGmailReady();
     return;
   }
 
@@ -111,6 +112,11 @@ function startGmailPolling() {
         `Gmail integration disabled: ${err.message || err}. ` +
           "The API and WebSocket server will still run."
       );
+    })
+    .finally(() => {
+      // Never leave reply requests waiting on an integration that is not
+      // coming up (init normally marks readiness itself).
+      require("./Mail/mailStore.js").markGmailReady();
     });
 }
 
@@ -289,6 +295,10 @@ async function start() {
         "up in a degraded state so /health can be reached; routes remain " +
         "registered and return a real error instead of a JSON 404."
     );
+
+    // Gmail polling is not started without a database; release any reply
+    // request waiting for it so it fails fast with a clear error.
+    require("./Mail/mailStore.js").markGmailReady();
 
     console.log(`Server listening on http://${HOST}:${PORT} (degraded)`);
   }

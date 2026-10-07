@@ -186,16 +186,38 @@ async function init() {
     console.log(
       "No Gmail accounts configured (CLIENT_ID/CLIENT_SECRET missing). Skipping Gmail polling."
     );
+    mailStore.markGmailReady();
     return;
   }
 
-  for (const account of accounts) {
+  // Phase 1: authorize and register EVERY inbox before any (potentially slow)
+  // initial sweep runs, so replies can be sent as soon as possible after a
+  // restart. Waiting requests (see SendReply.js) are released once this ends.
+  const ready = [];
+  try {
+    for (const account of accounts) {
+      try {
+        ready.push({ account, gmail: await registerAccount(account) });
+      } catch (err) {
+        // One misconfigured inbox should never take down the others.
+        console.warn(
+          `Skipping Gmail account "${account}": ${
+            err && err.message ? err.message : err
+          }`
+        );
+      }
+    }
+  } finally {
+    mailStore.markGmailReady();
+  }
+
+  // Phase 2: initial sweep + continuous polling per registered inbox.
+  for (const { account, gmail } of ready) {
     try {
-      await initAccount(account);
+      await startPolling(gmail, account);
     } catch (err) {
-      // One misconfigured inbox should never take down the others.
       console.warn(
-        `Skipping Gmail account "${account}": ${
+        `Initial Gmail sweep failed for "${account}": ${
           err && err.message ? err.message : err
         }`
       );
@@ -203,16 +225,27 @@ async function init() {
   }
 }
 
-async function initAccount(account) {
+async function registerAccount(account) {
   const { gmail, email } = await authorizeAccount(account);
   console.log(`Profile log (${account}): `, email);
 
   // Register this inbox's client so completion can mark the message read
-  // against the correct account.
+  // and replies can be sent against the correct account.
   mailStore.setGmail(account, gmail);
+  return gmail;
+}
 
+async function startPolling(gmail, account) {
   // Initial sweep for anything that arrived while the server was offline.
-  await processUnreadMessages(gmail, account);
+  // A failure here must not prevent the interval below from being set up.
+  try {
+    await processUnreadMessages(gmail, account);
+  } catch (err) {
+    console.error(
+      `Error during initial Gmail sweep (${account}) for unread messages:`,
+      err
+    );
+  }
 
   // Continuously poll this inbox so newly arriving unread emails are picked
   // up and broadcast to connected Electron clients.

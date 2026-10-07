@@ -167,18 +167,38 @@ async function resolveOriginalEmail(messageId) {
   return fetchOriginalFromGmail(messageId);
 }
 
+// How long a reply waits for the Gmail inboxes to finish authorizing right
+// after a server (re)start before giving up.
+const GMAIL_READY_TIMEOUT_MS =
+  Number(process.env.MAIL_READY_TIMEOUT_MS) || 20000;
+
 module.exports.sendReply = async function sendReply(
   messageId,
   attachments = [],
   bodyText = ""
 ) {
+  // The HTTP server accepts requests before the Gmail inboxes are authorized.
+  // A reply arriving in that window (e.g. right after a restart) waits for the
+  // integration instead of failing with "no Gmail inbox is connected".
+  if (!mailStore.get(messageId) && !mailStore.isGmailReady()) {
+    await mailStore.waitForGmail(GMAIL_READY_TIMEOUT_MS);
+  }
+
   const email = await resolveOriginalEmail(messageId);
   if (!email) {
     const registered = mailStore.listGmail().length;
+    let reason;
+    if (registered > 0) {
+      reason = "in the mail store or any connected Gmail inbox";
+    } else if (!mailStore.isGmailReady()) {
+      reason = "the Gmail integration is still starting up, try again shortly";
+    } else {
+      reason = "no Gmail inbox is connected on the server";
+    }
     throw new Error(
-      registered === 0
-        ? `Original email not found (${messageId}): no Gmail inbox is connected on the server`
-        : `Original email not found (${messageId}) in the mail store or any connected Gmail inbox`
+      registered > 0
+        ? `Original email not found (${messageId}) ${reason}`
+        : `Original email not found (${messageId}): ${reason}`
     );
   }
 
