@@ -108,14 +108,78 @@ function buildReplyMime(email, attachments = [], bodyText = "") {
  * @param {string} bodyText    Optional body text for the reply.
  * @returns {Promise<Object>}  The Gmail send response (or null when skipped).
  */
+function headerValue(headers, name) {
+  const h = (headers || []).find(
+    (x) => x && x.name && x.name.toLowerCase() === name.toLowerCase()
+  );
+  return h ? h.value : "";
+}
+
+function isNotFoundError(err) {
+  const status = err && (err.code || err.status || err.response?.status);
+  return Number(status) === 404 || Number(status) === 400;
+}
+
+// Fetch just the headers needed for a reply straight from Gmail. Each
+// registered inbox is tried in turn because the message ID alone does not tell
+// which inbox it belongs to.
+async function fetchOriginalFromGmail(messageId) {
+  for (const [account, gmail] of mailStore.listGmail()) {
+    if (!gmail) continue;
+    try {
+      const res = await gmail.users.messages.get({
+        userId: "me",
+        id: messageId,
+        format: "metadata",
+        metadataHeaders: ["From", "Subject", "Message-ID"],
+      });
+      const msg = res.data || {};
+      const headers = msg.payload?.headers || [];
+      return {
+        account,
+        messageId,
+        threadId: msg.threadId || "",
+        messageIdHeader: headerValue(headers, "Message-ID"),
+        from: headerValue(headers, "From"),
+        subject: headerValue(headers, "Subject"),
+      };
+    } catch (err) {
+      // Not in this inbox: try the next one. Any other failure is real.
+      if (isNotFoundError(err)) continue;
+      throw err;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the original email for a reply. The in-memory mailStore is checked
+ * first; when the email is not there (server restart, a different server
+ * process, or the card was already completed/dismissed) the headers are
+ * fetched directly from Gmail so the reply can still be sent.
+ *
+ * @param {string} messageId  Gmail message ID of the original email.
+ * @returns {Promise<Object|null>}
+ */
+async function resolveOriginalEmail(messageId) {
+  const cached = mailStore.get(messageId);
+  if (cached) return cached;
+  return fetchOriginalFromGmail(messageId);
+}
+
 module.exports.sendReply = async function sendReply(
   messageId,
   attachments = [],
   bodyText = ""
 ) {
-  const email = mailStore.get(messageId);
+  const email = await resolveOriginalEmail(messageId);
   if (!email) {
-    throw new Error("Original email not found");
+    const registered = mailStore.listGmail().length;
+    throw new Error(
+      registered === 0
+        ? `Original email not found (${messageId}): no Gmail inbox is connected on the server`
+        : `Original email not found (${messageId}) in the mail store or any connected Gmail inbox`
+    );
   }
 
   const gmail = mailStore.getGmail(email.account);

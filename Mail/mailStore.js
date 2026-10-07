@@ -40,6 +40,13 @@ module.exports.getGmail = function getGmail(account) {
   return gmailByAccount.get(account) || null;
 };
 
+// Every registered inbox as [account, client] pairs. Used to look a message up
+// directly in Gmail when it is no longer (or not yet) held in memory, e.g.
+// after a server restart wiped this in-memory store.
+module.exports.listGmail = function listGmail() {
+  return Array.from(gmailByAccount.entries());
+};
+
 module.exports.has = function has(account, messageId) {
   return activeEmails.has(key(account, messageId));
 };
