@@ -195,9 +195,9 @@ module.exports.ProcessEmail = async function ProcessEmail(
 
   // Attachments are lazy: only their metadata goes on the card so workers see
   // names/sizes without the server downloading the bytes. The bytes are fetched
-  // on demand via getAttachment() once the card is opened. Graphics embedded
-  // in the email body (signature logos, icons) are not attachments and are
-  // left out, so workers only see the documents the broker actually attached.
+  // on demand via getAttachment() once the card is opened. Every file part of
+  // the email is listed (PDFs, documents, images and body graphics alike) so
+  // no attachment is ever hidden from workers.
   const usedNames = new Set();
   for (const meta of walkParts.selectAttachments(bag)) {
     const filename = uniqueFileName(meta.filename, usedNames);

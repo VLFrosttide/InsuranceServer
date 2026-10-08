@@ -60,63 +60,24 @@ function decodeBase64Url(data) {
   return Buffer.from(normalized, "base64");
 }
 
-// Embedded images at least this large are treated as a real (photographed)
-// attachment when the email carries no regular attachment at all - e.g. iOS
-// Mail places photos inside the body as cid: images. Signature logos and icons
-// are far smaller than this.
-const BODY_IMAGE_FALLBACK_MIN_SIZE = 100 * 1024;
-
-const IMAGE_EXT_RE = /\.(png|jpe?g|gif|bmp|webp|svg|ico|tiff?|heic|heif|emz|wmz)$/i;
-
-// Only images can be body graphics (signature logos, icons, letterheads).
-// Gmail sometimes reports images as application/octet-stream, so the file
-// extension is checked as well.
-function isImagePart(att) {
-  return (
-    String(att.mimeType || "").toLowerCase().startsWith("image/") ||
-    IMAGE_EXT_RE.test(String(att.filename || ""))
-  );
-}
-
 /**
  * Pick the parts that should be shown to workers as attachments.
  *
- * Gmail reports body graphics (signature logos, social icons, letterheads -
- * anything rendered inside the HTML via <img src="cid:...">) as parts with a
- * filename/attachmentId, exactly like real attachments. Those graphics are
- * part of the email body, not the document the broker sent, so they are
- * removed here. A part counts as a body graphic when it is an image AND its
- * Content-ID is referenced from the HTML body. (Content-Disposition is
- * deliberately not trusted: Outlook adds Content-IDs to real attachments and
- * Apple Mail marks real attachments "inline".) Non-image parts such as PDFs
- * are always kept: Apple/iOS Mail and Outlook reference inline-displayed PDFs
- * from the HTML via cid: too, yet they are the document the broker sent.
+ * EVERY file part of the email is shown - images, PDFs, documents, and also
+ * graphics embedded in the HTML body (<img src="cid:...">, e.g. signature
+ * logos). Earlier versions tried to hide body graphics by matching
+ * Content-IDs against the HTML, but mail clients (Apple/iOS Mail, Outlook)
+ * reference real documents such as PDFs from the body as well, so genuine
+ * attachments went missing. Showing a few extra logos is far better than
+ * hiding the broker's document.
  *
- * @param {{ htmlParts: string[], attachmentParts: Object[] }} bag
- * @returns {Object[]} The attachment parts to expose.
+ * @param {{ attachmentParts: Object[] }} bag
+ * @returns {Object[]} The attachment parts to expose (all of them).
  */
 function selectAttachments(bag) {
-  const html = (bag.htmlParts || []).join("\n");
-  const referenced = new Set();
-  const cidRe = /cid:([^"'\s>)]+)/gi;
-  let m;
-  while ((m = cidRe.exec(html))) referenced.add(normalizeCid(m[1]));
-
-  const attachments = [];
-  const bodyGraphics = [];
-  for (const att of bag.attachmentParts || []) {
-    if (att.contentId && referenced.has(att.contentId) && isImagePart(att))
-      bodyGraphics.push(att);
-    else attachments.push(att);
-  }
-
-  if (attachments.length) return attachments;
-  return bodyGraphics.filter(
-    (att) => (att.size || 0) >= BODY_IMAGE_FALLBACK_MIN_SIZE
-  );
+  return (bag.attachmentParts || []).slice();
 }
 
 walkParts.selectAttachments = selectAttachments;
-walkParts.BODY_IMAGE_FALLBACK_MIN_SIZE = BODY_IMAGE_FALLBACK_MIN_SIZE;
 
 module.exports = walkParts;
