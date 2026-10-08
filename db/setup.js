@@ -218,6 +218,24 @@ async function runSetup(config = {}) {
     "UPDATE insurance SET PaymentType = 'Broker' WHERE BrokerId IS NOT NULL AND PaymentType = 'Cash'"
   );
 
+  // Walk-in policies (no BrokerId - not created from a broker's email) record
+  // the branch that issued them as their broker. Older walk-ins were stored
+  // with an empty Broker, so fill it in from their Branch. BrokerId stays NULL,
+  // so this moves no money and does not make them broker-paid.
+  const [walkInBackfill] = await db.query(
+    `UPDATE insurance
+        SET Broker = Branch
+      WHERE BrokerId IS NULL
+        AND (Broker IS NULL OR Broker = '')
+        AND Branch IS NOT NULL
+        AND Branch <> ''`
+  );
+  if (walkInBackfill && walkInBackfill.affectedRows) {
+    console.log(
+      `Recorded the branch as the broker of ${walkInBackfill.affectedRows} walk-in insurance(s)`
+    );
+  }
+
   // Optional surcharges chosen on the add-insurance form. Their amounts
   // (+5 for NonTurk, +2 for CardFee) are already included in Price; these
   // flags record which ones were applied.

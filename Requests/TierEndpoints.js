@@ -556,7 +556,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
       }
       const brokerId = broker ? broker.id : null;
-      const brokerName = broker ? broker.name : "";
+      // Walk-ins have no broker of their own, so the branch that issued them is
+      // recorded as their broker (insurance.Broker). BrokerId stays NULL: it is
+      // what marks a policy as paid from a real broker's balance, and walk-ins
+      // are always paid in cash or by card.
+      const brokerName = broker ? broker.name : String(branch);
 
       const priceDecimal = toDecimal(price);
 
@@ -904,6 +908,24 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         if (!cardFeeHandled && finalPayment !== "Card" && insurance.CardFee) {
           sets.push("CardFee = ?");
           params.push(0);
+        }
+
+        // A walk-in's broker is the branch that issued it, so moving it to
+        // another branch moves its recorded broker along. Email policies keep
+        // the real broker they were created for, and so do legacy walk-ins whose
+        // broker was typed by hand (i.e. is neither empty nor the old branch).
+        const editedBranch = b.Branch ?? b.branch;
+        const storedBroker = String(insurance.Broker ?? "");
+        if (
+          !isEmailPolicy &&
+          editedBranch !== undefined &&
+          editedBranch !== null &&
+          (storedBroker === "" ||
+            storedBroker === String(insurance.Branch ?? "")) &&
+          String(editedBranch) !== storedBroker
+        ) {
+          sets.push("Broker = ?");
+          params.push(String(editedBranch));
         }
 
         // Duration is stored as integer days, so parse it the same way the
