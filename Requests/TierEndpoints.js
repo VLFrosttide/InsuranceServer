@@ -537,11 +537,16 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       let attachments = b.Attachments ?? b.attachments ?? [];
       if (!Array.isArray(attachments)) attachments = [];
 
-      if (!blancNumber) {
+      // Blank, car and policy number are required for every policy (walk-ins
+      // and email cards alike). Whitespace alone does not count.
+      if (!String(blancNumber).trim()) {
         return res.status(400).json({ error: "BlancNumber is required" });
       }
       if (!String(carNumber).trim()) {
         return res.status(400).json({ error: "CarNumber is required" });
+      }
+      if (!String(policyNumber).trim()) {
+        return res.status(400).json({ error: "PolicyNumber is required" });
       }
 
       // An email policy is paid from its broker's balance, so the sender must
@@ -936,6 +941,48 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           params.push(duration);
         }
 
+        // Car number is required on creation, so an empty value is rejected
+        // here too instead of silently wiping the stored one.
+        const carNumberValue = b.CarNumber ?? b.carNumber;
+        if (carNumberValue !== undefined && carNumberValue !== null) {
+          const carNumber = String(carNumberValue).trim();
+          if (!carNumber) {
+            return res.status(400).json({ error: "CarNumber is required" });
+          }
+          sets.push("CarNumber = ?");
+          params.push(carNumber);
+        }
+
+        // The blank number is the policy's key (and the URL parameter), so it
+        // can only be changed to a number no other policy uses yet. The row is
+        // still located by its CURRENT number in the WHERE clause below.
+        let newBlancNumber = String(insurance.BlancNumber ?? blancNumber);
+        const blancValue = b.BlancNumber ?? b.blancNumber;
+        if (blancValue !== undefined && blancValue !== null) {
+          const requestedBlanc = String(blancValue).trim();
+          if (!requestedBlanc) {
+            return res.status(400).json({ error: "BlancNumber is required" });
+          }
+          if (requestedBlanc !== newBlancNumber) {
+            const [clash] = await DBConnection.query(
+              "SELECT BlancNumber FROM insurance WHERE BlancNumber = ?",
+              [requestedBlanc]
+            );
+            if (
+              clash.some(
+                (r) => String(r.BlancNumber) !== String(insurance.BlancNumber)
+              )
+            ) {
+              return res
+                .status(409)
+                .json({ error: "Insurance with this BlancNumber already exists" });
+            }
+            sets.push("BlancNumber = ?");
+            params.push(requestedBlanc);
+            newBlancNumber = requestedBlanc;
+          }
+        }
+
         if (sets.length === 0) {
           return res.status(400).json({ error: "Nothing to update" });
         }
@@ -1013,7 +1060,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                 branch: newBranch,
                 username: req.user.username,
                 amount: newPrice,
-                reason: blancNumber,
+                reason: newBlancNumber,
                 currency: newCurrency,
               });
             }
@@ -1037,12 +1084,20 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           );
         });
 
+        // Re-read under the (possibly changed) blank number.
         const [rows] = await DBConnection.query(
           "SELECT * FROM insurance WHERE BlancNumber = ?",
-          [blancNumber]
+          [newBlancNumber]
         );
         res.json({ message: "Insurance updated", insurance: rows[0] });
       } catch (err) {
+        // Another policy took the new blank number between the check and the
+        // UPDATE.
+        if (err?.code === "ER_DUP_ENTRY") {
+          return res
+            .status(409)
+            .json({ error: "Insurance with this BlancNumber already exists" });
+        }
         // The cash drawer cannot fund the reversal of the old price (the money
         // was already paid out or reset). The transaction was rolled back, so
         // neither the policy nor the balances changed - report it the same way
