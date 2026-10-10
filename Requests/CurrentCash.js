@@ -31,9 +31,9 @@
 //                                 + total_cash.BrokerPart
 //
 // Reading the cash part live from `current_cash` is what makes the superset
-// identity structural: resetting current cash - or clearing the card balance,
-// which zeroes every CardPart - automatically drags Total cash down with it, so
-// the two records can never diverge.
+// identity structural: resetting a branch - which zeroes its current cash and
+// its card balance (and so its CardPart) - automatically drags that branch's
+// Total cash down with it, so the two records can never diverge.
 //
 // `total_cash_transactions` is the Total cash ledger: one row per movement,
 // tagged with the channel it came through (Source = Cash | Card | Broker).
@@ -520,7 +520,7 @@ const logTotalCash = (module.exports.logTotalCash =
 /**
  * Record a payment that arrives through the Card or the Broker channel.
  *
- * Card: the money is held in `CardBalance` (a single global balance), so
+ * Card: the money is held in the branch's row of `branch_card_balance`, and
  * CardPart keeps the per-branch/per-currency share of it that Total cash adds
  * on top of current cash.
  *
@@ -627,6 +627,125 @@ const zeroAllCardParts = (module.exports.zeroAllCardParts =
     return removed;
   });
 
+// ---------------------------------------------------------------------------
+// Card balance, per branch.
+//
+// Card payments used to be held in one global `CardBalance` row, so resetting
+// a branch could never clear "its" card money. They are now held per branch in
+// `branch_card_balance` (one row per branch), and resetting a branch's current
+// cash also clears that branch's card balance. The per-branch/per-currency
+// CardPart in `total_cash` keeps mirroring it, so Total cash stays consistent.
+// The legacy `CardBalance` table is no longer read or written.
+// ---------------------------------------------------------------------------
+
+/**
+ * Ensure the card balance row exists for a branch.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ */
+const ensureBranchCardRow = (module.exports.ensureBranchCardRow =
+  async function ensureBranchCardRow(conn, branch) {
+    await conn.query(
+      "INSERT IGNORE INTO branch_card_balance (Branch, CardBalance) VALUES (?, 0)",
+      [normalizeBranch(branch)]
+    );
+  });
+
+/**
+ * Read one branch's card balance.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ * @returns {Promise<number>}
+ */
+const getBranchCardBalance = (module.exports.getBranchCardBalance =
+  async function getBranchCardBalance(conn, branch) {
+    const [rows] = await conn.query(
+      "SELECT CardBalance FROM branch_card_balance WHERE Branch = ?",
+      [normalizeBranch(branch)]
+    );
+    return rows.length ? Number(rows[0].CardBalance) : 0;
+  });
+
+/**
+ * Add to / subtract from one branch's card balance. Like the old global card
+ * balance it may go negative (refunds are never blocked).
+ *
+ * NOTE: runs inside the caller's transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ * @param {"increase"|"reduce"} type
+ * @param {number} amount  Positive, already validated.
+ */
+const adjustBranchCardBalance = (module.exports.adjustBranchCardBalance =
+  async function adjustBranchCardBalance(conn, branch, type, amount) {
+    if (type !== "increase" && type !== "reduce") {
+      throw new Error("type must be 'increase' or 'reduce'");
+    }
+    const b = normalizeBranch(branch);
+    await ensureBranchCardRow(conn, b);
+    await conn.query(
+      "UPDATE branch_card_balance SET CardBalance = CardBalance + ? WHERE Branch = ?",
+      [type === "increase" ? amount : -amount, b]
+    );
+  });
+
+/**
+ * Zero one branch's card balance: records the kept amount in `card_resets`
+ * and zeroes the branch's CardPart in `total_cash` (logging it in the Total
+ * cash ledger), so Total cash falls by the same amount.
+ *
+ * NOTE: runs inside the caller's transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ * @param {string} username
+ * @returns {Promise<number>} The card balance kept (just before zeroing).
+ */
+const resetBranchCard = (module.exports.resetBranchCard =
+  async function resetBranchCard(conn, branch, username) {
+    const b = normalizeBranch(branch);
+    await ensureBranchCardRow(conn, b);
+    const kept = await getBranchCardBalance(conn, b);
+
+    await conn.query(
+      "UPDATE branch_card_balance SET CardBalance = 0 WHERE Branch = ?",
+      [b]
+    );
+    await conn.query(
+      "INSERT INTO card_resets (Branch, Username, KeptAmount) VALUES (?, ?, ?)",
+      [b, username, kept]
+    );
+
+    const [parts] = await conn.query(
+      "SELECT Currency, CardPart FROM total_cash WHERE id = ? AND Branch = ? AND CardPart != 0",
+      [TOTAL_ROW_ID, b]
+    );
+    for (const row of parts) {
+      const part = Number(row.CardPart);
+      // A part can be negative after reversals; log the movement in the
+      // direction that brings it back to 0.
+      await logTotalCash(
+        conn,
+        b,
+        username,
+        part >= 0 ? "reduce" : "increase",
+        Math.abs(part),
+        "Card balance cleared",
+        row.Currency,
+        "Card"
+      );
+    }
+    await conn.query(
+      "UPDATE total_cash SET CardPart = 0 WHERE id = ? AND Branch = ?",
+      [TOTAL_ROW_ID, b]
+    );
+
+    return kept;
+  });
+
 /**
  * Reset current cash to zero (all currencies) for a branch and record who did
  * it and how much was kept per currency.
@@ -681,6 +800,28 @@ const resetCurrentCash = (module.exports.resetCurrentCash =
 
     return kept;
   });
+
+/**
+ * "Reset to 0" for a branch: zeroes the branch's current cash (every
+ * currency) AND the branch's card balance, recording both resets.
+ *
+ * NOTE: runs inside the caller's transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ * @param {string} username
+ * @returns {Promise<{cash: Record<string, number>, card: number}>} What was
+ *   kept: cash per currency and the card balance.
+ */
+const resetBranch = (module.exports.resetBranch = async function resetBranch(
+  conn,
+  branch,
+  username
+) {
+  const cash = await resetCurrentCash(conn, branch, username);
+  const card = await resetBranchCard(conn, branch, username);
+  return { cash, card };
+});
 
 /**
  * Create the CurrentCash router.
@@ -745,6 +886,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         return res.status(400).json({ error: day.error });
       }
       const balances = await getCurrentCash(DBConnection, branch);
+      const cardBalance = await getBranchCardBalance(DBConnection, branch);
       const [txs] = await DBConnection.query(
         `SELECT * FROM cash_transactions
           WHERE Branch = ? AND CreatedAt >= ? AND CreatedAt < ?
@@ -759,6 +901,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
       );
       res.json({
         balances,
+        cardBalance,
         transactions: txs,
         resets,
         date: day.date,
@@ -854,19 +997,20 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
     }
   );
 
-  // POST /currentcash/reset — zero all currencies for a branch and record the
-  // reset. Expects { branch } in the body.
+  // POST /currentcash/reset — "Reset to 0": zero all currencies AND the card
+  // balance of a branch, recording both resets. Expects { branch } in the body.
   router.post("/currentcash/reset", auth, requireCashRole, async (req, res) => {
     try {
       const { branch } = req.body || {};
       const b = normalizeBranch(branch);
-      const kept = await DBConnection.withTransaction((conn) =>
-        resetCurrentCash(conn, b, req.user.username)
+      const { cash, card } = await DBConnection.withTransaction((conn) =>
+        resetBranch(conn, b, req.user.username)
       );
 
       res.status(200).json({
-        message: "Current cash reset",
-        kept,
+        message: "Current cash and card balance reset",
+        kept: cash,
+        cardKept: card,
         branch: b,
         author: req.user.username,
       });

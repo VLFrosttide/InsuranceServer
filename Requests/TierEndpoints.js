@@ -75,8 +75,10 @@ function isBrokerLinked(insurance) {
  * @returns {"Cash"|"Card"|"Broker"}
  */
 function effectivePayment(insurance) {
-  const p = resolvePaymentType(insurance.PaymentType);
-  return p === "Cash" && isBrokerLinked(insurance) ? "Broker" : p;
+  // Any broker-linked row was funded by the broker's balance, whatever payment
+  // type a legacy row was stored with (Cash or Card before "Broker" existed).
+  if (isBrokerLinked(insurance)) return "Broker";
+  return resolvePaymentType(insurance.PaymentType);
 }
 
 /**
@@ -86,7 +88,7 @@ function effectivePayment(insurance) {
  *   Broker -> Broker part of Total cash only (never current cash; the broker's
  *             own balance is handled separately by Brokers.js).
  *   Cash   -> current cash (and, through it, Total cash).
- *   Card   -> card balance + Card part of Total cash.
+ *   Card   -> the branch's card balance + Card part of Total cash.
  */
 async function movePolicyMoney(conn, payment, type, m) {
   const { branch, username, amount, reason, currency } = m;
@@ -113,10 +115,11 @@ async function movePolicyMoney(conn, payment, type, m) {
       currency
     );
   }
+  // The card balance is kept per branch: the policy's branch gets the money.
   if (type === "increase") {
-    await recordCardPayment(conn, username, amount, reason);
+    await recordCardPayment(conn, branch, username, amount, reason);
   } else {
-    await reduceCardBalance(conn, username, amount, reason);
+    await reduceCardBalance(conn, branch, username, amount, reason);
   }
   return recordChannelMovement(
     conn,
@@ -153,6 +156,78 @@ function parseDurationDays(value) {
   if (str.includes("годин") || str.includes("year")) return num * 365;
   if (str.includes("месец") || str.includes("month")) return num * 30;
   return num; // days
+}
+
+// ---------------------------------------------------------------------------
+// Annulment fees
+// ---------------------------------------------------------------------------
+// The fee is decided by whether the policy is already in effect when it is
+// annulled (now has reached its start date): 1 if it has not started yet,
+// 9 if it already has. Who pays it (broker or worker) is chosen in the form;
+// "none" (no fault) charges no fee at all.
+//
+// The fee is in the policy's own currency and is deducted from the refund.
+// ---------------------------------------------------------------------------
+
+const ANNUL_PAYERS = ["broker", "worker", "none"];
+const ANNUL_FEE_NOT_IN_EFFECT = 1;
+const ANNUL_FEE_IN_EFFECT = 9;
+
+/**
+ * Parse a policy start date into the LOCAL midnight it begins at.
+ *
+ * Accepts a Date (mysql2 returns DATE columns as local-midnight Dates) or a
+ * "YYYY-MM-DD" / "YYYY-MM-DD HH:MM:SS" / ISO string. Only the calendar day is
+ * used: a policy is in effect for the whole of its starting day.
+ *
+ * @param {Date|string|null|undefined} value
+ * @returns {Date|null}
+ */
+function parseStartDate(value) {
+  if (value === undefined || value === null || value === "") return null;
+  // Realm-safe Date check (instanceof fails for Dates from another context).
+  if (Object.prototype.toString.call(value) === "[object Date]") {
+    if (Number.isNaN(value.getTime())) return null;
+    return new Date(value.getFullYear(), value.getMonth(), value.getDate());
+  }
+  const m = String(value)
+    .trim()
+    .match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
+/**
+ * Whether a policy is already in effect at `now`, i.e. `now` has reached its
+ * start date. A policy without a usable start date is treated as in effect
+ * (the higher fee), since there is nothing to prove it has not started.
+ *
+ * @param {{StartDate?: any}} insurance
+ * @param {Date} now
+ * @returns {boolean}
+ */
+function isPolicyInEffect(insurance, now) {
+  const start = parseStartDate(insurance && insurance.StartDate);
+  if (!start) return true;
+  return now.getTime() >= start.getTime();
+}
+
+/**
+ * The annulment fee for a policy at `now`. "none" (no fault) is always free;
+ * otherwise the start date decides (1 not yet in effect, 9 already in effect).
+ *
+ * @param {{StartDate?: any}} insurance
+ * @param {Date} now
+ * @param {"broker"|"worker"|"none"} payer
+ * @returns {{fee: number, inEffect: boolean}}
+ */
+function computeAnnulFee(insurance, now, payer) {
+  const inEffect = isPolicyInEffect(insurance, now);
+  if (payer === "none") return { fee: 0, inEffect };
+  return {
+    fee: inEffect ? ANNUL_FEE_IN_EFFECT : ANNUL_FEE_NOT_IN_EFFECT,
+    inEffect,
+  };
 }
 
 // Real-world UTC offsets range from UTC-12:00 to UTC+14:00.
@@ -591,8 +666,15 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       const paymentType = isEmailPolicy ? "Broker" : requestedPayment;
 
       // Optional surcharges (already included in Price). The card fee is only
-      // valid for card payments.
+      // valid for card payments. The non-Turk tax only applies to walk-ins:
+      // an email policy carrying it is rejected (its price would include a +5
+      // the broker must not be charged for).
       const nonTurk = toFlag(b.NonTurk ?? b.nonTurk);
+      if (isEmailPolicy && nonTurk) {
+        return res.status(400).json({
+          error: "The non-Turk tax only applies to walk-in policies",
+        });
+      }
       const cardFee = paymentType === "Card" && toFlag(b.CardFee ?? b.cardFee);
 
       // Optional return-email handling. When the form was opened from an
@@ -616,6 +698,16 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       }
       if (!String(policyNumber).trim()) {
         return res.status(400).json({ error: "PolicyNumber is required" });
+      }
+
+      // An email card policy is answered with a return email carrying the
+      // policy files; it must not be created without at least one attachment
+      // that actually has content.
+      const validAttachments = attachments.filter((a) => a && a.base64);
+      if (messageId && !disableReturnEmail && validAttachments.length === 0) {
+        return res.status(400).json({
+          error: "Attach at least one file before saving an email policy",
+        });
       }
 
       // The creation time is computed by the CLIENT (the worker's local
@@ -707,9 +799,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
         // Flat fee: when the sender's email is associated with a broker, the
         // policy price is deducted from that broker's balance (which may go
-        // negative) and its InactivePolicies is decremented. Creating an email
-        // insurance therefore REDUCES the broker balance - that reduction is
-        // what pays for the policy.
+        // negative). Creating an email insurance therefore REDUCES the broker
+        // balance - that reduction is what pays for the policy. The blanc is
+        // marked used by the inserted row itself (inactive blancs are
+        // calculated from the broker's blanc batches).
         if (brokerId !== null) {
           await decreaseBrokerForInsurance(conn, brokerId, price);
         }
@@ -819,11 +912,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // Shared insurance endpoints (roles 1 and 2)
   // ---------------------------------------------------------------------
 
-  // GET /insurances?author=&date=&policyNumber=&blancNumber=&carNumber=
+  // GET /insurances?author=&date=&policyNumber=&blancNumber=&carNumber=&broker=
   // Returns insurances matching any combination of the supplied filters.
   // At least one filter must be provided. Author/date match exactly (date
-  // compares only the calendar day); policyNumber/blancNumber/carNumber use a
-  // partial (substring) match so partially-remembered numbers still work.
+  // compares only the calendar day); policyNumber/blancNumber/carNumber/broker
+  // use a partial (substring) match so partially-remembered numbers - and
+  // partially typed broker names such as "Euro" for "Euroins" - still work.
   router.get("/insurances", auth, requireRole(1, 2), async (req, res) => {
     try {
       const author = req.query.author ? String(req.query.author).trim() : "";
@@ -837,11 +931,19 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       const carNumber = req.query.carNumber
         ? String(req.query.carNumber).trim()
         : "";
+      const broker = req.query.broker ? String(req.query.broker).trim() : "";
 
-      if (!author && !date && !policyNumber && !blancNumber && !carNumber) {
+      if (
+        !author &&
+        !date &&
+        !policyNumber &&
+        !blancNumber &&
+        !carNumber &&
+        !broker
+      ) {
         return res.status(400).json({
           error:
-            "At least one search parameter is required (author, date, policyNumber, blancNumber or carNumber)",
+            "At least one search parameter is required (author, date, policyNumber, blancNumber, carNumber or broker)",
         });
       }
 
@@ -851,9 +953,16 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           .json({ error: "date must be in YYYY-MM-DD format" });
       }
 
-      // Deleted (soft-deleted) insurances are always excluded here so they
-      // stop being parsed/surfaced, regardless of the other filters applied.
-      const conditions = ["Deleted = 0"];
+      // Deleted (soft-deleted) insurances are excluded by default so they stop
+      // being parsed/surfaced, regardless of the other filters applied. Admins
+      // can look them up with ?includeDeleted=1 (e.g. to audit a deletion);
+      // the flag is ignored for workers, who never see deleted policies.
+      const includeDeleted =
+        String(req.user && req.user.role) === "1" &&
+        ["1", "true", "yes"].includes(
+          String(req.query.includeDeleted || "").toLowerCase()
+        );
+      const conditions = includeDeleted ? ["1 = 1"] : ["Deleted = 0"];
       const params = [];
 
       if (author) {
@@ -875,6 +984,13 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       if (carNumber) {
         conditions.push("CarNumber LIKE ?");
         params.push(`%${carNumber}%`);
+      }
+      // The broker is stored as a name on the policy (insurance.Broker), so a
+      // substring match lets the caller type only part of it ("Euro" -> the
+      // policies issued through "Euroins").
+      if (broker) {
+        conditions.push("Broker LIKE ?");
+        params.push(`%${broker}%`);
       }
 
       const [rows] = await DBConnection.query(
@@ -973,6 +1089,20 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         if (!isEmailPolicy && requestedPayment === "Broker") {
           return res.status(400).json({
             error: "Only email policies can be paid from a broker balance",
+          });
+        }
+        // The non-Turk tax only applies to walk-ins, so an email policy can
+        // never be flagged with it. (Sending it as false is still accepted, so
+        // a legacy row that carries the flag can be cleared.)
+        const nonTurkValue = b.NonTurk ?? b.nonTurk;
+        if (
+          isEmailPolicy &&
+          nonTurkValue !== undefined &&
+          nonTurkValue !== null &&
+          toFlag(nonTurkValue)
+        ) {
+          return res.status(400).json({
+            error: "The non-Turk tax only applies to walk-in policies",
           });
         }
         const finalPayment = isEmailPolicy
@@ -1198,20 +1328,14 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     }
   );
 
-  // Annulment fees (flat amount, in the policy's own currency) per fault
-  // reason. "broker" and "worker" faults still charge a small fee to cover
-  // processing costs; "none" (no fault) refunds the full price.
-  const ANNUL_FEES = {
-    broker: 8,
-    worker: 1,
-    none: 0,
-  };
-
-  // POST /insurances/:blancNumber/annul  { reason: "broker"|"worker"|"none" }
-  // Annuls a policy: refunds its price (minus the fee for the given fault
-  // reason) out of current cash (or the card balance, depending on how it was
-  // originally paid) and reverses its effect on the linked broker's balance,
-  // if any. A policy can only be annulled once. Admins (role 1) can annul any
+  // POST /insurances/:blancNumber/annul  { payer: "broker"|"worker"|"none" }
+  // Annuls a policy: refunds its price minus the annulment fee, through the
+  // channel it was originally paid through (current cash, card balance, or the
+  // Broker channel for email policies), and reverses its effect on the linked
+  // broker's balance, if any. The caller chooses WHO pays the fee (or "none"
+  // for no fault, which is free); the fee itself (1 or 9, see computeAnnulFee)
+  // is decided here from the policy's start date and is never taken from the
+  // request. A policy can only be annulled once. Admins (role 1) can annul any
   // policy; workers (role 2) can only annul policies they created themselves.
   router.post(
     "/insurances/:blancNumber/annul",
@@ -1220,13 +1344,21 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     async (req, res) => {
       try {
         const { blancNumber } = req.params;
-        const reason = String(req.body?.reason ?? req.body?.Reason ?? "")
+        // Who pays the fee. `reason` is still accepted as an alias so an older
+        // client sending { reason: "broker" | "worker" } keeps working.
+        const payer = String(
+          req.body?.payer ??
+            req.body?.Payer ??
+            req.body?.reason ??
+            req.body?.Reason ??
+            ""
+        )
           .trim()
           .toLowerCase();
 
-        if (!Object.prototype.hasOwnProperty.call(ANNUL_FEES, reason)) {
+        if (!ANNUL_PAYERS.includes(payer)) {
           return res.status(400).json({
-            error: "reason must be one of 'broker', 'worker' or 'none'",
+            error: "payer must be one of 'broker', 'worker' or 'none'",
           });
         }
 
@@ -1260,7 +1392,13 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
 
         const price = toDecimal(insurance.Price) || 0;
-        const fee = ANNUL_FEES[reason];
+        // No fault: 0. Otherwise 9 when the policy is already in effect (its
+        // start date has been reached), 1 when it has not started yet.
+        const { fee, inEffect } = computeAnnulFee(
+          insurance,
+          new Date(),
+          payer
+        );
         const refund = Math.max(0, Math.round((price - fee) * 100) / 100);
 
         await DBConnection.withTransaction(async (conn) => {
@@ -1290,7 +1428,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             `UPDATE insurance
                 SET Annulled = 1, AnnulReason = ?, AnnulFee = ?, AnnulDate = NOW(), AnnulBy = ?
               WHERE BlancNumber = ?`,
-            [reason, fee, req.user.username, blancNumber]
+            [payer, fee, req.user.username, blancNumber]
           );
         });
 
@@ -1302,7 +1440,8 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           message: "Insurance annulled",
           refund,
           fee,
-          reason,
+          payer,
+          inEffect,
           insurance: rows[0],
         });
       } catch (err) {
@@ -1332,7 +1471,8 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   //     from current cash / the card balance and from Total cash.
   //   - Broker (email): the full price is refunded to the broker's balance,
   //     it is removed from the Broker part of Total cash, and the blanc is
-  //     given back to the broker (InactivePolicies + 1).
+  //     given back to the broker (a deleted policy no longer counts as using
+  //     a blanc of its batch).
   // If the policy was annulled first, the annulment already refunded part of
   // the money; only what is still counted (the kept annulment fee) is removed,
   // and the broker is not refunded a second time - but the blanc is restored.

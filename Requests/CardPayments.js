@@ -1,153 +1,94 @@
 "use strict";
 // Card balance support.
 //
-// Card balance is a single running balance, separate from current cash.
-// When an insurance policy is created with PaymentType = "Card", its price
-// is added here instead of to current cash.
+// Card balance is kept PER BRANCH (`branch_card_balance`, one row per branch),
+// separate from current cash. When an insurance policy is created with
+// PaymentType = "Card", its price is added to the card balance of the branch
+// that issued it instead of to current cash.
 //
-// Every entry records the user who performed it and a reason (the blanc number).
+// A branch's card balance is cleared ONLY together with its current cash, by
+// that branch's "Reset to 0" button (POST /currentcash/reset - see
+// resetBranch in CurrentCash.js). There is no separate card clear. Every reset
+// records the branch, the user who did it and the amount kept.
+//
+// Workers see their own branch's card balance on the Current cash screen
+// (GET /currentcash returns it). The all-branches overview below is admin-only.
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
-const { toDecimal, zeroAllCardParts } = require("./CurrentCash.js");
-
-// CardBalance is a single-row table keyed by this id.
-const CARD_ROW_ID = 1;
+const { toDecimal, adjustBranchCardBalance } = require("./CurrentCash.js");
 
 /**
- * Ensure the single CardBalance row exists.
+ * Read every branch's card balance and the overall total.
  *
  * @param {import("mysql2/promise").Connection} conn
- */
-const ensureCardRow = (module.exports.ensureCardRow =
-  async function ensureCardRow(conn) {
-    await conn.query(
-      "INSERT IGNORE INTO CardBalance (id, CardBalance) VALUES (?, 0)",
-      [CARD_ROW_ID]
-    );
-  });
-
-/**
- * Read the current card balance.
- *
- * @param {import("mysql2/promise").Connection} conn
- * @returns {Promise<number>}
+ * @returns {Promise<{branches: Array<{Branch: string, CardBalance: number}>, total: number}>}
  */
 const getCardPayments = (module.exports.getCardPayments =
   async function getCardPayments(conn) {
-    await ensureCardRow(conn);
     const [rows] = await conn.query(
-      "SELECT CardBalance FROM CardBalance WHERE id = ?",
-      [CARD_ROW_ID]
+      "SELECT Branch, CardBalance FROM branch_card_balance ORDER BY Branch"
     );
-    return rows.length ? Number(rows[0].CardBalance) : 0;
+    const branches = rows.map((r) => ({
+      Branch: r.Branch,
+      CardBalance: Number(r.CardBalance),
+    }));
+    const total =
+      Math.round(branches.reduce((s, b) => s + b.CardBalance, 0) * 100) / 100;
+    return { branches, total };
   });
 
+function validateMovement(amount, reason) {
+  const decimal = toDecimal(amount);
+  if (decimal === null || decimal <= 0) {
+    throw new Error("amount must be a positive number");
+  }
+  if (typeof reason !== "string" || !reason.trim()) {
+    throw new Error("reason is required");
+  }
+  return decimal;
+}
+
 /**
- * Record a single card payment (increment).
+ * Record a single card payment (increment) on a branch's card balance.
  *
  * NOTE: this runs inside the caller's transaction (the caller is responsible
  * for `beginTransaction` / `commit` / `rollback`).
  *
  * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch  Branch that took the payment.
  * @param {string} username  Username associated with the payment.
  * @param {number|string} amount  Positive value to add.
  * @param {string} reason  Human-readable reason for the payment.
  * @returns {Promise<number>} The applied amount (rounded to 2 decimals).
  */
 const recordCardPayment = (module.exports.recordCardPayment =
-  async function recordCardPayment(conn, username, amount, reason) {
-    const decimal = toDecimal(amount);
-    if (decimal === null || decimal <= 0) {
-      throw new Error("amount must be a positive number");
-    }
-    if (typeof reason !== "string" || !reason.trim()) {
-      throw new Error("reason is required");
-    }
-
-    await ensureCardRow(conn);
-
-    await conn.query(
-      "UPDATE CardBalance SET CardBalance = CardBalance + ? WHERE id = ?",
-      [decimal, CARD_ROW_ID]
-    );
-
+  async function recordCardPayment(conn, branch, username, amount, reason) {
+    const decimal = validateMovement(amount, reason);
+    await adjustBranchCardBalance(conn, branch, "increase", decimal);
     return decimal;
   });
 
 /**
- * Reduce the card balance (e.g. refunding part of an annulled policy that was
- * originally paid by card). Unlike current cash, the card balance is allowed
- * to go negative (it is a running ledger, not a physical cash drawer).
+ * Reduce a branch's card balance (e.g. refunding part of an annulled policy
+ * that was originally paid by card). Unlike current cash, the card balance is
+ * allowed to go negative (it is a running ledger, not a physical cash drawer).
  *
  * NOTE: this runs inside the caller's transaction (the caller is responsible
  * for `beginTransaction` / `commit` / `rollback`).
  *
  * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch  Branch the policy was paid at.
  * @param {string} username  Username associated with the refund.
  * @param {number|string} amount  Positive value to subtract.
  * @param {string} reason  Human-readable reason for the refund.
  * @returns {Promise<number>} The applied amount (rounded to 2 decimals).
  */
 const reduceCardBalance = (module.exports.reduceCardBalance =
-  async function reduceCardBalance(conn, username, amount, reason) {
-    const decimal = toDecimal(amount);
-    if (decimal === null || decimal <= 0) {
-      throw new Error("amount must be a positive number");
-    }
-    if (typeof reason !== "string" || !reason.trim()) {
-      throw new Error("reason is required");
-    }
-
-    await ensureCardRow(conn);
-
-    await conn.query(
-      "UPDATE CardBalance SET CardBalance = CardBalance - ? WHERE id = ?",
-      [decimal, CARD_ROW_ID]
-    );
-
+  async function reduceCardBalance(conn, branch, username, amount, reason) {
+    const decimal = validateMovement(amount, reason);
+    await adjustBranchCardBalance(conn, branch, "reduce", decimal);
     return decimal;
-  });
-
-/**
- * Reset the card balance to zero and record who did it and how much was kept
- * at the time of the reset.
- *
- * NOTE: this runs inside the caller's transaction (the caller is responsible
- * for `beginTransaction` / `commit` / `rollback`).
- *
- * @param {import("mysql2/promise").Connection} conn
- * @param {string} username  Username who performed the reset.
- * @returns {Promise<number>} The amount that was kept (i.e. the balance just
- *   before it was zeroed).
- */
-const resetCardBalance = (module.exports.resetCardBalance =
-  async function resetCardBalance(conn, username) {
-    await ensureCardRow(conn);
-
-    const [rows] = await conn.query(
-      "SELECT CardBalance FROM CardBalance WHERE id = ?",
-      [CARD_ROW_ID]
-    );
-    const kept = rows.length ? Number(rows[0].CardBalance) : 0;
-
-    await conn.query("UPDATE CardBalance SET CardBalance = 0 WHERE id = ?", [
-      CARD_ROW_ID,
-    ]);
-
-    await conn.query(
-      "INSERT INTO card_resets (Username, KeptAmount) VALUES (?, ?)",
-      [username, kept]
-    );
-
-    // Total cash counts card payments as one of its three payment types, stored
-    // per branch/currency in `total_cash.CardPart`. Clearing the card balance
-    // must therefore drag Total cash down by the same amount, otherwise the
-    // superset identity (TotalCash = CurrentCash + CardPart + BrokerPart) would
-    // silently keep the cleared card money in the total.
-    await zeroAllCardParts(conn, username);
-
-    return kept;
   });
 
 /**
@@ -176,45 +117,24 @@ module.exports.createCardPaymentsRouter = function createCardPaymentsRouter(
   const router = express.Router();
   const auth = requireAuth(DBConnection);
 
-  const requireCardRole = requireRole(1, 2);
-  // Clearing the card balance is a destructive, admin-only action.
+  // The all-branches overview shows every branch's card money, so it is
+  // admin-only. Workers see their own branch's card balance on the Current
+  // cash screen instead.
   const requireCardAdmin = requireRole(1);
 
-  // GET /cardpayments — current card balance total + reset history.
-  router.get("/cardpayments", auth, requireCardRole, async (req, res) => {
+  // GET /cardpayments — card balance of every branch, their total
+  // (`cardBalance`) and the reset history. Read-only: card balances are only
+  // cleared by a branch's "Reset to 0" (POST /currentcash/reset).
+  router.get("/cardpayments", auth, requireCardAdmin, async (req, res) => {
     try {
-      const cardBalance = await getCardPayments(DBConnection);
+      const { branches, total } = await getCardPayments(DBConnection);
       const resets = await getCardResets(DBConnection);
-      res.json({ cardBalance, resets });
+      res.json({ cardBalance: total, branches, resets });
     } catch (err) {
       console.error("CardPayments lookup failed:", err);
       res.status(500).json({ error: "Failed to fetch card payments" });
     }
   });
-
-  // POST /cardpayments/reset — zero the card balance and record the kept
-  // amount. Admin only.
-  router.post(
-    "/cardpayments/reset",
-    auth,
-    requireCardAdmin,
-    async (req, res) => {
-      try {
-        const kept = await DBConnection.withTransaction((conn) =>
-          resetCardBalance(conn, req.user.username)
-        );
-
-        res.status(200).json({
-          message: "Card balance reset",
-          kept,
-          author: req.user.username,
-        });
-      } catch (err) {
-        console.error("CardPayments reset failed:", err);
-        res.status(500).json({ error: "Failed to reset card balance" });
-      }
-    }
-  );
 
   return router;
 };

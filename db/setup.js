@@ -18,6 +18,49 @@ const { seedBrokersFromInfo } = require("./BrokerInfo.js");
  *   Optional connection overrides. Falls back to env vars / sensible local
  *   defaults so the script still runs standalone (`npm run db:setup`).
  */
+/**
+ * One-time split of the old global card balance into per-branch balances
+ * (same statements as migrations/009_branch_card_balance.sql). Runs only
+ * while `branch_card_balance` is empty, so it never overwrites live data.
+ *
+ * Each branch starts with its card share from total_cash.CardPart (summed over
+ * currencies) - the card money its policies brought in since the last clear.
+ * Whatever part of the old global CardBalance is not linked to any branch is
+ * kept on an unassigned ('') row, so no card money silently disappears.
+ *
+ * @param {import("mysql2/promise").Connection} db
+ */
+async function seedBranchCardBalances(db) {
+  const [[existing]] = await db.query(
+    "SELECT COUNT(*) AS n FROM branch_card_balance"
+  );
+  if (Number(existing.n) > 0) return;
+
+  await db.query(`
+    INSERT INTO branch_card_balance (Branch, CardBalance)
+    SELECT Branch, ROUND(SUM(CardPart), 2)
+      FROM total_cash
+     GROUP BY Branch
+    HAVING SUM(CardPart) <> 0
+  `);
+
+  const [legacy] = await db.query(
+    "SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'CardBalance'"
+  );
+  if (Number(legacy[0].n) > 0) {
+    await db.query(`
+      INSERT INTO branch_card_balance (Branch, CardBalance)
+      SELECT '', ROUND(cb.CardBalance - COALESCE(s.total, 0), 2)
+        FROM CardBalance cb
+        LEFT JOIN (SELECT SUM(CardBalance) AS total FROM branch_card_balance) s ON 1 = 1
+       WHERE cb.id = 1
+         AND ROUND(cb.CardBalance - COALESCE(s.total, 0), 2) <> 0
+      ON DUPLICATE KEY UPDATE CardBalance = CardBalance + VALUES(CardBalance)
+    `);
+  }
+  console.log("Split the card balance into per-branch balances");
+}
+
 async function runSetup(config = {}) {
   const DB_NAME = config.database || process.env.DB_NAME || "insurancedb";
   const host = config.host || process.env.DB_HOST || "localhost";
@@ -482,6 +525,30 @@ async function runSetup(config = {}) {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
 
+  // Card resets are per branch now: record which branch was cleared.
+  const [cardResetCols] = await db.query(
+    "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    [DB_NAME, "card_resets"]
+  );
+  if (!cardResetCols.some((c) => c.COLUMN_NAME === "Branch")) {
+    await db.query(
+      "ALTER TABLE card_resets ADD COLUMN Branch VARCHAR(45) NOT NULL DEFAULT '' AFTER id"
+    );
+    console.log("Added card_resets.Branch");
+  }
+
+  // Card balance per branch. Replaces the single global CardBalance row, so
+  // each branch's "Reset to 0" clears only that branch's card money.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS branch_card_balance (
+      Branch VARCHAR(45) NOT NULL,
+      CardBalance DECIMAL(15,2) NOT NULL DEFAULT 0,
+      UpdatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (Branch)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  `);
+  // (Filled from total_cash further below, once that table exists.)
+
   // 4a2) Total cash - the second record of cash flow.
   //
   // Total cash is a strict superset of current cash: it counts every type of
@@ -570,6 +637,9 @@ async function runSetup(config = {}) {
     console.log("Backfilled total_cash parts from existing insurances");
   }
 
+  // Split the old global card balance into per-branch balances (one-time).
+  await seedBranchCardBalances(db);
+
   // 4b) Create brokers + broker_emails tables.
   await db.query(`
      CREATE TABLE IF NOT EXISTS brokers (
@@ -626,6 +696,25 @@ async function runSetup(config = {}) {
        UNIQUE KEY uq_branch_tariff (Branch, InsuranceType, Duration),
        KEY idx_branch_tariffs_branch (Branch)
      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+   `);
+
+  // Blanc batches handed to brokers: one row per [RangeStart, RangeEnd]
+  // batch. A broker's inactive blancs are calculated from all of its batches
+  // (see Requests/Brokers.js); brokers.PolicyRangeStart / PolicyRangeEnd /
+  // InactivePolicies are legacy and no longer maintained.
+  await db.query(`
+     CREATE TABLE IF NOT EXISTS broker_blanc_batches (
+       id INT NOT NULL AUTO_INCREMENT,
+       BrokerId INT NOT NULL,
+       RangeStart BIGINT UNSIGNED NOT NULL,
+       RangeEnd BIGINT UNSIGNED NOT NULL,
+       CreatedBy VARCHAR(45) NOT NULL DEFAULT '',
+       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       PRIMARY KEY (id),
+       KEY idx_broker_blanc_batches_broker (BrokerId),
+       KEY idx_broker_blanc_batches_range (RangeStart, RangeEnd)
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+     COMMENT='Blanc number ranges handed to brokers (one row per batch)'
    `);
 
   // Migrate brokers to the current schema on existing databases.

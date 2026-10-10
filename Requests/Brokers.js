@@ -16,8 +16,24 @@
 //     current cash happens to be available.
 //
 // Creating an insurance whose email sender is associated with a broker
-// deducts a flat fee (the policy price) from that broker's balance and
-// decrements the broker's InactivePolicies by 1. No percentages are involved.
+// deducts a flat fee (the policy price) from that broker's balance. No
+// percentages are involved.
+//
+// Blanc batches: admins hand blancs (blank policy forms) to a broker in
+// batches, each one a numeric range [RangeStart, RangeEnd] stored in
+// `broker_blanc_batches`. A broker may hold any number of batches. The
+// broker's inactive (unused) blancs are NOT a stored counter - they are
+// calculated on every read from all of its batch ranges:
+//
+//     InactivePolicies = sum of (RangeEnd - RangeStart + 1)     (all batches)
+//                      - blancs in those ranges used by a non-deleted
+//                        insurance (Deleted = 0)
+//
+// An annulled policy keeps its blanc used up (it is not given back); only a
+// deletion gives the blanc back. Batches may never overlap - not within one
+// broker and not across brokers - so a blanc belongs to at most one batch.
+// The legacy brokers.PolicyRangeStart / PolicyRangeEnd / InactivePolicies
+// columns are no longer read or maintained.
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
@@ -45,7 +61,7 @@ function parsePositiveAmount(value) {
  *
  * Order of resolution:
  *   1. An explicit BrokerId.
- *   2. A broker whose policy range contains the blanc number.
+ *   2. A broker with a blanc batch whose range contains the blanc number.
  *   3. The single broker, if exactly one exists.
  *
  * @param {import("mysql2/promise").Connection} conn
@@ -69,7 +85,9 @@ const resolveBrokerId = (module.exports.resolveBrokerId =
     const numeric = parseInt(String(blancNumber ?? ""), 10);
     if (Number.isFinite(numeric)) {
       const [rows] = await conn.query(
-        "SELECT id FROM brokers WHERE PolicyRangeStart <= ? AND PolicyRangeEnd >= ? ORDER BY id LIMIT 1",
+        `SELECT BrokerId AS id FROM broker_blanc_batches
+          WHERE RangeStart <= ? AND RangeEnd >= ?
+          ORDER BY id LIMIT 1`,
         [numeric, numeric]
       );
       if (rows.length) return rows[0].id;
@@ -115,9 +133,11 @@ const resolveBrokerByEmail = (module.exports.resolveBrokerByEmail =
   });
 
 /**
- * Deduct the flat fee (the policy price) from a broker's balance and
- * decrement InactivePolicies by 1. The balance is allowed to go negative.
- * Runs inside the caller's transaction.
+ * Deduct the flat fee (the policy price) from a broker's balance. The balance
+ * is allowed to go negative. Runs inside the caller's transaction.
+ *
+ * The broker's inactive blancs are not touched here: they are calculated from
+ * the blanc batches, and the new insurance row itself marks its blanc as used.
  *
  * @param {import("mysql2/promise").Connection} conn
  * @param {number} brokerId
@@ -134,10 +154,7 @@ const decreaseBrokerForInsurance = (module.exports.decreaseBrokerForInsurance =
     const priceNum = toDecimal(price) || 0;
 
     await conn.query(
-      `UPDATE brokers
-            SET CashBalance = CashBalance - ?,
-                InactivePolicies = InactivePolicies - 1
-          WHERE id = ?`,
+      "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
       [priceNum, brokerId]
     );
 
@@ -149,10 +166,11 @@ const decreaseBrokerForInsurance = (module.exports.decreaseBrokerForInsurance =
  * annulled: increases CashBalance by the full price (the money side of the
  * inverse of {@link decreaseBrokerForInsurance}).
  *
- * InactivePolicies is intentionally NOT touched: the blanc of an annulled
- * policy has been used up and is not given back to the broker. Only a
- * deletion restores the blanc (see {@link restoreBrokerForDeletion}). Runs
- * inside the caller's transaction.
+ * The blanc of an annulled policy stays used up and is not given back to the
+ * broker: annulled (non-deleted) policies still count as using their blanc
+ * when inactive blancs are calculated. Only a deletion gives the blanc back
+ * (see {@link restoreBrokerForDeletion}). Runs inside the caller's
+ * transaction.
  *
  * @param {import("mysql2/promise").Connection} conn
  * @param {number} brokerId
@@ -178,13 +196,15 @@ const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
 
 /**
  * Undo a policy's effect on its broker when the policy is deleted: refunds
- * `amount` to CashBalance and gives the blanc back (InactivePolicies + 1) -
- * the full inverse of {@link decreaseBrokerForInsurance}.
+ * `amount` to CashBalance - the money side of the inverse of
+ * {@link decreaseBrokerForInsurance}. The blanc is given back on its own: a
+ * deleted policy no longer counts as using a blanc when the inactive blancs
+ * are calculated from the broker's batches.
  *
  * `amount` is normally the full price. For a policy that was annulled before
  * being deleted the annulment already refunded the price, so the caller
- * passes 0 and only the blanc is restored. Runs inside the caller's
- * transaction.
+ * passes 0 and nothing is refunded (the blanc is still given back). Runs
+ * inside the caller's transaction.
  *
  * @param {import("mysql2/promise").Connection} conn
  * @param {number} brokerId
@@ -200,13 +220,12 @@ const restoreBrokerForDeletion = (module.exports.restoreBrokerForDeletion =
 
     const amountNum = Math.max(0, toDecimal(amount) || 0);
 
-    await conn.query(
-      `UPDATE brokers
-            SET CashBalance = CashBalance + ?,
-                InactivePolicies = InactivePolicies + 1
-          WHERE id = ?`,
-      [amountNum, brokerId]
-    );
+    if (amountNum > 0) {
+      await conn.query(
+        "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
+        [amountNum, brokerId]
+      );
+    }
 
     return amountNum;
   });
@@ -214,8 +233,8 @@ const restoreBrokerForDeletion = (module.exports.restoreBrokerForDeletion =
 /**
  * Re-sync a broker's balance after the price of a policy linked to it is
  * corrected: applies the difference between the new and the old price to
- * CashBalance WITHOUT touching InactivePolicies (the policy is still active,
- * only its price changed). A positive delta charges the broker more, a negative
+ * CashBalance (the policy is still active and still uses its blanc, only its
+ * price changed). A positive delta charges the broker more, a negative
  * one refunds part of the fee. Runs inside the caller's transaction.
  *
  * This matters because an insurance created from a broker's email is funded
@@ -245,6 +264,189 @@ const adjustBrokerForPriceChange = (module.exports.adjustBrokerForPriceChange =
     return d;
   });
 
+// ---------------------------------------------------------------------------
+// Blanc batches
+// ---------------------------------------------------------------------------
+
+const BLANC_BATCH_TABLE_SQL = `CREATE TABLE IF NOT EXISTS broker_blanc_batches (
+  id INT NOT NULL AUTO_INCREMENT,
+  BrokerId INT NOT NULL,
+  RangeStart BIGINT UNSIGNED NOT NULL,
+  RangeEnd BIGINT UNSIGNED NOT NULL,
+  CreatedBy VARCHAR(45) NOT NULL DEFAULT '',
+  CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_broker_blanc_batches_broker (BrokerId),
+  KEY idx_broker_blanc_batches_range (RangeStart, RangeEnd)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+COMMENT='Blanc number ranges handed to brokers (one row per batch)'`;
+module.exports.BLANC_BATCH_TABLE_SQL = BLANC_BATCH_TABLE_SQL;
+
+/**
+ * Validate one batch from a request body.
+ *
+ * @param {object} raw  { RangeStart, RangeEnd } (other casings accepted)
+ * @returns {{ok: true, RangeStart: number, RangeEnd: number} | {ok: false, error: string}}
+ */
+const parseBlancBatch = (module.exports.parseBlancBatch =
+  function parseBlancBatch(raw) {
+    const src = raw && typeof raw === "object" ? raw : {};
+    const read = (...keys) => {
+      for (const k of keys) {
+        const v = src[k];
+        if (v !== undefined && v !== null && String(v).trim() !== "") {
+          return String(v).trim();
+        }
+      }
+      return null;
+    };
+    const startRaw = read("RangeStart", "rangeStart", "PolicyRangeStart", "policyRangeStart");
+    const endRaw = read("RangeEnd", "rangeEnd", "PolicyRangeEnd", "policyRangeEnd");
+    if (startRaw === null || endRaw === null) {
+      return { ok: false, error: "RangeStart and RangeEnd are required" };
+    }
+    if (!/^\d+$/.test(startRaw) || !/^\d+$/.test(endRaw)) {
+      return {
+        ok: false,
+        error: "RangeStart and RangeEnd must be non-negative whole numbers",
+      };
+    }
+    const RangeStart = Number(startRaw);
+    const RangeEnd = Number(endRaw);
+    if (!Number.isSafeInteger(RangeStart) || !Number.isSafeInteger(RangeEnd)) {
+      return { ok: false, error: "RangeStart / RangeEnd is too large" };
+    }
+    if (RangeEnd < RangeStart) {
+      return { ok: false, error: "RangeEnd must be >= RangeStart" };
+    }
+    return { ok: true, RangeStart, RangeEnd };
+  });
+
+/**
+ * Find the first batch in `batches` whose range overlaps `candidate`.
+ *
+ * @param {Array<{id?: any, RangeStart: any, RangeEnd: any}>} batches
+ * @param {{RangeStart: number, RangeEnd: number}} candidate
+ * @param {any} [ignoreId] Batch id to skip (the batch being edited).
+ * @returns {object|null}
+ */
+const findOverlappingBatch = (module.exports.findOverlappingBatch =
+  function findOverlappingBatch(batches, candidate, ignoreId) {
+    for (const b of batches || []) {
+      if (
+        ignoreId !== undefined &&
+        ignoreId !== null &&
+        String(b.id) === String(ignoreId)
+      ) {
+        continue;
+      }
+      if (
+        Number(b.RangeStart) <= candidate.RangeEnd &&
+        Number(b.RangeEnd) >= candidate.RangeStart
+      ) {
+        return b;
+      }
+    }
+    return null;
+  });
+
+/**
+ * Turn batch rows (each carrying a `Used` count) into per-broker summaries.
+ * Each batch gets Total / Used / Inactive, and every broker gets the sums of
+ * all its batches: BlancTotal, BlancUsed and InactivePolicies (the inactive,
+ * i.e. still unused, blancs).
+ *
+ * @param {Array<{id: any, BrokerId: any, RangeStart: any, RangeEnd: any, Used?: any}>} rows
+ * @returns {Map<number, {batches: object[], BlancTotal: number, BlancUsed: number, InactivePolicies: number}>}
+ */
+const summarizeBlancBatches = (module.exports.summarizeBlancBatches =
+  function summarizeBlancBatches(rows) {
+    const byBroker = new Map();
+    for (const r of rows || []) {
+      const brokerId = Number(r.BrokerId);
+      const start = Number(r.RangeStart);
+      const end = Number(r.RangeEnd);
+      const total = Math.max(0, end - start + 1);
+      const used = Math.min(total, Math.max(0, Number(r.Used) || 0));
+      const batch = {
+        id: r.id,
+        BrokerId: brokerId,
+        RangeStart: start,
+        RangeEnd: end,
+        CreatedBy: r.CreatedBy ?? "",
+        CreatedAt: r.CreatedAt ?? null,
+        Total: total,
+        Used: used,
+        Inactive: total - used,
+      };
+      if (!byBroker.has(brokerId)) {
+        byBroker.set(brokerId, {
+          batches: [],
+          BlancTotal: 0,
+          BlancUsed: 0,
+          InactivePolicies: 0,
+        });
+      }
+      const s = byBroker.get(brokerId);
+      s.batches.push(batch);
+      s.BlancTotal += total;
+      s.BlancUsed += used;
+      s.InactivePolicies += total - used;
+    }
+    for (const s of byBroker.values()) {
+      s.batches.sort((a, b) => a.RangeStart - b.RangeStart);
+    }
+    return byBroker;
+  });
+
+/**
+ * Attach the blanc summary to a broker row (a broker without batches gets
+ * zeros everywhere). Overwrites the legacy stored InactivePolicies value.
+ *
+ * @param {object} broker
+ * @param {Map<number, object>} summaries  Output of summarizeBlancBatches.
+ * @returns {object} The same broker object.
+ */
+const applyBlancSummary = (module.exports.applyBlancSummary =
+  function applyBlancSummary(broker, summaries) {
+    const s = summaries.get(Number(broker.id));
+    broker.batches = s ? s.batches : [];
+    broker.BlancTotal = s ? s.BlancTotal : 0;
+    broker.BlancUsed = s ? s.BlancUsed : 0;
+    broker.InactivePolicies = s ? s.InactivePolicies : 0;
+    return broker;
+  });
+
+/**
+ * Load blanc batches (of every broker, or of one) together with how many of
+ * their blancs are already used. A blanc counts as used when a non-deleted
+ * insurance carries it as its (numeric) BlancNumber. Annulled policies still
+ * count: an annulled policy keeps its blanc used up, only a deletion gives
+ * the blanc back.
+ *
+ * @param {{query: Function}} db
+ * @param {number} [brokerId]
+ * @returns {Promise<object[]>}
+ */
+const loadBlancBatchRows = (module.exports.loadBlancBatchRows =
+  async function loadBlancBatchRows(db, brokerId) {
+    const hasBroker = brokerId !== undefined && brokerId !== null;
+    const [rows] = await db.query(
+      `SELECT b.id, b.BrokerId, b.RangeStart, b.RangeEnd, b.CreatedBy, b.CreatedAt,
+              (SELECT COUNT(DISTINCT CAST(TRIM(i.BlancNumber) AS UNSIGNED))
+                 FROM insurance i
+                WHERE TRIM(i.BlancNumber) REGEXP '^[0-9]+$'
+                  AND CAST(TRIM(i.BlancNumber) AS UNSIGNED)
+                      BETWEEN b.RangeStart AND b.RangeEnd
+                  AND i.Deleted = 0) AS Used
+         FROM broker_blanc_batches b
+        ${hasBroker ? "WHERE b.BrokerId = ?" : ""}
+        ORDER BY b.BrokerId, b.RangeStart`,
+      hasBroker ? [brokerId] : []
+    );
+    return rows;
+  });
+
 /**
  * Create the broker router.
 
@@ -257,8 +459,102 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   const auth = requireAuth(DBConnection);
   const requireBrokerRole = requireRole(1, 2);
 
-  const BROKER_COLUMNS =
-    "id, Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies";
+  // InactivePolicies / PolicyRange* are no longer selected: inactive blancs
+  // are calculated from the blanc batches (see applyBlancSummary).
+  const BROKER_COLUMNS = "id, Name, CashBalance";
+
+  // The batches table is created on first use (and by db/setup.js), so the
+  // server also works on a database that has not been set up again yet.
+  let batchTableReady = null;
+  function ensureBatchTable() {
+    if (!batchTableReady) {
+      batchTableReady = Promise.resolve(
+        DBConnection.query(BLANC_BATCH_TABLE_SQL)
+      ).catch((err) => {
+        batchTableReady = null;
+        throw err;
+      });
+    }
+    return batchTableReady;
+  }
+
+  async function loadSummaries(brokerId) {
+    await ensureBatchTable();
+    return summarizeBlancBatches(
+      await loadBlancBatchRows(DBConnection, brokerId)
+    );
+  }
+
+  function parseBatchId(param) {
+    const id = Number(param);
+    return Number.isInteger(id) && id > 0 ? id : null;
+  }
+
+  /**
+   * Validate a list of new batches against each other and against every
+   * batch already stored (any broker). Returns an error message or null.
+   *
+   * @param {{query: Function}} conn
+   * @param {Array<{RangeStart: number, RangeEnd: number}>} batches
+   * @param {number} [ignoreId] Stored batch id to skip (the one being edited).
+   */
+  async function findBatchConflict(conn, batches, ignoreId) {
+    for (let i = 0; i < batches.length; i++) {
+      const other = findOverlappingBatch(batches.slice(0, i), batches[i]);
+      if (other) {
+        return `Batch ${batches[i].RangeStart}-${batches[i].RangeEnd} overlaps batch ${other.RangeStart}-${other.RangeEnd}`;
+      }
+    }
+    for (const b of batches) {
+      const [rows] = await conn.query(
+        `SELECT bb.id, bb.BrokerId, bb.RangeStart, bb.RangeEnd, br.Name
+           FROM broker_blanc_batches bb
+           LEFT JOIN brokers br ON br.id = bb.BrokerId
+          WHERE bb.RangeStart <= ? AND bb.RangeEnd >= ?`,
+        [b.RangeEnd, b.RangeStart]
+      );
+      const hit = findOverlappingBatch(rows, b, ignoreId);
+      if (hit) {
+        return `Batch ${b.RangeStart}-${b.RangeEnd} overlaps existing batch ${hit.RangeStart}-${hit.RangeEnd}${hit.Name ? ` (${hit.Name})` : ""}`;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Parse `body.batches` (array). Falls back to a single legacy
+   * PolicyRangeStart/PolicyRangeEnd pair so older clients keep working.
+   * Returns null when the body carries no batch information at all.
+   */
+  function parseBatchList(body) {
+    const b = body || {};
+    let list;
+    if (Array.isArray(b.batches)) list = b.batches;
+    else if (
+      [b.PolicyRangeStart, b.policyRangeStart, b.PolicyRangeEnd, b.policyRangeEnd]
+        .some((v) => v !== undefined && v !== null && v !== "")
+    ) {
+      list = [b];
+    } else return null;
+
+    const out = [];
+    for (const raw of list) {
+      const parsed = parseBlancBatch(raw);
+      if (!parsed.ok) return { error: parsed.error };
+      out.push({ RangeStart: parsed.RangeStart, RangeEnd: parsed.RangeEnd });
+    }
+    return { batches: out };
+  }
+
+  async function insertBatches(conn, brokerId, batches, username) {
+    for (const b of batches) {
+      await conn.query(
+        `INSERT INTO broker_blanc_batches (BrokerId, RangeStart, RangeEnd, CreatedBy)
+         VALUES (?, ?, ?, ?)`,
+        [brokerId, b.RangeStart, b.RangeEnd, username || ""]
+      );
+    }
+  }
 
   function parseBrokerId(param) {
     const id = Number(param);
@@ -293,15 +589,19 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     );
     broker.emails = emails.map((r) => r.Email);
     broker.insuranceCount = insurances[0].n;
+    applyBlancSummary(broker, await loadSummaries(id));
     return broker;
   }
 
-  // GET /brokers — list every broker with its balance, inactive policies and emails.
+  // GET /brokers — list every broker with its balance, blanc batches,
+  // calculated inactive blancs and emails.
   router.get("/brokers", auth, requireBrokerRole, async (req, res) => {
     try {
       const [rows] = await DBConnection.query(
         `SELECT ${BROKER_COLUMNS} FROM brokers ORDER BY id`
       );
+      const summaries = await loadSummaries();
+      for (const b of rows) applyBlancSummary(b, summaries);
       const [emailRows] = await DBConnection.query(
         "SELECT BrokerId, Email FROM broker_emails ORDER BY BrokerId, id"
       );
@@ -339,12 +639,18 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       const countByBroker = new Map(
         insuranceRows.map((r) => [r.BrokerId, r.n])
       );
+      const summaries = await loadSummaries();
 
-      const brokers = rows.map((b) => ({
-        ...b,
-        emails: emailsByBroker.get(b.id) || [],
-        insuranceCount: countByBroker.get(b.id) || 0,
-      }));
+      const brokers = rows.map((b) =>
+        applyBlancSummary(
+          {
+            ...b,
+            emails: emailsByBroker.get(b.id) || [],
+            insuranceCount: countByBroker.get(b.id) || 0,
+          },
+          summaries
+        )
+      );
 
       const format = String(req.query.format || "json").toLowerCase();
       if (format === "csv") {
@@ -352,8 +658,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           "id",
           "Name",
           "CashBalance",
-          "PolicyRangeStart",
-          "PolicyRangeEnd",
+          "BlancBatches",
+          "BlancTotal",
+          "BlancUsed",
           "InactivePolicies",
           "emails",
           "insuranceCount",
@@ -366,8 +673,13 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               b.id,
               esc(b.Name),
               b.CashBalance,
-              b.PolicyRangeStart,
-              b.PolicyRangeEnd,
+              esc(
+                b.batches
+                  .map((x) => `${x.RangeStart}-${x.RangeEnd}`)
+                  .join(";")
+              ),
+              b.BlancTotal,
+              b.BlancUsed,
               b.InactivePolicies,
               esc(b.emails.join(";")),
               b.insuranceCount,
@@ -564,38 +876,36 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
       const cashBalance =
         toNumber(req.body?.CashBalance ?? req.body?.cashBalance) ?? 0;
-      const rangeStart = toNumber(
-        req.body?.PolicyRangeStart ?? req.body?.policyRangeStart
-      );
-      const rangeEnd = toNumber(
-        req.body?.PolicyRangeEnd ?? req.body?.policyRangeEnd
-      );
-      const inactive =
-        toNumber(req.body?.InactivePolicies ?? req.body?.inactivePolicies) ?? 0;
 
-      if (rangeStart === null || rangeEnd === null) {
-        return res.status(400).json({
-          error: "PolicyRangeStart and PolicyRangeEnd are required",
-        });
+      // Blanc batches are optional on creation: more can be added any time
+      // through POST /brokers/:id/batches.
+      const batchList = parseBatchList(req.body);
+      if (batchList && batchList.error) {
+        return res.status(400).json({ error: batchList.error });
       }
-      if (rangeEnd < rangeStart) {
-        return res
-          .status(400)
-          .json({ error: "PolicyRangeEnd must be >= PolicyRangeStart" });
-      }
+      const batches = batchList ? batchList.batches : [];
 
       const emails = parseBrokerEmails(req.body?.emails) || [];
 
+      await ensureBatchTable();
+
       let brokerId;
+      let conflict = null;
       try {
         brokerId = await DBConnection.withTransaction(async (conn) => {
+          conflict = await findBatchConflict(conn, batches);
+          if (conflict) return null;
+
+          // The legacy range / counter columns are kept at 0: inactive blancs
+          // are calculated from broker_blanc_batches.
           const [result] = await conn.query(
             `INSERT INTO brokers
                (Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
              VALUES (?, ?, ?, ?, ?)`,
-            [name, cashBalance, rangeStart, rangeEnd, inactive]
+            [name, cashBalance, 0, 0, 0]
           );
           const id = result.insertId;
+          await insertBatches(conn, id, batches, req.user?.username);
           for (const email of emails) {
             await conn.query(
               "INSERT INTO broker_emails (BrokerId, Email) VALUES (?, ?)",
@@ -611,6 +921,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             .json({ error: "A broker with this Name already exists" });
         }
         throw err;
+      }
+      if (conflict) {
+        return res.status(409).json({ error: conflict });
       }
 
       const broker = await fetchBroker(res, brokerId);
@@ -641,12 +954,12 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       const sets = [];
       const params = [];
 
+      // Blanc ranges are no longer broker fields - they are managed as
+      // batches (POST/PATCH/DELETE /brokers/:id/batches), and InactivePolicies
+      // is calculated from them, so neither can be set here.
       const fieldMap = [
         ["Name", b.Name ?? b.name],
         ["CashBalance", b.CashBalance ?? b.cashBalance],
-        ["PolicyRangeStart", b.PolicyRangeStart ?? b.policyRangeStart],
-        ["PolicyRangeEnd", b.PolicyRangeEnd ?? b.policyRangeEnd],
-        ["InactivePolicies", b.InactivePolicies ?? b.inactivePolicies],
       ];
 
       for (const [column, value] of fieldMap) {
@@ -734,6 +1047,10 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         await conn.query("DELETE FROM broker_emails WHERE BrokerId = ?", [
           brokerId,
         ]);
+        await conn.query(
+          "DELETE FROM broker_blanc_batches WHERE BrokerId = ?",
+          [brokerId]
+        );
         await conn.query("DELETE FROM brokers WHERE id = ?", [brokerId]);
       });
 
@@ -743,6 +1060,181 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       res.status(500).json({ error: "Failed to delete broker" });
     }
   });
+
+  // ---------------------------------------------------------------------
+  // Blanc batches
+  // ---------------------------------------------------------------------
+  //
+  // GET    /brokers/:id/batches              list + calculated totals
+  // POST   /brokers/:id/batches              add { RangeStart, RangeEnd }
+  //                                          or several { batches: [...] }
+  // PATCH  /brokers/:id/batches/:batchId     correct a batch's range
+  // DELETE /brokers/:id/batches/:batchId     remove a batch
+  //
+  // Writes are admin-only, reject any range overlapping a stored batch (of
+  // any broker) and answer with the refreshed broker, so the client re-renders
+  // with the recalculated InactivePolicies.
+
+  async function requireExistingBroker(req, res) {
+    const brokerId = parseBrokerId(req.params.id);
+    if (brokerId === null) {
+      res.status(400).json({ error: "Invalid broker id" });
+      return null;
+    }
+    const [existing] = await DBConnection.query(
+      "SELECT id FROM brokers WHERE id = ?",
+      [brokerId]
+    );
+    if (existing.length === 0) {
+      res.status(404).json({ error: "Broker not found" });
+      return null;
+    }
+    await ensureBatchTable();
+    return brokerId;
+  }
+
+  router.get(
+    "/brokers/:id/batches",
+    auth,
+    requireBrokerRole,
+    async (req, res) => {
+      try {
+        const brokerId = await requireExistingBroker(req, res);
+        if (brokerId === null) return;
+        const s = applyBlancSummary(
+          { id: brokerId },
+          await loadSummaries(brokerId)
+        );
+        res.json({
+          batches: s.batches,
+          BlancTotal: s.BlancTotal,
+          BlancUsed: s.BlancUsed,
+          InactivePolicies: s.InactivePolicies,
+        });
+      } catch (err) {
+        console.error("Blanc batch list failed:", err);
+        res.status(500).json({ error: "Failed to fetch blanc batches" });
+      }
+    }
+  );
+
+  router.post("/brokers/:id/batches", auth, requireAdmin, async (req, res) => {
+    try {
+      const brokerId = await requireExistingBroker(req, res);
+      if (brokerId === null) return;
+
+      const body = req.body || {};
+      const parsed = parseBatchList(
+        Array.isArray(body.batches) ? body : { batches: [body] }
+      );
+      if (!parsed || parsed.error) {
+        return res
+          .status(400)
+          .json({ error: (parsed && parsed.error) || "No batch given" });
+      }
+      if (parsed.batches.length === 0) {
+        return res.status(400).json({ error: "No batch given" });
+      }
+
+      let conflict = null;
+      await DBConnection.withTransaction(async (conn) => {
+        conflict = await findBatchConflict(conn, parsed.batches);
+        if (conflict) return;
+        await insertBatches(conn, brokerId, parsed.batches, req.user?.username);
+      });
+      if (conflict) return res.status(409).json({ error: conflict });
+
+      const broker = await fetchBroker(res, brokerId);
+      if (!broker) return;
+      res.status(201).json({ message: "Blanc batch added", broker });
+    } catch (err) {
+      console.error("Blanc batch create failed:", err);
+      res.status(500).json({ error: "Failed to add blanc batch" });
+    }
+  });
+
+  router.patch(
+    "/brokers/:id/batches/:batchId",
+    auth,
+    requireAdmin,
+    async (req, res) => {
+      try {
+        const brokerId = await requireExistingBroker(req, res);
+        if (brokerId === null) return;
+        const batchId = parseBatchId(req.params.batchId);
+        if (batchId === null) {
+          return res.status(400).json({ error: "Invalid batch id" });
+        }
+        const parsed = parseBlancBatch(req.body);
+        if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+        const batch = {
+          RangeStart: parsed.RangeStart,
+          RangeEnd: parsed.RangeEnd,
+        };
+
+        let status = 200;
+        let error = null;
+        await DBConnection.withTransaction(async (conn) => {
+          const [found] = await conn.query(
+            "SELECT id FROM broker_blanc_batches WHERE id = ? AND BrokerId = ?",
+            [batchId, brokerId]
+          );
+          if (found.length === 0) {
+            status = 404;
+            error = "Blanc batch not found";
+            return;
+          }
+          const conflict = await findBatchConflict(conn, [batch], batchId);
+          if (conflict) {
+            status = 409;
+            error = conflict;
+            return;
+          }
+          await conn.query(
+            "UPDATE broker_blanc_batches SET RangeStart = ?, RangeEnd = ? WHERE id = ?",
+            [batch.RangeStart, batch.RangeEnd, batchId]
+          );
+        });
+        if (error) return res.status(status).json({ error });
+
+        const broker = await fetchBroker(res, brokerId);
+        if (!broker) return;
+        res.json({ message: "Blanc batch updated", broker });
+      } catch (err) {
+        console.error("Blanc batch update failed:", err);
+        res.status(500).json({ error: "Failed to update blanc batch" });
+      }
+    }
+  );
+
+  router.delete(
+    "/brokers/:id/batches/:batchId",
+    auth,
+    requireAdmin,
+    async (req, res) => {
+      try {
+        const brokerId = await requireExistingBroker(req, res);
+        if (brokerId === null) return;
+        const batchId = parseBatchId(req.params.batchId);
+        if (batchId === null) {
+          return res.status(400).json({ error: "Invalid batch id" });
+        }
+        const [r] = await DBConnection.query(
+          "DELETE FROM broker_blanc_batches WHERE id = ? AND BrokerId = ?",
+          [batchId, brokerId]
+        );
+        if (!r || r.affectedRows === 0) {
+          return res.status(404).json({ error: "Blanc batch not found" });
+        }
+        const broker = await fetchBroker(res, brokerId);
+        if (!broker) return;
+        res.json({ message: "Blanc batch deleted", broker });
+      } catch (err) {
+        console.error("Blanc batch delete failed:", err);
+        res.status(500).json({ error: "Failed to delete blanc batch" });
+      }
+    }
+  );
 
   // ---------------------------------------------------------------
   // Broker Pricing endpoints (admin-only)
