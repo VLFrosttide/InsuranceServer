@@ -97,6 +97,82 @@ const normalizeBranch = (module.exports.normalizeBranch =
     return String(value || "").trim();
   });
 
+// ---------------------------------------------------------------------------
+// Transaction history by day.
+//
+// The current cash screen lists the ledger (transactions and resets) one day
+// at a time. Any day can be requested; without one, today is used. "Today" is
+// the CLIENT's calendar day: the client sends its UTC offset in minutes (east
+// of UTC positive, the same convention as TzOffset when an insurance is
+// created). A missing/invalid offset falls back to UTC. CreatedAt is compared
+// as the stored wall-clock value, i.e. the same value the screen displays.
+// ---------------------------------------------------------------------------
+
+// Real-world UTC offsets range from UTC-12:00 to UTC+14:00.
+const MIN_TZ_OFFSET_MINUTES = -12 * 60;
+const MAX_TZ_OFFSET_MINUTES = 14 * 60;
+
+/**
+ * Shift a "YYYY-MM-DD" date by a number of calendar days.
+ *
+ * @param {string} ymd
+ * @param {number} days
+ * @returns {string}
+ */
+const addDays = (module.exports.addDays = function addDays(ymd, days) {
+  const [y, m, d] = String(ymd).split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
+});
+
+/**
+ * The client's current calendar day as "YYYY-MM-DD".
+ *
+ * @param {unknown} offsetMinutes  Client UTC offset in minutes.
+ * @param {Date} [now]  Current instant (injectable for tests).
+ * @returns {string}
+ */
+const clientLocalDate = (module.exports.clientLocalDate =
+  function clientLocalDate(offsetMinutes, now = new Date()) {
+    let offset = Number(offsetMinutes);
+    if (
+      !Number.isFinite(offset) ||
+      offset < MIN_TZ_OFFSET_MINUTES ||
+      offset > MAX_TZ_OFFSET_MINUTES
+    ) {
+      offset = 0;
+    }
+    return new Date(now.getTime() + Math.round(offset) * 60000)
+      .toISOString()
+      .slice(0, 10);
+  });
+
+/**
+ * Resolve which day of the ledger to return. An empty date means the client's
+ * today. Returns `{ date, nextDate }`, or `{ error }` when the date is
+ * malformed.
+ *
+ * @param {unknown} dateValue  Requested day ("YYYY-MM-DD").
+ * @param {unknown} offsetMinutes  Client UTC offset in minutes.
+ * @param {Date} [now]  Current instant (injectable for tests).
+ */
+const resolveHistoryDay = (module.exports.resolveHistoryDay =
+  function resolveHistoryDay(dateValue, offsetMinutes, now = new Date()) {
+    const raw =
+      dateValue === undefined || dateValue === null
+        ? ""
+        : String(dateValue).trim();
+    if (raw === "") {
+      const today = clientLocalDate(offsetMinutes, now);
+      return { date: today, nextDate: addDays(today, 1) };
+    }
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+    // Round-tripping through addDays rejects impossible dates (2026-02-31).
+    if (!m || addDays(raw, 0) !== raw) {
+      return { error: "date must be in YYYY-MM-DD format" };
+    }
+    return { date: raw, nextDate: addDays(raw, 1) };
+  });
+
 /**
  * Ensure the current_cash row exists for a given branch and currency.
  *
@@ -656,21 +732,37 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
     }
   );
 
-  // GET /currentcash — per-currency balances, transaction and reset history
-  // for the branch specified in the query string (?branch=...).
+  // GET /currentcash — per-currency balances plus the transaction and reset
+  // history of ONE day for the branch in the query string.
+  //   ?branch=...    branch to read
+  //   ?date=YYYY-MM-DD  day to list (any day; default: the client's today)
+  //   ?tzOffset=N    client UTC offset in minutes, used to work out "today"
   router.get("/currentcash", auth, requireCashRole, async (req, res) => {
     try {
       const branch = normalizeBranch(req.query.branch);
+      const day = resolveHistoryDay(req.query.date, req.query.tzOffset);
+      if (day.error) {
+        return res.status(400).json({ error: day.error });
+      }
       const balances = await getCurrentCash(DBConnection, branch);
       const [txs] = await DBConnection.query(
-        "SELECT * FROM cash_transactions WHERE Branch = ? ORDER BY id DESC",
-        [branch]
+        `SELECT * FROM cash_transactions
+          WHERE Branch = ? AND CreatedAt >= ? AND CreatedAt < ?
+          ORDER BY id DESC`,
+        [branch, day.date, day.nextDate]
       );
       const [resets] = await DBConnection.query(
-        "SELECT * FROM cash_resets WHERE Branch = ? ORDER BY id DESC",
-        [branch]
+        `SELECT * FROM cash_resets
+          WHERE Branch = ? AND CreatedAt >= ? AND CreatedAt < ?
+          ORDER BY id DESC`,
+        [branch, day.date, day.nextDate]
       );
-      res.json({ balances, transactions: txs, resets });
+      res.json({
+        balances,
+        transactions: txs,
+        resets,
+        date: day.date,
+      });
     } catch (err) {
       console.error("CurrentCash lookup failed:", err);
       res.status(500).json({ error: "Failed to fetch current cash" });

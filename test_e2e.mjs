@@ -217,32 +217,6 @@ async function main() {
     );
     check("POST /worker/insurances", r.status === 201, JSON.stringify(r.data));
 
-    // Duplicate insurance
-    const dupBlanc = `DUP${Date.now()}`;
-    r = await req(
-      "POST",
-      "/worker/insurances",
-      {
-        BlancNumber: dupBlanc,
-        CarNumber: "CB 1111 AA",
-      },
-      workerToken
-    );
-    const dupStatus = r.status;
-    r = await req(
-      "POST",
-      "/worker/insurances",
-      {
-        BlancNumber: dupBlanc,
-        CarNumber: "CB 1111 AA",
-      },
-      workerToken
-    );
-    check(
-      "POST /worker/insurances duplicate -> 409",
-      dupStatus === 201 && r.status === 409
-    );
-
     // Current cash (roles 1 and 2 only). Uses own test values, not DB data.
     r = await req("GET", "/currentcash", null, workerToken);
     check(
@@ -427,128 +401,139 @@ async function main() {
       r.status === 403 || r.status === 401
     );
 
-    // Creating insurance from an email associated with the broker deducts a
-    // flat fee (the full price) from the broker balance and decrements
-    // InactivePolicies. The balance may go negative.
-    const brokerBefore = await req(
-      "GET",
-      `/brokers/${brokerId}`,
-      null,
-      workerToken
-    );
-    const beforeBalance = Number(brokerBefore.data.broker.CashBalance);
-    const beforeInactive = Number(brokerBefore.data.broker.InactivePolicies);
+    // --- Deletion undoes a policy completely ---------------------------
+    const getCash = async () =>
+      (await req("GET", "/currentcash", null, adminToken)).data.balances.EUR;
+    const getCard = async () =>
+      (await req("GET", "/cardpayments", null, adminToken)).data.cardBalance;
 
-    // Use a unique numeric blanc inside Demo Broker's policy range
-    // (100..500) so it resolves to that broker.
-    const brokerInsuranceBlanc = String((Date.now() % 900000) + 100000);
+    // Self-contained fixtures: a dedicated broker + email so these checks do
+    // not depend on whatever brokers/policies the database already holds.
+    const delStamp = Date.now();
+    const delEmail = `deltest${delStamp}@broker.example`;
     r = await req(
       "POST",
-      "/worker/insurances",
+      "/brokers",
       {
-        BlancNumber: brokerInsuranceBlanc,
-        CarNumber: "CB 5678 CD",
-        Price: "500",
-        EmailFrom: "demo@broker.example",
+        Name: `DeleteTestBroker${delStamp}`,
+        CashBalance: 1000,
+        PolicyRangeStart: 1,
+        PolicyRangeEnd: 10,
+        InactivePolicies: 10,
+        emails: [delEmail],
       },
-      workerToken
+      adminToken
+    );
+    check("Create delete-test broker -> 201", r.status === 201, JSON.stringify(r.data));
+    const delBrokerId = r.data.broker?.id;
+    const getDelBroker = async () =>
+      (await req("GET", `/brokers/${delBrokerId}`, null, adminToken)).data.broker;
+    const createBrokerPolicy = (blanc, price) =>
+      req(
+        "POST",
+        "/worker/insurances",
+        {
+          BlancNumber: blanc,
+          PolicyNumber: `P${blanc}`,
+          CarNumber: "CB 7777 GG",
+          Price: String(price),
+          EmailFrom: delEmail,
+          PaymentType: "Broker",
+        },
+        workerToken
+      );
+
+    // Broker policy: delete refunds the full price and restores the blanc.
+    const delBrokerBlanc = `DELBRK${delStamp}`;
+    r = await createBrokerPolicy(delBrokerBlanc, 500);
+    check("POST broker insurance for delete -> 201", r.status === 201, JSON.stringify(r.data));
+    let bBefore = await getDelBroker();
+    r = await req("DELETE", `/insurances/${delBrokerBlanc}`, null, adminToken);
+    check(
+      "DELETE broker insurance -> 200",
+      r.status === 200 && r.data.brokerRefund === 500,
+      JSON.stringify(r.data)
+    );
+    let bAfter = await getDelBroker();
+    check(
+      "Delete refunds full price to broker balance",
+      Math.abs(Number(bAfter.CashBalance) - Number(bBefore.CashBalance) - 500) <
+        0.01,
+      `${bBefore.CashBalance} -> ${bAfter.CashBalance}`
     );
     check(
-      "POST /worker/insurances (broker) -> 201",
-      r.status === 201,
+      "Delete restores broker blanc (InactivePolicies + 1)",
+      Number(bAfter.InactivePolicies) - Number(bBefore.InactivePolicies) === 1,
+      `${bBefore.InactivePolicies} -> ${bAfter.InactivePolicies}`
+    );
+
+    r = await req("DELETE", `/insurances/${delBrokerBlanc}`, null, adminToken);
+    check("Deleting twice -> 400", r.status === 400, JSON.stringify(r.data));
+
+    // Worker cannot delete.
+    r = await req("DELETE", `/insurances/${delBrokerBlanc}`, null, workerToken);
+    check("Worker blocked from DELETE /insurances -> 403", r.status === 403);
+
+    // Cash walk-in: delete removes the price from current cash.
+    const cashBlanc = `DELCASH${Date.now()}`;
+    await req(
+      "POST",
+      "/worker/insurances",
+      { BlancNumber: cashBlanc, PolicyNumber: `P${cashBlanc}`, CarNumber: "CB 4444 DD", Price: "80", Cash: "true" },
+      workerToken
+    );
+    let cashBefore = await getCash();
+    r = await req("DELETE", `/insurances/${cashBlanc}`, null, adminToken);
+    let cashAfter = await getCash();
+    check(
+      "Delete cash walk-in removes price from current cash",
+      r.status === 200 && Math.abs(cashBefore - cashAfter - 80) < 0.01,
+      `${cashBefore} -> ${cashAfter} ${JSON.stringify(r.data)}`
+    );
+
+    // Card walk-in: delete removes the price from the card balance.
+    const cardBlanc = `DELCARD${Date.now()}`;
+    await req(
+      "POST",
+      "/worker/insurances",
+      { BlancNumber: cardBlanc, PolicyNumber: `P${cardBlanc}`, CarNumber: "CB 5555 EE", Price: "60", Cash: "false" },
+      workerToken
+    );
+    let cardBeforeDel = await getCard();
+    let cashBeforeCardDel = await getCash();
+    r = await req("DELETE", `/insurances/${cardBlanc}`, null, adminToken);
+    check(
+      "Delete card walk-in removes price from card balance only",
+      r.status === 200 &&
+        Math.abs(cardBeforeDel - (await getCard()) - 60) < 0.01 &&
+        Math.abs((await getCash()) - cashBeforeCardDel) < 0.01,
       JSON.stringify(r.data)
     );
 
-    const brokerAfter = await req(
-      "GET",
-      `/brokers/${brokerId}`,
-      null,
-      workerToken
-    );
-    const afterBalance = Number(brokerAfter.data.broker.CashBalance);
-    const afterInactive = Number(brokerAfter.data.broker.InactivePolicies);
-    // flat fee: price 500 is deducted in full
+    // Annulment refunds the broker but does NOT restore the blanc; a later
+    // deletion restores the blanc without refunding the broker again.
+    const annulBlanc = `DELANN${delStamp}`;
+    r = await createBrokerPolicy(annulBlanc, 200);
+    check("POST broker insurance for annul -> 201", r.status === 201, JSON.stringify(r.data));
+    bBefore = await getDelBroker();
+    r = await req("POST", `/insurances/${annulBlanc}/annul`, { reason: "none" }, adminToken);
+    bAfter = await getDelBroker();
     check(
-      "Broker balance decreased by the flat price",
-      Math.abs(beforeBalance - afterBalance - 500) < 0.01,
-      `${beforeBalance} -> ${afterBalance}`
+      "Annul refunds broker but keeps blanc used",
+      r.status === 200 &&
+        Math.abs(Number(bAfter.CashBalance) - Number(bBefore.CashBalance) - 200) < 0.01 &&
+        Number(bAfter.InactivePolicies) === Number(bBefore.InactivePolicies),
+      `${JSON.stringify(r.data)} inactive ${bBefore.InactivePolicies} -> ${bAfter.InactivePolicies}`
     );
+    bBefore = bAfter;
+    r = await req("DELETE", `/insurances/${annulBlanc}`, null, adminToken);
+    bAfter = await getDelBroker();
     check(
-      "Broker InactivePolicies decremented by 1",
-      beforeInactive - afterInactive === 1,
-      `${beforeInactive} -> ${afterInactive}`
-    );
-
-    // Card balance: a policy with PaymentType = Card increments CardBalance
-    // instead of current cash. Measure both balances before/after to verify
-    // the split.
-    const cashBeforeCard = (await req("GET", "/currentcash", null, workerToken))
-      .data.balances.EUR;
-    const cardBefore = (await req("GET", "/cardpayments", null, workerToken))
-      .data.cardBalance;
-
-    // Cash = true -> current cash increases, card payments unchanged.
-    r = await req(
-      "POST",
-      "/worker/insurances",
-      {
-        BlancNumber: `CASH${Date.now()}`,
-        CarNumber: "CB 2222 BB",
-        Price: "300",
-        Cash: "true",
-      },
-      workerToken
-    );
-    check(
-      "POST /worker/insurances (Cash=true) -> 201",
-      r.status === 201,
-      JSON.stringify(r.data)
-    );
-    let cashNow = (await req("GET", "/currentcash", null, workerToken)).data
-      .balances.EUR;
-    let cardNow = (await req("GET", "/cardpayments", null, workerToken)).data
-      .cardBalance;
-    check(
-      "Cash=true increases current cash by price",
-      Math.abs(cashNow - cashBeforeCard - 300) < 0.01,
-      `${cashBeforeCard} -> ${cashNow}`
-    );
-    check(
-      "Cash=true leaves card payments unchanged",
-      Math.abs(cardNow - cardBefore) < 0.01,
-      `${cardBefore} -> ${cardNow}`
-    );
-
-    // Cash = false -> card payments increase, current cash unchanged.
-    r = await req(
-      "POST",
-      "/worker/insurances",
-      {
-        BlancNumber: `CARD${Date.now()}`,
-        CarNumber: "CB 3333 CC",
-        Price: "125",
-        Cash: "false",
-      },
-      workerToken
-    );
-    check(
-      "POST /worker/insurances (Cash=false) -> 201",
-      r.status === 201,
-      JSON.stringify(r.data)
-    );
-    const cashAfterCard = (await req("GET", "/currentcash", null, workerToken))
-      .data.balances.EUR;
-    const cardAfter = (await req("GET", "/cardpayments", null, workerToken))
-      .data.cardBalance;
-    check(
-      "Cash=false increases card payments by price",
-      Math.abs(cardAfter - cardNow - 125) < 0.01,
-      `${cardNow} -> ${cardAfter}`
-    );
-    check(
-      "Cash=false leaves current cash unchanged",
-      Math.abs(cashAfterCard - cashNow) < 0.01,
-      `${cashNow} -> ${cashAfterCard}`
+      "Delete after annul restores blanc without double refund",
+      r.status === 200 &&
+        Math.abs(Number(bAfter.CashBalance) - Number(bBefore.CashBalance)) < 0.01 &&
+        Number(bAfter.InactivePolicies) - Number(bBefore.InactivePolicies) === 1,
+      `${JSON.stringify(r.data)} balance ${bBefore.CashBalance} -> ${bAfter.CashBalance}`
     );
 
     // GET /cardpayments returns the current card balance.

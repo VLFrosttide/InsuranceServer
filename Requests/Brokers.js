@@ -146,10 +146,13 @@ const decreaseBrokerForInsurance = (module.exports.decreaseBrokerForInsurance =
 
 /**
  * Restore a broker's balance after an insurance policy linked to it is
- * annulled: increases CashBalance by the full price (the inverse
- * of {@link decreaseBrokerForInsurance}) and increments InactivePolicies by 1
- * since the policy is no longer counted as active. Runs inside the caller's
- * transaction.
+ * annulled: increases CashBalance by the full price (the money side of the
+ * inverse of {@link decreaseBrokerForInsurance}).
+ *
+ * InactivePolicies is intentionally NOT touched: the blanc of an annulled
+ * policy has been used up and is not given back to the broker. Only a
+ * deletion restores the blanc (see {@link restoreBrokerForDeletion}). Runs
+ * inside the caller's transaction.
  *
  * @param {import("mysql2/promise").Connection} conn
  * @param {number} brokerId
@@ -166,14 +169,46 @@ const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
     const priceNum = toDecimal(price) || 0;
 
     await conn.query(
-      `UPDATE brokers
-            SET CashBalance = CashBalance + ?,
-                InactivePolicies = InactivePolicies + 1
-          WHERE id = ?`,
+      "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
       [priceNum, brokerId]
     );
 
     return priceNum;
+  });
+
+/**
+ * Undo a policy's effect on its broker when the policy is deleted: refunds
+ * `amount` to CashBalance and gives the blanc back (InactivePolicies + 1) -
+ * the full inverse of {@link decreaseBrokerForInsurance}.
+ *
+ * `amount` is normally the full price. For a policy that was annulled before
+ * being deleted the annulment already refunded the price, so the caller
+ * passes 0 and only the blanc is restored. Runs inside the caller's
+ * transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @param {number|string} amount
+ * @returns {Promise<number|null>} The amount refunded, or null if broker missing.
+ */
+const restoreBrokerForDeletion = (module.exports.restoreBrokerForDeletion =
+  async function restoreBrokerForDeletion(conn, brokerId, amount) {
+    const [[broker]] = await conn.query("SELECT id FROM brokers WHERE id = ?", [
+      brokerId,
+    ]);
+    if (!broker) return null;
+
+    const amountNum = Math.max(0, toDecimal(amount) || 0);
+
+    await conn.query(
+      `UPDATE brokers
+            SET CashBalance = CashBalance + ?,
+                InactivePolicies = InactivePolicies + 1
+          WHERE id = ?`,
+      [amountNum, brokerId]
+    );
+
+    return amountNum;
   });
 
 /**
@@ -253,7 +288,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       [id]
     );
     const [insurances] = await DBConnection.query(
-      "SELECT COUNT(*) AS n FROM insurance WHERE BrokerId = ?",
+      "SELECT COUNT(*) AS n FROM insurance WHERE BrokerId = ? AND Deleted = 0",
       [id]
     );
     broker.emails = emails.map((r) => r.Email);
@@ -293,7 +328,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         "SELECT BrokerId, Email FROM broker_emails ORDER BY BrokerId, id"
       );
       const [insuranceRows] = await DBConnection.query(
-        "SELECT BrokerId, COUNT(*) AS n FROM insurance GROUP BY BrokerId"
+        "SELECT BrokerId, COUNT(*) AS n FROM insurance WHERE Deleted = 0 GROUP BY BrokerId"
       );
 
       const emailsByBroker = new Map();

@@ -6,6 +6,7 @@
 //   node --env-file=.env db/setup.js
 //
 // Requires .env to contain DB_PASSWORD (MySQL root password).
+
 const mysql = require("mysql2/promise");
 const { seedBrokersFromInfo } = require("./BrokerInfo.js");
 

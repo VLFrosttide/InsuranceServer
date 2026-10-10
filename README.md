@@ -88,6 +88,21 @@ database for record-keeping but is excluded from `/admin/insurances` (unless
 `?includeDeleted=1` is passed), `/insurances`, and `/client/insurances` — and
 therefore is no longer picked up by reconciliation/report parsing.
 
+Deleting and annulling are different operations:
+
+- **Annul** (`POST /insurances/:blancNumber/annul`) refunds the price minus a
+  fault fee through the original payment channel and refunds the full price to
+  the broker's balance for email policies. The blanc stays used up
+  (`InactivePolicies` is not changed).
+- **Delete** undoes the policy completely: walk-in (Cash/Card) money is removed
+  from current cash / the card balance and Total cash; for email policies the
+  full price is refunded to the broker's balance, removed from the Broker part
+  of Total cash, and the blanc is given back (`InactivePolicies + 1`). Deleting
+  an already-annulled policy removes only the kept annulment fee, does not
+  refund the broker again, but still restores the blanc. If current cash
+  cannot cover the removal, the delete is rejected with `400` and nothing
+  changes.
+
 Use case: the core business entity — created by workers, listed for clients,
 edited by admins/workers, and linked to a broker and to the current-cash
 ledger. `BlancNumber` is the natural unique key used for create/update/duplicate

@@ -21,6 +21,7 @@ const {
   resolveBrokerByEmail,
   decreaseBrokerForInsurance,
   restoreBrokerForAnnulment,
+  restoreBrokerForDeletion,
   adjustBrokerForPriceChange,
 } = require("./Brokers.js");
 const { sendReply } = require("../Mail/SendReply.js");
@@ -153,6 +154,74 @@ function parseDurationDays(value) {
   if (str.includes("месец") || str.includes("month")) return num * 30;
   return num; // days
 }
+
+// Real-world UTC offsets range from UTC-12:00 to UTC+14:00.
+const MIN_TZ_OFFSET_MINUTES = -12 * 60;
+const MAX_TZ_OFFSET_MINUTES = 14 * 60;
+
+/**
+ * Validate the creation time computed by the client: the worker's local
+ * wall-clock time as a MySQL DATETIME string ("YYYY-MM-DD HH:MM:SS"). A "T"
+ * separator is accepted as well. Impossible dates/times (2026-02-31, 25:00)
+ * are rejected.
+ *
+ * @param {unknown} value
+ * @returns {string|null} The normalised "YYYY-MM-DD HH:MM:SS", or null.
+ */
+function parseClientDateTime(value) {
+  if (typeof value !== "string") return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/.exec(
+    value.trim()
+  );
+  if (!m) return null;
+  const [y, mo, d, h, mi, s] = m.slice(1).map(Number);
+  const t = new Date(Date.UTC(y, mo - 1, d, h, mi, s));
+  if (
+    t.getUTCFullYear() !== y ||
+    t.getUTCMonth() !== mo - 1 ||
+    t.getUTCDate() !== d ||
+    t.getUTCHours() !== h ||
+    t.getUTCMinutes() !== mi ||
+    t.getUTCSeconds() !== s
+  ) {
+    return null;
+  }
+  return `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`;
+}
+module.exports.parseClientDateTime = parseClientDateTime;
+
+/**
+ * Fallback creation time for clients that do not send CreationDate yet: the
+ * server clock shifted by the client's UTC offset in minutes (east positive,
+ * e.g. +180 for UTC+3), as a MySQL DATETIME string. A missing/invalid offset
+ * falls back to UTC. Never uses the database's NOW(), which runs in UTC on
+ * the hosting.
+ *
+ * @param {unknown} offsetMinutes
+ * @param {Date} [now]
+ * @returns {string}
+ */
+function clientLocalDateTime(offsetMinutes, now = new Date()) {
+  let offset = Number(offsetMinutes);
+  if (
+    !Number.isFinite(offset) ||
+    offset < MIN_TZ_OFFSET_MINUTES ||
+    offset > MAX_TZ_OFFSET_MINUTES
+  ) {
+    offset = 0;
+  }
+  const local = new Date(now.getTime() + Math.round(offset) * 60000);
+  const p = (n) => String(n).padStart(2, "0");
+  return (
+    `${local.getUTCFullYear()}-${p(local.getUTCMonth() + 1)}-${p(
+      local.getUTCDate()
+    )} ` +
+    `${p(local.getUTCHours())}:${p(local.getUTCMinutes())}:${p(
+      local.getUTCSeconds()
+    )}`
+  );
+}
+module.exports.clientLocalDateTime = clientLocalDateTime;
 
 /**
  * Create the tiered router.
@@ -549,6 +618,22 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         return res.status(400).json({ error: "PolicyNumber is required" });
       }
 
+      // The creation time is computed by the CLIENT (the worker's local
+      // wall-clock time) and stored as sent. Older clients that do not send it
+      // fall back to the server clock shifted by their TzOffset.
+      const sentCreationDate = b.CreationDate ?? b.creationDate;
+      let creationDate;
+      if (sentCreationDate !== undefined && sentCreationDate !== null && sentCreationDate !== "") {
+        creationDate = parseClientDateTime(sentCreationDate);
+        if (!creationDate) {
+          return res.status(400).json({
+            error: "CreationDate must be in YYYY-MM-DD HH:MM:SS format",
+          });
+        }
+      } else {
+        creationDate = clientLocalDateTime(b.TzOffset ?? b.tzOffset ?? null);
+      }
+
       // An email policy is paid from its broker's balance, so the sender must
       // resolve to a broker. Without one there is no balance to charge.
       let broker = null;
@@ -577,9 +662,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               (Author, CreationDate, PolicyNumber, BlancNumber, CarNumber, Price,
                CurrencyType, Duration, Broker, Branch, Otomobil, PaymentType,
                StartDate, BrokerId, NonTurk, CardFee)
-           VALUES (?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             req.user.username,
+            creationDate,
             policyNumber,
             blancNumber,
             String(carNumber).trim(),
@@ -1238,6 +1324,18 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // every normal list/search endpoint (/admin/insurances, /insurances,
   // /client/insurances) and therefore from reconciliation/report parsing.
   // Admin-only; a policy can only be deleted once.
+  //
+  // Unlike an annulment (which refunds the price minus a fee and keeps the
+  // blanc used up), a deletion undoes the policy completely, as if it had
+  // never been created:
+  //   - Walk-in (Cash/Card): whatever the policy still contributes is removed
+  //     from current cash / the card balance and from Total cash.
+  //   - Broker (email): the full price is refunded to the broker's balance,
+  //     it is removed from the Broker part of Total cash, and the blanc is
+  //     given back to the broker (InactivePolicies + 1).
+  // If the policy was annulled first, the annulment already refunded part of
+  // the money; only what is still counted (the kept annulment fee) is removed,
+  // and the broker is not refunded a second time - but the blanc is restored.
   router.delete(
     "/insurances/:blancNumber",
     auth,
@@ -1259,15 +1357,64 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           return res.status(400).json({ error: "Insurance already deleted" });
         }
 
-        await DBConnection.query(
-          `UPDATE insurance
-              SET Deleted = 1, DeletedAt = NOW(), DeletedBy = ?
-            WHERE BlancNumber = ?`,
-          [req.user.username, blancNumber]
-        );
+        const price = toDecimal(insurance.Price) || 0;
+        // What the policy still contributes to its payment channel: the full
+        // price, or - after an annulment refunded `price - fee` - only the
+        // part of the fee that was kept.
+        let counted = price;
+        if (insurance.Annulled) {
+          const fee = toDecimal(insurance.AnnulFee) || 0;
+          const refunded = Math.max(0, Math.round((price - fee) * 100) / 100);
+          counted = Math.round((price - refunded) * 100) / 100;
+        }
+        const brokerRefund =
+          isBrokerLinked(insurance) && !insurance.Annulled ? price : 0;
 
-        res.json({ message: "Insurance deleted", blancNumber });
+        await DBConnection.withTransaction(async (conn) => {
+          // Remove the money through the channel the policy was paid through.
+          // Email policies go through the Broker channel and never touch
+          // current cash.
+          if (counted > 0) {
+            await movePolicyMoney(conn, effectivePayment(insurance), "reduce", {
+              branch: insurance.Branch,
+              username: req.user.username,
+              amount: counted,
+              reason: `Delete ${blancNumber}`,
+              currency: insurance.CurrencyType,
+            });
+          }
+
+          // Refund the broker (unless an annulment already did) and give the
+          // blanc back.
+          if (isBrokerLinked(insurance)) {
+            await restoreBrokerForDeletion(
+              conn,
+              insurance.BrokerId,
+              brokerRefund
+            );
+          }
+
+          await conn.query(
+            `UPDATE insurance
+                SET Deleted = 1, DeletedAt = NOW(), DeletedBy = ?
+              WHERE BlancNumber = ?`,
+            [req.user.username, blancNumber]
+          );
+        });
+
+        res.json({
+          message: "Insurance deleted",
+          blancNumber,
+          removed: counted,
+          brokerRefund,
+        });
       } catch (err) {
+        // The cash drawer cannot fund the removal (the money was already paid
+        // out or reset). The transaction was rolled back, so nothing changed.
+        const msg = (err && err.message) || "";
+        if (msg.includes("insufficient")) {
+          return res.status(400).json({ error: msg });
+        }
         console.error("Insurance deletion failed:", err);
         res.status(500).json({ error: "Failed to delete insurance" });
       }
