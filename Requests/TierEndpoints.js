@@ -1335,8 +1335,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // broker's balance, if any. The caller chooses WHO pays the fee (or "none"
   // for no fault, which is free); the fee itself (1 or 9, see computeAnnulFee)
   // is decided here from the policy's start date and is never taken from the
-  // request. A policy can only be annulled once. Admins (role 1) can annul any
-  // policy; workers (role 2) can only annul policies they created themselves.
+  // request. A broker-linked policy gets the full price back unless the broker
+  // is the one at fault, in which case only the price minus the fee (the
+  // partial refund) is returned to the broker's balance. A policy can only be
+  // annulled once. Admins (role 1) can annul any policy; workers (role 2) can
+  // only annul policies they created themselves.
   router.post(
     "/insurances/:blancNumber/annul",
     auth,
@@ -1417,10 +1420,14 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           }
 
           if (isBrokerLinked(insurance)) {
+            // The broker gets the full price back unless the broker itself is
+            // at fault, in which case the annulment fee is kept back and only
+            // the partial refund (price - fee) returns to the broker's balance.
+            const brokerRefund = payer === "broker" ? refund : price;
             await restoreBrokerForAnnulment(
               conn,
               insurance.BrokerId,
-              insurance.Price
+              brokerRefund
             );
           }
 

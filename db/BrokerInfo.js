@@ -807,6 +807,12 @@ const BrokerData = {
   Sevgin: Sevgin,
   Barutcu: Barutcu,
   Varna: Varna,
+
+  // Walk-in-only border crossings. They take no email policies, so their
+  // broker_emails stay empty; they exist as brokers so admins can hand them
+  // blanc batches and track how many blancs each crossing still holds.
+  Lesovo: [],
+  KapAndreevo: [],
 };
 
 /**
@@ -843,9 +849,11 @@ async function seedBrokerTariffsIfMissing(db, brokerId, brokerName) {
   return inserted;
 }
 
-// The Pricing entries that are not brokers (they have no email list in
-// BrokerData) are the walk-in prices of the branches. Map each of them to the
-// branch name selected at login (see renderer/LoginPage/index.html).
+// Walk-in (branch) prices, keyed by the branch name selected at login (see
+// renderer/LoginPage/index.html). Nikolay is the Harmanli office and is not a
+// broker. Lesovo / KapAndreevo are also walk-in-only brokers (see BrokerData:
+// their email lists are empty), but their branch prices stay here in
+// branch_tariffs, separate from the broker tariffs in broker_tariffs.
 const BranchPricingKeys = {
   "ГКПП Капитан Андреево": "KapAndreevo",
   "ГКПП Лесово": "Lesovo",
