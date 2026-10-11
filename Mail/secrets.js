@@ -92,26 +92,34 @@ module.exports.loadTokens = function loadTokens(suffix = "") {
   return tokens;
 };
 
-// Writes refreshed/updated tokens back into the .env file so tokens only ever
-// live in .env (never in source control). Existing comments are preserved.
-module.exports.persistTokens = function persistTokens(tokens, suffix = "") {
-  if (!tokens || typeof tokens !== "object") return;
-  if (!fs.existsSync(ENV_PATH)) return;
+// `GMAIL_EXPIRY_DATE` is normally a Unix timestamp in milliseconds (as
+// google-auth-library stores it in `expiry_date`), but a hand-pasted seconds
+// timestamp is easy to mistake for it. Normalize either to a real Date so the
+// console log always shows an actual calendar date.
+function parseExpiryDate(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  // Seconds timestamps are ~1.7e9; millisecond timestamps are ~1.7e12 for
+  // dates in the current era, so anything below 1e12 is treated as seconds.
+  const ms = n < 1e12 ? n * 1000 : n;
+  const date = new Date(ms);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+module.exports.parseExpiryDate = parseExpiryDate;
 
-  const updates = {};
-  for (const [tokenKey, envKey] of Object.entries(TOKEN_ENV_KEYS)) {
-    const value = tokens[tokenKey];
-    if (value !== undefined && value !== null && value !== "") {
-      updates[envKey + suffix] = String(value);
-    }
-  }
-  if (Object.keys(updates).length === 0) return;
+// Shared low-level helper that writes/updates a set of `.env` variables,
+// preserving existing lines and appending any new keys. Returns silently if the
+// file is missing or read-only so token bookkeeping never crashes the process.
+function upsertEnvValues(updates) {
+  if (!updates || Object.keys(updates).length === 0) return;
+  if (!fs.existsSync(ENV_PATH)) return;
 
   let lines;
   try {
     lines = fs.readFileSync(ENV_PATH, "utf8").split(/\r?\n/);
   } catch (err) {
-    console.error("Could not read .env to persist Gmail tokens:", err);
+    console.error("Could not read .env to persist Gmail values:", err);
     return;
   }
   const seen = new Set();
@@ -133,15 +141,29 @@ module.exports.persistTokens = function persistTokens(tokens, suffix = "") {
     fs.writeFileSync(ENV_PATH, updated.join("\n"));
   } catch (err) {
     // On some hosting setups `.env` is read-only (secrets are injected through
-    // the control panel instead). The refreshed tokens still live in memory for
-    // the lifetime of the process, so not being able to persist them must never
+    // the control panel instead). The values still live in memory for the
+    // lifetime of the process, so not being able to persist them must never
     // crash the refresh/poll loop.
     console.warn(
-      "Could not persist refreshed Gmail tokens to .env (continuing with the " +
-        "in-memory tokens):",
+      "Could not persist values to .env (continuing with in-memory values):",
       err && err.message ? err.message : err
     );
   }
+}
+
+// Writes refreshed/updated tokens back into the .env file so tokens only ever
+// live in .env (never in source control). Existing comments are preserved.
+module.exports.persistTokens = function persistTokens(tokens, suffix = "") {
+  if (!tokens || typeof tokens !== "object") return;
+
+  const updates = {};
+  for (const [tokenKey, envKey] of Object.entries(TOKEN_ENV_KEYS)) {
+    const value = tokens[tokenKey];
+    if (value !== undefined && value !== null && value !== "") {
+      updates[envKey + suffix] = String(value);
+    }
+  }
+  upsertEnvValues(updates);
 };
 
 // Removes the GMAIL_* token variables for one account from both the running
@@ -151,7 +173,6 @@ module.exports.clearTokens = function clearTokens(suffix = "") {
   for (const baseEnvKey of Object.values(TOKEN_ENV_KEYS)) {
     delete process.env[baseEnvKey + suffix];
   }
-
   if (!fs.existsSync(ENV_PATH)) return;
 
   const names = new Set(

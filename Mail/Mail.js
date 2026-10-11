@@ -7,9 +7,11 @@ const {
   hasCredentials,
   clearTokens,
   loadTokens,
+  parseExpiryDate,
 } = require("./secrets.js");
 const Authorize = require("./Authorize.js");
 const mailStore = require("./mailStore.js");
+const { startWeeklyRefreshReminder } = require("./renewalReminder.js");
 const { notifyEmailRead } = require("../Users/websocket.js");
 
 let MailPhotos = [];
@@ -147,7 +149,10 @@ async function authorizeAccount(account) {
       await Authorize(OAuthClient, account, redirectUri);
       const gmail = google.gmail({ version: "v1", auth: OAuthClient });
       const Profile = await gmail.users.getProfile({ userId: "me" });
-      return { gmail, email: Profile.data.emailAddress };
+      const expiryDate = parseExpiryDate(
+        OAuthClient.credentials && OAuthClient.credentials.expiry_date
+      );
+      return { gmail, email: Profile.data.emailAddress, expiryDate };
     } catch (err) {
       err.__insHadStoredTokens = hadStoredTokensBefore;
       throw err;
@@ -223,11 +228,25 @@ async function init() {
       );
     }
   }
+
+  // Weekly Saturday reminder to refresh the Gmail OAuth tokens before Google's
+  // testing-mode refresh tokens (which expire after 7 days) stop working.
+  startWeeklyRefreshReminder();
 }
 
 async function registerAccount(account) {
-  const { gmail, email } = await authorizeAccount(account);
+  const { gmail, email, expiryDate } = await authorizeAccount(account);
   console.log(`Profile log (${account}): `, email);
+
+  // Surface the token expiry as a real calendar date on the server console.
+  if (expiryDate) {
+    console.log(
+      `Gmail token expiry (${account}): ${expiryDate.toISOString()} ` +
+        `(${expiryDate.toLocaleString()})`
+    );
+  } else {
+    console.warn(`Gmail token expiry (${account}): unknown`);
+  }
 
   // Register this inbox's client so completion can mark the message read
   // and replies can be sent against the correct account.

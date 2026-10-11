@@ -278,6 +278,9 @@ async function start() {
 
     // Let the mail pipeline check senders against the broker emails in the DB.
     require("./Mail/brokerSenders.js").setDb(DBConnection);
+    // Let the Gmail token-refresh reminder persist its last-sent Saturday in
+    // the DB so a restart on the same Saturday does not send a duplicate.
+    require("./Mail/renewalReminder.js").setDb(DBConnection);
     startGmailPolling();
 
     console.log(`Server listening on http://${HOST}:${PORT}`);

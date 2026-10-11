@@ -1,5 +1,9 @@
 const { SCOPES } = require("./constants.js");
-const { loadTokens, persistTokens, accountSuffix } = require("./secrets.js");
+const {
+  loadTokens,
+  persistTokens,
+  accountSuffix,
+} = require("./secrets.js");
 const obtainAuthCode = require("./ObtainCode.js");
 
 // Merely *referencing* `process.stdin` lazily constructs the underlying
@@ -44,7 +48,7 @@ async function Authorize(MyClient, Account, RedirectUri) {
     // interactive consent flow.
     MyClient.forceRefreshOnFailure = true;
     await MyClient.refreshAccessToken();
-    console.log("Refreshed access token for account: " + Account);
+    console.log(`Refreshed access token for account: ${Account}`);
     return MyClient;
   }
 

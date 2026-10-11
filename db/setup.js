@@ -361,6 +361,18 @@ async function runSetup(config = {}) {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
 
+  // Gmail token refresh reminder: records which Saturday the reminder was last
+  // sent so a server restart on the same Saturday does not send it again.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS gmail_token_reminder (
+      id INT NOT NULL,
+      LastRemindedSaturday VARCHAR(10) NULL,
+      UpdatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  `);
+  await db.query("INSERT IGNORE INTO gmail_token_reminder (id) VALUES (1)");
+
   // The legacy `tasks` table was only a demo work-item store; it is no longer
   // required by the server, so drop it on existing databases.
   await db.query("DROP TABLE IF EXISTS tasks");
