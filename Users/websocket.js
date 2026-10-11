@@ -13,6 +13,105 @@ const EMAIL_UPDATE_ROLE = "2";
 // reconnect or the next page time to claim the email itself.
 const RELEASE_GRACE_MS = Number(process.env.EMAIL_RELEASE_GRACE_MS) || 3000;
 
+// ---------------------------------------------------------------------------
+// Worker presence board.
+//
+// A worker is "online" while they hold at least one authenticated WebSocket.
+// Their status is one of:
+//   "online"  (green)  online and on the PC
+//   "working" (orange) busy working on a form
+//   "afk"     (red)    online but away from keyboard
+// The afk threshold is enforced client-side; this module only stores and
+// re-broadcasts the status it is told.
+// ---------------------------------------------------------------------------
+
+// Role whose members appear on the presence board.
+const PRESENCE_ROLE = "2";
+
+// Roles allowed to see the board (admins + workers).
+const PRESENCE_VIEWER_ROLES = new Set(["1", "2"]);
+
+// After the last connection of a worker closes, wait this long before declaring
+// them offline. This absorbs the quick socket swap when the client navigates
+// dashboard -> form -> dashboard, so the board does not flicker.
+const PRESENCE_OFFLINE_GRACE_MS =
+  Number(process.env.PRESENCE_OFFLINE_GRACE_MS) || 1500;
+
+// Valid statuses a worker may report.
+const PRESENCE_STATUSES = new Set(["online", "working", "afk"]);
+
+// username -> { username, status: "online" | "working" | "afk", updatedAt }
+const presence = new Map();
+
+function isWorkerConnected(username) {
+  if (!wss || !username) return false;
+  for (const client of wss.clients) {
+    if (
+      client.readyState === WebSocket.OPEN &&
+      client.username === username &&
+      String(client.role) === PRESENCE_ROLE
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function onlineWorkers() {
+  return Array.from(presence.values())
+    .map((entry) => ({ ...entry }))
+    .sort((a, b) => a.username.localeCompare(b.username));
+}
+
+function broadcastPresence() {
+  if (!wss) return;
+  const message = JSON.stringify({
+    type: "presence_update",
+    data: onlineWorkers(),
+  });
+  for (const client of wss.clients) {
+    if (
+      client.readyState === WebSocket.OPEN &&
+      client.username &&
+      PRESENCE_VIEWER_ROLES.has(String(client.role))
+    ) {
+      try {
+        client.send(message);
+      } catch (err) {
+        console.error("Failed to broadcast presence update:", err);
+      }
+    }
+  }
+}
+
+function ensureWorkerOnline(username) {
+  if (presence.has(username)) return;
+  presence.set(username, { username, status: "online", updatedAt: Date.now() });
+  broadcastPresence();
+}
+
+function setWorkerPresence(ws, status) {
+  if (!ws.username || String(ws.role) !== PRESENCE_ROLE) return;
+  const normalized = PRESENCE_STATUSES.has(status) ? status : "online";
+  const existing = presence.get(ws.username);
+  if (existing && existing.status === normalized) {
+    // Same status: only refresh the heartbeat timestamp, don't re-broadcast.
+    existing.updatedAt = Date.now();
+    return;
+  }
+  presence.set(ws.username, {
+    username: ws.username,
+    status: normalized,
+    updatedAt: Date.now(),
+  });
+  broadcastPresence();
+}
+
+function removeWorkerPresence(username) {
+  if (!username || isWorkerConnected(username)) return;
+  if (presence.delete(username)) broadcastPresence();
+}
+
 // Whether any currently open connection holds the claim on this email.
 function isHeldByOpenConnection(messageId) {
   if (!wss) return false;
@@ -147,24 +246,31 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
       // email on its own connection, and a brief network blip reconnects
       // within a second or two. Neither should flip the card and the Gmail
       // read state back and forth.
+      const username = ws.username;
       const claimed = Array.from(ws.claimedEmails);
       ws.claimedEmails.clear();
-      if (claimed.length === 0) return;
-      const username = ws.username;
-      setTimeout(() => {
-        for (const messageId of claimed) {
-          const email = mailStore.get(messageId);
-          if (!email) continue;
-          // Only release if this user still holds the claim and has not
-          // re-claimed it on a newer connection in the meantime. The card may
-          // also have been released/completed and claimed by someone else.
-          if (mailStore.getClaimer(messageId) !== username) continue;
-          if (isHeldByOpenConnection(messageId)) continue;
-          releaseEmail(email, messageId).catch((err) => {
-            console.error("Failed to release email of closed connection:", err);
-          });
-        }
-      }, RELEASE_GRACE_MS);
+      if (claimed.length > 0) {
+        setTimeout(() => {
+          for (const messageId of claimed) {
+            const email = mailStore.get(messageId);
+            if (!email) continue;
+            // Only release if this user still holds the claim and has not
+            // re-claimed it on a newer connection in the meantime. The card may
+            // also have been released/completed and claimed by someone else.
+            if (mailStore.getClaimer(messageId) !== username) continue;
+            if (isHeldByOpenConnection(messageId)) continue;
+            releaseEmail(email, messageId).catch((err) => {
+              console.error("Failed to release email of closed connection:", err);
+            });
+          }
+        }, RELEASE_GRACE_MS);
+      }
+
+      // Remove the worker from the presence board once no other authenticated
+      // connection remains (see PRESENCE_OFFLINE_GRACE_MS).
+      if (username && String(ws.role) === PRESENCE_ROLE) {
+        setTimeout(() => removeWorkerPresence(username), PRESENCE_OFFLINE_GRACE_MS);
+      }
     });
   });
 
@@ -240,6 +346,11 @@ async function handleMessage(ws, data) {
         // Branch the worker selected at login; used to restrict which
         // brokers' emails this worker may see.
         ws.branch = typeof msg.branch === "string" ? msg.branch : "";
+        // Register the worker on the presence board (unless they are already
+        // online from a connection still within its offline grace period).
+        if (String(ws.role) === PRESENCE_ROLE) {
+          ensureWorkerOnline(username);
+        }
         ws.send(JSON.stringify({ type: "auth_ok", username }));
       } else {
         ws.send(
@@ -255,6 +366,11 @@ async function handleMessage(ws, data) {
     }
   } else if (msg.type === "ping") {
     ws.send(JSON.stringify({ type: "pong" }));
+  } else if (msg.type === "presence") {
+    setWorkerPresence(ws, msg.status);
+  } else if (msg.type === "list_presence") {
+    if (!ws.username) return;
+    ws.send(JSON.stringify({ type: "presence_update", data: onlineWorkers() }));
   } else if (msg.type === "list_emails") {
     if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
       ws.send(JSON.stringify({ type: "list_emails", data: [] }));
