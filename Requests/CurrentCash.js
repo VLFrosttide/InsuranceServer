@@ -912,6 +912,78 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
     }
   });
 
+  // GET /currentcash/daily — country-wide daily report for the day in the
+  // query string. It is independent of the branch selector above: insurances
+  // and cash movements are counted across ALL branches.
+  //   ?date=YYYY-MM-DD  day to report on (default: the client's today)
+  //   ?tzOffset=N       client UTC offset in minutes, used to work out "today"
+  router.get("/currentcash/daily", auth, requireCashRole, async (req, res) => {
+    try {
+      const day = resolveHistoryDay(req.query.date, req.query.tzOffset);
+      if (day.error) {
+        return res.status(400).json({ error: day.error });
+      }
+
+      // Every non-deleted insurance created that day, split by channel: a
+      // broker-linked (email) policy has a BrokerId, a walk-in has none.
+      const [counts] = await DBConnection.query(
+        `SELECT
+           COUNT(*) AS total,
+           COALESCE(SUM(CASE WHEN BrokerId IS NOT NULL THEN 1 ELSE 0 END), 0) AS broker,
+           COALESCE(SUM(CASE WHEN BrokerId IS NULL THEN 1 ELSE 0 END), 0) AS walkIn
+         FROM insurance
+         WHERE Deleted = 0 AND CreationDate >= ? AND CreationDate < ?`,
+        [day.date, day.nextDate]
+      );
+
+      // Country-wide figure via the policy-number span of the day: the last
+      // policy number minus the first daily policy number (policy numbers are
+      // issued sequentially).
+      const [span] = await DBConnection.query(
+        `SELECT
+           MIN(CAST(PolicyNumber AS UNSIGNED)) AS firstPolicy,
+           MAX(CAST(PolicyNumber AS UNSIGNED)) AS lastPolicy
+         FROM insurance
+         WHERE Deleted = 0
+           AND PolicyNumber REGEXP '^[0-9]+$'
+           AND CreationDate >= ? AND CreationDate < ?`,
+        [day.date, day.nextDate]
+      );
+      const firstPolicy =
+        span[0] && span[0].firstPolicy !== null ? Number(span[0].firstPolicy) : 0;
+      const lastPolicy =
+        span[0] && span[0].lastPolicy !== null ? Number(span[0].lastPolicy) : 0;
+
+      // Total daily cash: the net cash-drawer movement of the day across all
+      // branches. Walk-in cash payments and manual increases/reductions are all
+      // recorded as cash_transactions rows, so the net is their sum.
+      const [cash] = await DBConnection.query(
+        `SELECT Currency,
+           ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
+         FROM cash_transactions
+         WHERE CreatedAt >= ? AND CreatedAt < ?
+         GROUP BY Currency`,
+        [day.date, day.nextDate]
+      );
+      const totalDailyCash = { EUR: 0, USD: 0, TRY: 0 };
+      for (const row of cash) {
+        totalDailyCash[normalizeCurrency(row.Currency)] = Number(row.Net) || 0;
+      }
+
+      res.json({
+        date: day.date,
+        totalInsurances: Number(counts[0].total) || 0,
+        brokerInsurances: Number(counts[0].broker) || 0,
+        walkInInsurances: Number(counts[0].walkIn) || 0,
+        totalDailyCash,
+        countryWideInsurances: Math.max(0, lastPolicy - firstPolicy),
+      });
+    } catch (err) {
+      console.error("CurrentCash daily report failed:", err);
+      res.status(500).json({ error: "Failed to fetch daily report" });
+    }
+  });
+
   // POST /currentcash/increase  { amount, reason, currency, branch }
   router.post(
     "/currentcash/increase",
@@ -1151,59 +1223,6 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
       }
     }
   );
-
-  // ---------------------------------------------------------------------
-  // TOTAL cash - the second record of cash flow.
-  // ---------------------------------------------------------------------
-
-  // GET /totalcash/branches — branches with any non-zero TOTAL cash (i.e. any
-  // non-zero current cash, card part or broker part).
-  router.get("/totalcash/branches", auth, requireCashRole, async (req, res) => {
-    try {
-      const [rows] = await DBConnection.query(
-        `SELECT DISTINCT Branch FROM (
-           SELECT Branch FROM current_cash WHERE CurrentCash != 0
-           UNION
-           SELECT Branch FROM total_cash WHERE CardPart != 0 OR BrokerPart != 0
-         ) AS branches ORDER BY Branch`
-      );
-
-      const branchData = {};
-      for (const row of rows) {
-        const totals = await getTotalCash(DBConnection, row.Branch);
-        const nonZero = Object.entries(totals).filter(
-          ([, value]) => Number(value) !== 0
-        );
-        if (nonZero.length > 0) {
-          branchData[row.Branch] = Object.fromEntries(nonZero);
-        }
-      }
-
-      res.json({ branches: branchData });
-    } catch (err) {
-      console.error("TotalCash branches lookup failed:", err);
-      res.status(500).json({ error: "Failed to fetch branches" });
-    }
-  });
-
-  // GET /totalcash?branch=... — the per-currency TOTAL cash (current cash +
-  // card part + broker part), the parts it is built from, and the ledger with
-  // the channel (Source) each movement came through.
-  router.get("/totalcash", auth, requireCashRole, async (req, res) => {
-    try {
-      const branch = normalizeBranch(req.query.branch);
-      const balances = await getTotalCash(DBConnection, branch);
-      const parts = await getTotalParts(DBConnection, branch);
-      const [txs] = await DBConnection.query(
-        "SELECT * FROM total_cash_transactions WHERE Branch = ? ORDER BY id DESC",
-        [branch]
-      );
-      res.json({ balances, parts, transactions: txs });
-    } catch (err) {
-      console.error("TotalCash lookup failed:", err);
-      res.status(500).json({ error: "Failed to fetch total cash" });
-    }
-  });
 
   return router;
 };
