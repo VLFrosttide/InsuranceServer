@@ -44,6 +44,7 @@ const {
   normalizeCurrency,
   normalizeBranch,
 } = require("./CurrentCash.js");
+const { getSchedule } = require("./PaymentSchedule.js");
 
 /**
  * Parse and validate a positive amount (returns null when invalid).
@@ -358,6 +359,32 @@ const biweekKey = (module.exports.biweekKey = function biweekKey(value) {
   const s = biweekStart(value);
   return s ? s.toISOString().slice(0, 10) : null;
 });
+
+/**
+ * Whether a broker is cut off for an unpaid balance: their balance was already
+ * negative at the start of the current payment period and is still negative
+ * now (i.e. they missed the last payment and have not paid it off).
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @param {number|string} currentBalance
+ * @param {{periodStart: string}} schedule
+ * @returns {Promise<boolean>}
+ */
+const resolveBrokerCutOff = (module.exports.resolveBrokerCutOff =
+  async function resolveBrokerCutOff(conn, brokerId, currentBalance, schedule) {
+    const balance = Number(currentBalance) || 0;
+    if (balance >= 0) return false;
+
+    const [[{ since }]] = await conn.query(
+      `SELECT COALESCE(SUM(Amount), 0) AS since
+         FROM broker_balance_movements
+        WHERE BrokerId = ? AND CreatedAt >= ?`,
+      [brokerId, `${schedule.periodStart} 00:00:00`]
+    );
+    const balanceAtPeriodStart = balance - Number(since);
+    return balanceAtPeriodStart < 0;
+  });
 
 // ---------------------------------------------------------------------------
 // Blanc batches
@@ -727,10 +754,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   }
 
   // Build the per-broker bi-weekly rollup: for each two-week period the number
-  // of (non-deleted) policies, their total price (revenue), and the net balance
-  // movement recorded in the broker balance ledger.
+  // of (non-deleted) policies and the net balance movement recorded in the
+  // broker balance ledger.
   async function buildBiweeklyResponse(brokerId = null) {
     await ensureMovementTable();
+    const schedule = getSchedule(new Date());
 
     const brokerWhere = brokerId === null ? "" : "WHERE id = ?";
     const brokerParams = brokerId === null ? [] : [brokerId];
@@ -745,7 +773,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         : "WHERE BrokerId = ? AND Deleted = 0";
     const insParams = brokerId === null ? [] : [brokerId];
     const [insuranceRows] = await DBConnection.query(
-      `SELECT BrokerId, CreationDate, Price FROM insurance ${insWhere}`,
+      `SELECT BrokerId, CreationDate FROM insurance ${insWhere}`,
       insParams
     );
 
@@ -769,10 +797,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         insuranceByBroker.set(r.BrokerId, new Map());
       }
       const buckets = insuranceByBroker.get(r.BrokerId);
-      const entry = buckets.get(key) || { policies: 0, revenue: 0 };
+      const entry = buckets.get(key) || { policies: 0 };
       entry.policies += 1;
-      entry.revenue =
-        Math.round((entry.revenue + Number(r.Price || 0)) * 100) / 100;
       buckets.set(key, entry);
     }
 
@@ -795,13 +821,12 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       for (const key of keys) {
         const start = new Date(`${key}T00:00:00Z`);
         const end = new Date(start.getTime() + 13 * DAY_MS);
-        const i = ins.get(key) || { policies: 0, revenue: 0 };
+        const i = ins.get(key) || { policies: 0 };
         const m = mov.get(key) || 0;
         periods.push({
           start: key,
           end: end.toISOString().slice(0, 10),
           policies: i.policies,
-          revenue: i.revenue,
           balanceMovement: Math.round(m * 100) / 100,
         });
       }
@@ -809,7 +834,26 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       b.periods = periods;
     }
 
-    return { periodLengthDays: 14, brokers };
+    // Payment cut-off status: a broker is cut off when their balance was
+    // already negative at the start of the current period and is still
+    // negative now (i.e. they missed the last payment and haven't paid).
+    const [movSinceRows] = await DBConnection.query(
+      `SELECT BrokerId, COALESCE(SUM(Amount), 0) AS since
+         FROM broker_balance_movements
+        WHERE CreatedAt >= ?
+        GROUP BY BrokerId`,
+      [`${schedule.periodStart} 00:00:00`]
+    );
+    const sinceByBroker = new Map(
+      movSinceRows.map((r) => [r.BrokerId, Number(r.since)])
+    );
+    for (const b of brokers) {
+      const balance = Number(b.CashBalance) || 0;
+      const since = sinceByBroker.get(b.id) || 0;
+      b.cutOff = balance < 0 && balance - since < 0;
+    }
+
+    return { periodLengthDays: 14, schedule, brokers };
   }
 
   // GET /brokers — list every broker with its balance, blanc batches,
@@ -986,6 +1030,57 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       } catch (err) {
         console.error("Broker biweekly lookup failed:", err);
         res.status(500).json({ error: "Failed to fetch broker biweekly data" });
+      }
+    }
+  );
+
+  // GET /brokers/:id/policies — the policies created since the last payment
+  // period (i.e. since the start of the current bi-weekly period).
+  router.get(
+    "/brokers/:id/policies",
+    auth,
+    requireBrokerView,
+    async (req, res) => {
+      try {
+        const brokerId = parseBrokerId(req.params.id);
+        if (brokerId === null) {
+          return res.status(400).json({ error: "Invalid broker id" });
+        }
+        if (req.brokerScope !== null && req.brokerScope !== brokerId) {
+          return res
+            .status(403)
+            .json({ error: "Forbidden: you can only view your own broker" });
+        }
+        const [[broker]] = await DBConnection.query(
+          `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
+          [brokerId]
+        );
+        if (!broker) {
+          return res.status(404).json({ error: "Broker not found" });
+        }
+
+        const schedule = getSchedule(new Date());
+        const [policies] = await DBConnection.query(
+          `SELECT PolicyNumber, BlancNumber, CarNumber, Price, CurrencyType,
+                  Duration, Branch, PaymentType, CreationDate, StartDate
+             FROM insurance
+            WHERE BrokerId = ? AND Deleted = 0 AND CreationDate >= ?
+            ORDER BY CreationDate DESC`,
+          [brokerId, `${schedule.periodStart} 00:00:00`]
+        );
+
+        res.json({
+          broker: {
+            id: broker.id,
+            Name: broker.Name,
+            CashBalance: broker.CashBalance,
+          },
+          schedule,
+          policies,
+        });
+      } catch (err) {
+        console.error("Broker policies lookup failed:", err);
+        res.status(500).json({ error: "Failed to fetch broker policies" });
       }
     }
   );

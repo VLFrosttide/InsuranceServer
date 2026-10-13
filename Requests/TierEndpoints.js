@@ -23,7 +23,9 @@ const {
   restoreBrokerForAnnulment,
   restoreBrokerForDeletion,
   adjustBrokerForPriceChange,
+  resolveBrokerCutOff,
 } = require("./Brokers.js");
+const { getSchedule } = require("./PaymentSchedule.js");
 const { sendReply } = require("../Mail/SendReply.js");
 
 /**
@@ -817,6 +819,30 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       const brokerName = broker ? broker.name : String(branch);
 
       const priceDecimal = toDecimal(price);
+
+      // A broker who missed the last payment and is still negative is cut off:
+      // no new insurances may be created for them until the balance is paid.
+      if (brokerId !== null) {
+        const schedule = getSchedule(new Date());
+        const [[brokerRow]] = await DBConnection.query(
+          "SELECT CashBalance FROM brokers WHERE id = ?",
+          [brokerId]
+        );
+        const currentBalance = brokerRow ? Number(brokerRow.CashBalance) : 0;
+        if (
+          await resolveBrokerCutOff(
+            DBConnection,
+            brokerId,
+            currentBalance,
+            schedule
+          )
+        ) {
+          return res.status(403).json({
+            error:
+              "Broker is cut off for an unpaid balance; new insurances cannot be created until the balance is paid",
+          });
+        }
+      }
 
       let replyError = null;
       await DBConnection.withTransaction(async (conn) => {
