@@ -8,6 +8,7 @@
 // Requires .env to contain DB_PASSWORD (MySQL root password).
 
 const mysql = require("mysql2/promise");
+const Bcrypt = require("bcryptjs");
 const { seedBrokersFromInfo } = require("./BrokerInfo.js");
 
 /**
@@ -59,6 +60,60 @@ async function seedBranchCardBalances(db) {
     `);
   }
   console.log("Split the card balance into per-branch balances");
+}
+
+/**
+ * Seed the demo accounts (admin, worker, client and a broker login linked to
+ * the "Ahmed" broker). Idempotent: existing usernames are never overwritten,
+ * so real accounts are left untouched.
+ *
+ * @param {import("mysql2/promise").Connection} db
+ */
+async function seedDemoAccounts(db) {
+  const demoAccounts = [
+    { username: "admin", password: "AdminPass123", role: 1 },
+    { username: "worker", password: "WorkerPass123", role: 2 },
+    { username: "client", password: "ClientPass123", role: 3 },
+    { username: "broker", password: "BrokerPass123", role: 3, brokerName: "Ahmed" },
+  ];
+
+  let seeded = 0;
+  for (const d of demoAccounts) {
+    const [existing] = await db.query(
+      "SELECT Username FROM users WHERE Username = ?",
+      [d.username]
+    );
+    if (existing.length > 0) continue;
+
+    let brokerId = null;
+    if (d.brokerName) {
+      const [named] = await db.query(
+        "SELECT id FROM brokers WHERE Name = ? ORDER BY id LIMIT 1",
+        [d.brokerName]
+      );
+      if (named.length > 0) {
+        brokerId = named[0].id;
+      } else {
+        const [anyBroker] = await db.query(
+          "SELECT id FROM brokers ORDER BY id LIMIT 1"
+        );
+        if (anyBroker.length > 0) brokerId = anyBroker[0].id;
+      }
+    }
+
+    const hash = await Bcrypt.hash(d.password, 12);
+    await db.query(
+      "INSERT INTO users (Username, Password, Role, Balance, BrokerId) VALUES (?, ?, ?, 0, ?)",
+      [d.username, hash, d.role, brokerId]
+    );
+    seeded++;
+  }
+
+  if (seeded > 0) {
+    console.log(
+      `Seeded ${seeded} demo account(s) (admin, worker, client, broker)`
+    );
+  }
 }
 
 async function runSetup(config = {}) {
@@ -173,6 +228,12 @@ async function runSetup(config = {}) {
       "ALTER TABLE users ADD COLUMN Status VARCHAR(20) NOT NULL DEFAULT 'active'"
     );
     console.log("Added users.Status column");
+  }
+  // Links a client (role 3) account to a broker so the broker can log in and
+  // access only their own broker data on the website.
+  if (!userColNames.has("BrokerId")) {
+    await db.query("ALTER TABLE users ADD COLUMN BrokerId INT NULL");
+    console.log("Added users.BrokerId column");
   }
   // Prune the legacy payout percentage column. No percentages are used.
   if (userColNames.has("PayoutPercentage")) {
@@ -729,6 +790,25 @@ async function runSetup(config = {}) {
      COMMENT='Blanc number ranges handed to brokers (one row per batch)'
    `);
 
+  // Ledger of every change to a broker's CashBalance (signed Amount), so the
+  // website can show each broker's balance movement per bi-weekly period.
+  await db.query(`
+     CREATE TABLE IF NOT EXISTS broker_balance_movements (
+       id INT NOT NULL AUTO_INCREMENT,
+       BrokerId INT NOT NULL,
+       Amount DECIMAL(15,2) NOT NULL,
+       Type VARCHAR(30) NOT NULL,
+       Reason VARCHAR(255) NOT NULL DEFAULT '',
+       Author VARCHAR(45) NOT NULL DEFAULT '',
+       BlancNumber VARCHAR(45) NULL,
+       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       PRIMARY KEY (id),
+       KEY idx_broker_movements_broker_time (BrokerId, CreatedAt)
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+     COMMENT='Every change to a broker CashBalance (signed Amount)'
+   `);
+
+
   // Migrate brokers to the current schema on existing databases.
   // - Rename TotalGivenPolicies -> InactivePolicies.
   // - Drop the legacy Percentage column (no percentages; flat fee per policy).
@@ -761,6 +841,58 @@ async function runSetup(config = {}) {
     await seedBrokersFromInfo(db);
   } catch (err) {
     console.warn("Broker seed from BrokerInfo.js failed:", err.message || err);
+  }
+
+  // Seed demo logins (including the broker test account) after brokers exist,
+  // so the broker account can be linked to the "Ahmed" broker.
+  await seedDemoAccounts(db);
+
+  // One-time backfill of the broker balance ledger from existing insurances,
+  // so historical bi-weekly reports already show balance movement. Only runs
+  // when the ledger is empty, so a later restart never double-counts. Manual
+  // increases/reduces that predate the ledger cannot be reconstructed.
+  const [[{ n: movementCount }]] = await db.query(
+    "SELECT COUNT(*) AS n FROM broker_balance_movements"
+  );
+  if (Number(movementCount) === 0) {
+    // Creation deducts the policy price from the broker's balance.
+    await db.query(`
+      INSERT INTO broker_balance_movements
+        (BrokerId, Amount, Type, Reason, Author, BlancNumber, CreatedAt)
+      SELECT BrokerId, -CAST(Price AS DECIMAL(15,2)), 'policy',
+             CONCAT('Insurance ', BlancNumber), COALESCE(Author, ''),
+             BlancNumber, CreationDate
+        FROM insurance
+       WHERE BrokerId IS NOT NULL
+    `);
+    // An annulment refunds the price (minus the fee when the broker was at
+    // fault, stored in AnnulReason = 'broker').
+    await db.query(`
+      INSERT INTO broker_balance_movements
+        (BrokerId, Amount, Type, Reason, Author, BlancNumber, CreatedAt)
+      SELECT BrokerId,
+             ROUND(CASE WHEN AnnulReason = 'broker'
+                   THEN CAST(Price AS DECIMAL(15,2))
+                      - COALESCE(CAST(AnnulFee AS DECIMAL(15,2)), 0)
+                   ELSE CAST(Price AS DECIMAL(15,2)) END, 2),
+             'annulment',
+             CONCAT('Annul ', BlancNumber), COALESCE(AnnulBy, ''),
+             BlancNumber, AnnulDate
+        FROM insurance
+       WHERE BrokerId IS NOT NULL AND Annulled = 1
+    `);
+    // A deletion refunds the full price only when the policy was not already
+    // annulled (an annulment would already have refunded it).
+    await db.query(`
+      INSERT INTO broker_balance_movements
+        (BrokerId, Amount, Type, Reason, Author, BlancNumber, CreatedAt)
+      SELECT BrokerId, CAST(Price AS DECIMAL(15,2)), 'deletion',
+             CONCAT('Delete ', BlancNumber), COALESCE(DeletedBy, ''),
+             BlancNumber, DeletedAt
+        FROM insurance
+       WHERE BrokerId IS NOT NULL AND Deleted = 1 AND Annulled = 0
+    `);
+    console.log("Backfilled broker_balance_movements from existing insurances");
   }
 
   console.log("Database setup complete.");

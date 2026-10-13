@@ -322,7 +322,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   router.get("/admin/users", auth, requireRole(1), async (req, res) => {
     try {
       const [users] = await DBConnection.query(
-        `SELECT Username, Role, Balance, Status
+        `SELECT Username, Role, Balance, Status, BrokerId
          FROM users
          ORDER BY Username`
       );
@@ -330,6 +330,78 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     } catch (err) {
       console.error("Admin users lookup failed:", err);
       res.status(500).json({ error: "Failed to fetch users" });
+    }
+  });
+
+  // PATCH /admin/users/:username — link/unlink a login account to a broker
+  // (BrokerId) and/or change its Status. Used so a client (role 3) account can
+  // be turned into a broker login that only sees its own broker data.
+  router.patch("/admin/users/:username", auth, requireRole(1), async (req, res) => {
+    try {
+      const username = String(req.params.username || "").trim();
+      if (!username) {
+        return res.status(400).json({ error: "Username is required" });
+      }
+
+      const [rows] = await DBConnection.query(
+        "SELECT Username FROM users WHERE Username = ?",
+        [username]
+      );
+      if (rows.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      const b = req.body || {};
+      const sets = [];
+      const params = [];
+
+      if (b.BrokerId !== undefined || b.brokerId !== undefined) {
+        const raw = b.BrokerId ?? b.brokerId;
+        let brokerId = null;
+        if (raw !== null && raw !== "" && raw !== undefined) {
+          brokerId = Number(raw);
+          if (!Number.isInteger(brokerId) || brokerId <= 0) {
+            return res
+              .status(400)
+              .json({ error: "BrokerId must be a positive integer or null" });
+          }
+          const [br] = await DBConnection.query(
+            "SELECT id FROM brokers WHERE id = ?",
+            [brokerId]
+          );
+          if (br.length === 0) {
+            return res.status(404).json({ error: "Broker not found" });
+          }
+        }
+        sets.push("BrokerId = ?");
+        params.push(brokerId);
+      }
+
+      if (b.Status !== undefined || b.status !== undefined) {
+        const status = String(b.Status ?? b.status).toLowerCase();
+        if (status !== "active" && status !== "suspended") {
+          return res
+            .status(400)
+            .json({ error: "Status must be 'active' or 'suspended'" });
+        }
+        sets.push("Status = ?");
+        params.push(status);
+      }
+
+      if (sets.length === 0) {
+        return res.status(400).json({ error: "Nothing to update" });
+      }
+
+      params.push(username);
+      await DBConnection.query(
+        `UPDATE users SET ${sets.join(", ")} WHERE Username = ?`,
+        params
+      );
+
+      res.json({ message: "User updated", username });
+    } catch (err) {
+      console.error("Admin user update failed:", err);
+      res.status(500).json({ error: "Failed to update user" });
     }
   });
 
@@ -804,7 +876,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         // marked used by the inserted row itself (inactive blancs are
         // calculated from the broker's blanc batches).
         if (brokerId !== null) {
-          await decreaseBrokerForInsurance(conn, brokerId, price);
+          await decreaseBrokerForInsurance(conn, brokerId, price, {
+            reason: blancNumber,
+            author: req.user.username,
+            blancNumber,
+          });
         }
       });
 
@@ -1289,7 +1365,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               await adjustBrokerForPriceChange(
                 conn,
                 insurance.BrokerId,
-                Math.round((newPrice - oldPrice) * 100) / 100
+                Math.round((newPrice - oldPrice) * 100) / 100,
+                {
+                  reason: `Price change ${insurance.BlancNumber}`,
+                  author: req.user.username,
+                  blancNumber: insurance.BlancNumber,
+                }
               );
             }
           }
@@ -1427,7 +1508,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             await restoreBrokerForAnnulment(
               conn,
               insurance.BrokerId,
-              brokerRefund
+              brokerRefund,
+              {
+                reason: `Annul ${blancNumber}`,
+                author: req.user.username,
+                blancNumber,
+              }
             );
           }
 
@@ -1537,7 +1623,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             await restoreBrokerForDeletion(
               conn,
               insurance.BrokerId,
-              brokerRefund
+              brokerRefund,
+              {
+                reason: `Delete ${blancNumber}`,
+                author: req.user.username,
+                blancNumber,
+              }
             );
           }
 

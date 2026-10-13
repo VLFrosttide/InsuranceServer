@@ -113,6 +113,12 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
         response.balance = DBalance;
       }
 
+      // A broker-linked account gets its broker id so the client can decide
+      // whether to allow a role-3 (client) login into the broker portal.
+      if (user.BrokerId !== null && user.BrokerId !== undefined) {
+        response.brokerId = user.BrokerId;
+      }
+
       return sendLoginResponse(res, 200, response);
     } catch (err) {
       console.error("Error during login:", err);

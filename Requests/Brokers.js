@@ -145,7 +145,7 @@ const resolveBrokerByEmail = (module.exports.resolveBrokerByEmail =
  * @returns {Promise<number|null>} The charge applied, or null if broker missing.
  */
 const decreaseBrokerForInsurance = (module.exports.decreaseBrokerForInsurance =
-  async function decreaseBrokerForInsurance(conn, brokerId, price) {
+  async function decreaseBrokerForInsurance(conn, brokerId, price, meta = {}) {
     const [[broker]] = await conn.query("SELECT id FROM brokers WHERE id = ?", [
       brokerId,
     ]);
@@ -157,6 +157,8 @@ const decreaseBrokerForInsurance = (module.exports.decreaseBrokerForInsurance =
       "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
       [priceNum, brokerId]
     );
+
+    await recordBrokerMovement(conn, brokerId, -priceNum, "policy", meta);
 
     return priceNum;
   });
@@ -178,7 +180,7 @@ const decreaseBrokerForInsurance = (module.exports.decreaseBrokerForInsurance =
  * @returns {Promise<number|null>} The amount restored, or null if broker missing.
  */
 const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
-  async function restoreBrokerForAnnulment(conn, brokerId, price) {
+  async function restoreBrokerForAnnulment(conn, brokerId, price, meta = {}) {
     const [[broker]] = await conn.query("SELECT id FROM brokers WHERE id = ?", [
       brokerId,
     ]);
@@ -190,6 +192,8 @@ const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
       "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
       [priceNum, brokerId]
     );
+
+    await recordBrokerMovement(conn, brokerId, priceNum, "annulment", meta);
 
     return priceNum;
   });
@@ -212,7 +216,7 @@ const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
  * @returns {Promise<number|null>} The amount refunded, or null if broker missing.
  */
 const restoreBrokerForDeletion = (module.exports.restoreBrokerForDeletion =
-  async function restoreBrokerForDeletion(conn, brokerId, amount) {
+  async function restoreBrokerForDeletion(conn, brokerId, amount, meta = {}) {
     const [[broker]] = await conn.query("SELECT id FROM brokers WHERE id = ?", [
       brokerId,
     ]);
@@ -225,6 +229,7 @@ const restoreBrokerForDeletion = (module.exports.restoreBrokerForDeletion =
         "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
         [amountNum, brokerId]
       );
+      await recordBrokerMovement(conn, brokerId, amountNum, "deletion", meta);
     }
 
     return amountNum;
@@ -247,7 +252,7 @@ const restoreBrokerForDeletion = (module.exports.restoreBrokerForDeletion =
  * @returns {Promise<number|null>} The delta applied, or null if broker missing.
  */
 const adjustBrokerForPriceChange = (module.exports.adjustBrokerForPriceChange =
-  async function adjustBrokerForPriceChange(conn, brokerId, delta) {
+  async function adjustBrokerForPriceChange(conn, brokerId, delta, meta = {}) {
     const d = toDecimal(delta) || 0;
     if (d === 0) return 0;
 
@@ -261,8 +266,98 @@ const adjustBrokerForPriceChange = (module.exports.adjustBrokerForPriceChange =
       [d, brokerId]
     );
 
+    await recordBrokerMovement(conn, brokerId, -d, "price_change", meta);
+
     return d;
   });
+
+// ---------------------------------------------------------------------------
+// Broker balance ledger.
+// ---------------------------------------------------------------------------
+// `broker_balance_movements` records every change to a broker's CashBalance so
+// the website can show each broker's balance movement per bi-weekly period.
+// `Amount` is signed: positive increases the balance, negative decreases it.
+// Policy-derived rows also carry the policy's BlancNumber; manual rows leave
+// it NULL.
+
+const BROKER_MOVEMENT_TABLE_SQL = `CREATE TABLE IF NOT EXISTS broker_balance_movements (
+  id INT NOT NULL AUTO_INCREMENT,
+  BrokerId INT NOT NULL,
+  Amount DECIMAL(15,2) NOT NULL,
+  Type VARCHAR(30) NOT NULL,
+  Reason VARCHAR(255) NOT NULL DEFAULT '',
+  Author VARCHAR(45) NOT NULL DEFAULT '',
+  BlancNumber VARCHAR(45) NULL,
+  CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_broker_movements_broker_time (BrokerId, CreatedAt)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+COMMENT='Every change to a broker CashBalance (signed Amount)'`;
+module.exports.BROKER_MOVEMENT_TABLE_SQL = BROKER_MOVEMENT_TABLE_SQL;
+
+/**
+ * Insert one signed broker-balance movement. Runs inside the caller's
+ * transaction (`conn`).
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @param {number|string} amount  signed delta (positive = increase)
+ * @param {string} type  e.g. "policy" | "annulment" | "deletion" |
+ *                       "price_change" | "increase" | "reduce" | "adjust"
+ * @param {{reason?: string, author?: string, blancNumber?: string,
+ *          createdAt?: Date}} [meta]
+ * @returns {Promise<number>} the (rounded) amount recorded, or 0 if skipped.
+ */
+const recordBrokerMovement = (module.exports.recordBrokerMovement =
+  async function recordBrokerMovement(conn, brokerId, amount, type, meta = {}) {
+    const amt = Math.round((toDecimal(amount) || 0) * 100) / 100;
+    if (amt === 0) return 0;
+    const createdAt =
+      meta.createdAt instanceof Date && !Number.isNaN(meta.createdAt.getTime())
+        ? meta.createdAt
+        : new Date();
+    await conn.query(
+      `INSERT INTO broker_balance_movements
+         (BrokerId, Amount, Type, Reason, Author, BlancNumber, CreatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        brokerId,
+        amt,
+        type,
+        String(meta.reason ?? ""),
+        String(meta.author ?? ""),
+        meta.blancNumber ? String(meta.blancNumber) : null,
+        createdAt,
+      ]
+    );
+    return amt;
+  });
+
+// Bi-weekly bucketing: a fixed 14-day grid anchored to Monday 2020-01-06.
+const DAY_MS = 86400000;
+const BIWEEK_EPOCH = Date.UTC(2020, 0, 6);
+
+function toDateOnly(value) {
+  if (!value) return null;
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+}
+
+const biweekStart = (module.exports.biweekStart = function biweekStart(value) {
+  const d = toDateOnly(value);
+  if (!d) return null;
+  const daysSinceMonday = (d.getUTCDay() + 6) % 7;
+  const weekStart = d.getTime() - daysSinceMonday * DAY_MS;
+  const weeks = Math.floor((weekStart - BIWEEK_EPOCH) / (7 * DAY_MS));
+  const biweek = Math.floor(weeks / 2);
+  return new Date(BIWEEK_EPOCH + biweek * 14 * DAY_MS);
+});
+
+const biweekKey = (module.exports.biweekKey = function biweekKey(value) {
+  const s = biweekStart(value);
+  return s ? s.toISOString().slice(0, 10) : null;
+});
 
 // ---------------------------------------------------------------------------
 // Blanc batches
@@ -459,6 +554,31 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   const auth = requireAuth(DBConnection);
   const requireBrokerRole = requireRole(1, 2);
 
+  // Read access to broker data. Admins (1) and workers (2) see every broker;
+  // a broker-linked client (3) sees only their own broker. Sets req.brokerScope
+  // to null (full access) or a broker id.
+  const requireBrokerView = (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    const role = String(req.user.role);
+    if (role === "1" || role === "2") {
+      req.brokerScope = null;
+      return next();
+    }
+    if (role === "3") {
+      const brokerId = req.user.brokerId ? Number(req.user.brokerId) : null;
+      if (!brokerId) {
+        return res.status(403).json({
+          error: "Forbidden: this account is not linked to a broker",
+        });
+      }
+      req.brokerScope = brokerId;
+      return next();
+    }
+    return res.status(403).json({ error: "Forbidden" });
+  };
+
   // InactivePolicies / PolicyRange* are no longer selected: inactive blancs
   // are calculated from the blanc batches (see applyBlancSummary).
   const BROKER_COLUMNS = "id, Name, CashBalance";
@@ -476,6 +596,19 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       });
     }
     return batchTableReady;
+  }
+
+  let movementTableReady = null;
+  function ensureMovementTable() {
+    if (!movementTableReady) {
+      movementTableReady = Promise.resolve(
+        DBConnection.query(BROKER_MOVEMENT_TABLE_SQL)
+      ).catch((err) => {
+        movementTableReady = null;
+        throw err;
+      });
+    }
+    return movementTableReady;
   }
 
   async function loadSummaries(brokerId) {
@@ -593,17 +726,110 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     return broker;
   }
 
+  // Build the per-broker bi-weekly rollup: for each two-week period the number
+  // of (non-deleted) policies, their total price (revenue), and the net balance
+  // movement recorded in the broker balance ledger.
+  async function buildBiweeklyResponse(brokerId = null) {
+    await ensureMovementTable();
+
+    const brokerWhere = brokerId === null ? "" : "WHERE id = ?";
+    const brokerParams = brokerId === null ? [] : [brokerId];
+    const [brokerRows] = await DBConnection.query(
+      `SELECT ${BROKER_COLUMNS} FROM brokers ${brokerWhere} ORDER BY id`,
+      brokerParams
+    );
+
+    const insWhere =
+      brokerId === null
+        ? "WHERE BrokerId IS NOT NULL AND Deleted = 0"
+        : "WHERE BrokerId = ? AND Deleted = 0";
+    const insParams = brokerId === null ? [] : [brokerId];
+    const [insuranceRows] = await DBConnection.query(
+      `SELECT BrokerId, CreationDate, Price FROM insurance ${insWhere}`,
+      insParams
+    );
+
+    const movWhere = brokerId === null ? "" : "WHERE BrokerId = ?";
+    const movParams = brokerId === null ? [] : [brokerId];
+    const [movementRows] = await DBConnection.query(
+      `SELECT BrokerId, CreatedAt, Amount FROM broker_balance_movements ${movWhere}`,
+      movParams
+    );
+
+    const summaries = await loadSummaries();
+    const brokers = brokerRows.map((b) =>
+      applyBlancSummary({ ...b }, summaries)
+    );
+
+    const insuranceByBroker = new Map();
+    for (const r of insuranceRows) {
+      const key = biweekKey(r.CreationDate);
+      if (!key) continue;
+      if (!insuranceByBroker.has(r.BrokerId)) {
+        insuranceByBroker.set(r.BrokerId, new Map());
+      }
+      const buckets = insuranceByBroker.get(r.BrokerId);
+      const entry = buckets.get(key) || { policies: 0, revenue: 0 };
+      entry.policies += 1;
+      entry.revenue =
+        Math.round((entry.revenue + Number(r.Price || 0)) * 100) / 100;
+      buckets.set(key, entry);
+    }
+
+    const movementByBroker = new Map();
+    for (const r of movementRows) {
+      const key = biweekKey(r.CreatedAt);
+      if (!key) continue;
+      if (!movementByBroker.has(r.BrokerId)) {
+        movementByBroker.set(r.BrokerId, new Map());
+      }
+      const buckets = movementByBroker.get(r.BrokerId);
+      buckets.set(key, (buckets.get(key) || 0) + Number(r.Amount || 0));
+    }
+
+    for (const b of brokers) {
+      const ins = insuranceByBroker.get(b.id) || new Map();
+      const mov = movementByBroker.get(b.id) || new Map();
+      const keys = new Set([...ins.keys(), ...mov.keys()]);
+      const periods = [];
+      for (const key of keys) {
+        const start = new Date(`${key}T00:00:00Z`);
+        const end = new Date(start.getTime() + 13 * DAY_MS);
+        const i = ins.get(key) || { policies: 0, revenue: 0 };
+        const m = mov.get(key) || 0;
+        periods.push({
+          start: key,
+          end: end.toISOString().slice(0, 10),
+          policies: i.policies,
+          revenue: i.revenue,
+          balanceMovement: Math.round(m * 100) / 100,
+        });
+      }
+      periods.sort((a, c) => a.start.localeCompare(c.start));
+      b.periods = periods;
+    }
+
+    return { periodLengthDays: 14, brokers };
+  }
+
   // GET /brokers — list every broker with its balance, blanc batches,
   // calculated inactive blancs and emails.
-  router.get("/brokers", auth, requireBrokerRole, async (req, res) => {
+  router.get("/brokers", auth, requireBrokerView, async (req, res) => {
     try {
+      const scoped = req.brokerScope;
       const [rows] = await DBConnection.query(
-        `SELECT ${BROKER_COLUMNS} FROM brokers ORDER BY id`
+        scoped === null
+          ? `SELECT ${BROKER_COLUMNS} FROM brokers ORDER BY id`
+          : `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
+        scoped === null ? [] : [scoped]
       );
       const summaries = await loadSummaries();
       for (const b of rows) applyBlancSummary(b, summaries);
       const [emailRows] = await DBConnection.query(
-        "SELECT BrokerId, Email FROM broker_emails ORDER BY BrokerId, id"
+        scoped === null
+          ? "SELECT BrokerId, Email FROM broker_emails ORDER BY BrokerId, id"
+          : "SELECT BrokerId, Email FROM broker_emails WHERE BrokerId = ?",
+        scoped === null ? [] : [scoped]
       );
       const emailsByBroker = new Map();
       for (const e of emailRows) {
@@ -615,6 +841,19 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     } catch (err) {
       console.error("Broker list failed:", err);
       res.status(500).json({ error: "Failed to fetch brokers" });
+    }
+  });
+
+  // GET /brokers/biweekly — per-broker bi-weekly rollup (policies, revenue and
+  // balance movement) for admins (1), workers (2), and broker-linked clients
+  // (3, scoped to their own broker). The website's broker dashboard is built
+  // from this endpoint.
+  router.get("/brokers/biweekly", auth, requireBrokerView, async (req, res) => {
+    try {
+      res.json(await buildBiweeklyResponse(req.brokerScope));
+    } catch (err) {
+      console.error("Broker biweekly failed:", err);
+      res.status(500).json({ error: "Failed to fetch broker biweekly data" });
     }
   });
 
@@ -702,11 +941,16 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   });
 
   // GET /brokers/:id — single broker.
-  router.get("/brokers/:id", auth, requireBrokerRole, async (req, res) => {
+  router.get("/brokers/:id", auth, requireBrokerView, async (req, res) => {
     try {
       const brokerId = parseBrokerId(req.params.id);
       if (brokerId === null) {
         return res.status(400).json({ error: "Invalid broker id" });
+      }
+      if (req.brokerScope !== null && req.brokerScope !== brokerId) {
+        return res
+          .status(403)
+          .json({ error: "Forbidden: you can only view your own broker" });
       }
       const broker = await fetchBroker(res, brokerId);
       if (!broker) return;
@@ -716,6 +960,35 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       res.status(500).json({ error: "Failed to fetch broker" });
     }
   });
+
+  // GET /brokers/:id/biweekly — the bi-weekly rollup of a single broker.
+  router.get(
+    "/brokers/:id/biweekly",
+    auth,
+    requireBrokerView,
+    async (req, res) => {
+      try {
+        const brokerId = parseBrokerId(req.params.id);
+        if (brokerId === null) {
+          return res.status(400).json({ error: "Invalid broker id" });
+        }
+        if (req.brokerScope !== null && req.brokerScope !== brokerId) {
+          return res
+            .status(403)
+            .json({ error: "Forbidden: you can only view your own broker" });
+        }
+        const data = await buildBiweeklyResponse(brokerId);
+        const broker = data.brokers.find((b) => b.id === brokerId);
+        if (!broker) {
+          return res.status(404).json({ error: "Broker not found" });
+        }
+        res.json({ broker });
+      } catch (err) {
+        console.error("Broker biweekly lookup failed:", err);
+        res.status(500).json({ error: "Failed to fetch broker biweekly data" });
+      }
+    }
+  );
 
   // POST /brokers/:id/increase  { amount, reason, currency }
   router.post(
@@ -762,6 +1035,12 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               reason,
               currency
             );
+
+            await recordBrokerMovement(conn, brokerId, amount, "increase", {
+              reason,
+              author: req.user.username,
+            });
+
             return r.affectedRows;
           }
         );
@@ -828,6 +1107,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         if (r.affectedRows === 0) {
           return res.status(404).json({ error: "Broker not found" });
         }
+
+        await recordBrokerMovement(DBConnection, brokerId, -amount, "reduce", {
+          reason,
+          author: req.user.username,
+        });
 
         const [[broker]] = await DBConnection.query(
           `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
@@ -943,16 +1227,18 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       }
 
       const [existing] = await DBConnection.query(
-        "SELECT id FROM brokers WHERE id = ?",
+        "SELECT id, CashBalance FROM brokers WHERE id = ?",
         [brokerId]
       );
       if (existing.length === 0) {
         return res.status(404).json({ error: "Broker not found" });
       }
+      const previousCashBalance = Number(existing[0].CashBalance);
 
       const b = req.body || {};
       const sets = [];
       const params = [];
+      let newCashBalance = null;
 
       // Blanc ranges are no longer broker fields - they are managed as
       // batches (POST/PATCH/DELETE /brokers/:id/batches), and InactivePolicies
@@ -975,6 +1261,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           }
           sets.push(`${column} = ?`);
           params.push(v);
+          if (column === "CashBalance") newCashBalance = v;
         }
       }
 
@@ -992,6 +1279,16 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               `UPDATE brokers SET ${sets.join(", ")} WHERE id = ?`,
               params
             );
+          }
+          if (newCashBalance !== null) {
+            const delta =
+              Math.round((newCashBalance - previousCashBalance) * 100) / 100;
+            if (delta !== 0) {
+              await recordBrokerMovement(conn, brokerId, delta, "adjust", {
+                reason: "Balance adjusted",
+                author: req.user.username,
+              });
+            }
           }
           if (emails !== null) {
             await conn.query("DELETE FROM broker_emails WHERE BrokerId = ?", [

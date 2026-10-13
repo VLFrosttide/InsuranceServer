@@ -25,11 +25,15 @@ npm run db:setup
 This creates the `insurancedb` database, adds any missing columns, creates the
 required tables, and seeds demo accounts:
 
-| Username | Password      | Role   |
-| -------- | ------------- | ------ |
-| admin    | AdminPass123  | admin  |
-| worker   | WorkerPass123 | worker |
-| client   | ClientPass123 | client |
+| Username | Password      | Role            |
+| -------- | ------------- | --------------- |
+| admin    | AdminPass123  | admin           |
+| worker   | WorkerPass123 | worker          |
+| client   | ClientPass123 | client          |
+| broker   | BrokerPass123 | client (broker) |
+
+The `broker` account is linked to the `Ahmed` broker and can only view its own
+broker data (see `users.BrokerId`).
 
 ## Database schema
 
