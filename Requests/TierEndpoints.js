@@ -1109,8 +1109,8 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   });
 
   // PATCH /insurances/:blancNumber
-  // Modify an existing insurance. Admins (role 1) can edit any policy;
-  // workers (role 2) can only edit policies they created themselves.
+  // Modify an existing insurance. Admins (role 1) and workers (role 2) can
+  // edit any policy.
   //
   // The edit is also applied to the money the policy represents: a policy
   // contributes its price to current cash (PaymentType = "Cash") or to the card
@@ -1136,16 +1136,6 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
 
         const insurance = existing[0];
-
-        // Workers can only modify their own insurances.
-        if (
-          String(req.user.role) === "2" &&
-          insurance.Author !== req.user.username
-        ) {
-          return res
-            .status(403)
-            .json({ error: "Forbidden: can only modify your own insurances" });
-        }
 
         if (insurance.Deleted) {
           return res
@@ -1445,8 +1435,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // request. A broker-linked policy gets the full price back unless the broker
   // is the one at fault, in which case only the price minus the fee (the
   // partial refund) is returned to the broker's balance. A policy can only be
-  // annulled once. Admins (role 1) can annul any policy; workers (role 2) can
-  // only annul policies they created themselves.
+  // annulled once. Admins (role 1) and workers (role 2) can annul any policy.
   router.post(
     "/insurances/:blancNumber/annul",
     auth,
@@ -1481,15 +1470,6 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
 
         const insurance = existing[0];
-
-        if (
-          String(req.user.role) === "2" &&
-          insurance.Author !== req.user.username
-        ) {
-          return res
-            .status(403)
-            .json({ error: "Forbidden: can only annul your own insurances" });
-        }
 
         if (insurance.Deleted) {
           return res
