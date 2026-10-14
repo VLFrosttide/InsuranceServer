@@ -568,6 +568,40 @@ const loadBlancBatchRows = (module.exports.loadBlancBatchRows =
     );
     return rows;
   });
+// ---------------------------------------------------------------------------
+// Global broker setting: whether broker requests that would push a broker's
+// balance negative are accepted. Stored in the `app_settings` key/value table
+// (created by db/setup.js). When no row exists the default is to REJECT such
+// requests, so the admin toggle is opt-in (negative balances stay disabled
+// until an admin enables them).
+// ---------------------------------------------------------------------------
+const BROKER_ALLOW_NEGATIVE_BALANCE = "broker_allow_negative_balance";
+
+const getBrokerAllowNegativeBalance = (module.exports.getBrokerAllowNegativeBalance =
+  async function getBrokerAllowNegativeBalance(conn) {
+    try {
+      const [rows] = await conn.query(
+        "SELECT value FROM app_settings WHERE name = ?",
+        [BROKER_ALLOW_NEGATIVE_BALANCE]
+      );
+      if (!rows.length) return false;
+      return String(rows[0].value) !== "0";
+    } catch (err) {
+      // A missing table or transient failure must never break insurance
+      // creation, so fall back to the default (reject negative balances).
+      return false;
+    }
+  });
+
+const setBrokerAllowNegativeBalance = (module.exports.setBrokerAllowNegativeBalance =
+  async function setBrokerAllowNegativeBalance(conn, allow) {
+    await conn.query(
+      `INSERT INTO app_settings (name, value) VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE value = VALUES(value)`,
+      [BROKER_ALLOW_NEGATIVE_BALANCE, allow ? "1" : "0"]
+    );
+  });
+
 
 /**
  * Create the broker router.
@@ -719,6 +753,39 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   function parseBrokerId(param) {
     const id = Number(param);
     return Number.isInteger(id) && id > 0 ? id : null;
+  }
+
+  // Whole positive integer from a query parameter, falling back when absent.
+  function parsePositiveIntParam(value, fallback) {
+    const n = Number(value);
+    return Number.isInteger(n) && n > 0 ? n : fallback;
+  }
+
+  // Keep the history page size inside a sane range.
+  function clampPageSize(n) {
+    return Math.min(Math.max(n, 1), 100);
+  }
+
+  // Parse a "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" query value as a local Date.
+  // Returns null when the value is not a valid date.
+  function parseHistoryDate(value) {
+    const s = String(value).trim();
+    if (!s) return null;
+    const norm = /^\d{4}-\d{2}-\d{2}$/.test(s)
+      ? `${s}T00:00:00`
+      : s.replace(" ", "T");
+    const d = new Date(norm);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  // Format a Date as the "YYYY-MM-DD HH:MM:SS" string used by the DATETIME
+  // columns, in the server's local time.
+  function toLocalDateTime(d) {
+    const p = (n) => String(n).padStart(2, "0");
+    return (
+      `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+      `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+    );
   }
 
   function parseBrokerEmails(value) {
@@ -881,7 +948,10 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         emailsByBroker.get(e.BrokerId).push(e.Email);
       }
       for (const b of rows) b.emails = emailsByBroker.get(b.id) || [];
-      res.json({ brokers: rows });
+      const allowNegativeBalance = await getBrokerAllowNegativeBalance(
+        DBConnection
+      );
+      res.json({ brokers: rows, allowNegativeBalance });
     } catch (err) {
       console.error("Broker list failed:", err);
       res.status(500).json({ error: "Failed to fetch brokers" });
@@ -984,6 +1054,36 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     }
   });
 
+  // GET /brokers/settings — read the global broker acceptance setting
+  // (admin only).
+  router.get("/brokers/settings", auth, requireRole(1), async (req, res) => {
+    try {
+      const allowNegativeBalance = await getBrokerAllowNegativeBalance(
+        DBConnection
+      );
+      res.json({ allowNegativeBalance });
+    } catch (err) {
+      console.error("Broker settings read failed:", err);
+      res.status(500).json({ error: "Failed to fetch broker settings" });
+    }
+  });
+
+  // PUT /brokers/settings — update the global broker acceptance setting.
+  // { allowNegativeBalance: boolean }. When false, broker requests that would
+  // drive the broker balance below zero are rejected.
+  router.put("/brokers/settings", auth, requireRole(1), async (req, res) => {
+    try {
+      const raw = req.body?.allowNegativeBalance;
+      const allowNegativeBalance =
+        typeof raw === "string" ? raw !== "0" && raw !== "false" : Boolean(raw);
+      await setBrokerAllowNegativeBalance(DBConnection, allowNegativeBalance);
+      res.json({ allowNegativeBalance });
+    } catch (err) {
+      console.error("Broker settings update failed:", err);
+      res.status(500).json({ error: "Failed to update broker settings" });
+    }
+  });
+
   // GET /brokers/:id — single broker.
   router.get("/brokers/:id", auth, requireBrokerView, async (req, res) => {
     try {
@@ -1081,6 +1181,129 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       } catch (err) {
         console.error("Broker policies lookup failed:", err);
         res.status(500).json({ error: "Failed to fetch broker policies" });
+      }
+    }
+  );
+
+  // GET /brokers/:id/history — the broker's balance movements for the last
+  // month (default), newest first, paginated (40 per page by default).
+  // Optional ?since / ?until (YYYY-MM-DD[ HH:MM:SS]) override the window and
+  // ?page / ?pageSize control pagination.
+  router.get(
+    "/brokers/:id/history",
+    auth,
+    requireBrokerView,
+    async (req, res) => {
+      try {
+        const brokerId = parseBrokerId(req.params.id);
+        if (brokerId === null) {
+          return res.status(400).json({ error: "Invalid broker id" });
+        }
+        if (req.brokerScope !== null && req.brokerScope !== brokerId) {
+          return res
+            .status(403)
+            .json({ error: "Forbidden: you can only view your own broker" });
+        }
+
+        await ensureMovementTable();
+
+        const [[broker]] = await DBConnection.query(
+          `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
+          [brokerId]
+        );
+        if (!broker) {
+          return res.status(404).json({ error: "Broker not found" });
+        }
+
+        const page = parsePositiveIntParam(req.query.page, 1);
+        const pageSize = clampPageSize(
+          parsePositiveIntParam(req.query.pageSize, 40)
+        );
+
+        const now = new Date();
+        const sinceDate =
+          req.query.since === undefined || req.query.since === ""
+            ? new Date(now.getTime() - 30 * DAY_MS)
+            : parseHistoryDate(String(req.query.since));
+        const untilDate =
+          req.query.until === undefined || req.query.until === ""
+            ? now
+            : parseHistoryDate(String(req.query.until));
+        if (sinceDate === null || untilDate === null) {
+          return res.status(400).json({ error: "Invalid date range" });
+        }
+
+        const since = toLocalDateTime(sinceDate);
+        const until = toLocalDateTime(untilDate);
+
+        const [[stats]] = await DBConnection.query(
+          `SELECT COUNT(*) AS total, COALESCE(SUM(Amount), 0) AS net
+             FROM broker_balance_movements
+            WHERE BrokerId = ? AND CreatedAt >= ? AND CreatedAt < ?`,
+          [brokerId, since, until]
+        );
+
+        const total = Number(stats.total) || 0;
+        const netChange =
+          Math.round((Number(stats.net) || 0) * 100) / 100;
+        const currentBalance =
+          Math.round((Number(broker.CashBalance) || 0) * 100) / 100;
+        const balanceAtStart =
+          Math.round((currentBalance - netChange) * 100) / 100;
+        const totalPages = Math.max(1, Math.ceil(total / pageSize));
+        const offset = (page - 1) * pageSize;
+
+        const [movementRows] = await DBConnection.query(
+          `SELECT t.id, t.Type, t.Amount, t.Reason, t.Author,
+                  t.BlancNumber, t.CreatedAt, t.BalanceAfter
+             FROM (
+               SELECT m.id, m.Amount, m.Type, m.Reason, m.Author,
+                      m.BlancNumber, m.CreatedAt,
+                      (? - COALESCE(SUM(m.Amount) OVER (
+                         ORDER BY m.CreatedAt DESC, m.id DESC
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                       ), 0)) AS BalanceAfter
+                 FROM broker_balance_movements m
+                WHERE m.BrokerId = ?
+                  AND m.CreatedAt >= ?
+                  AND m.CreatedAt < ?
+             ) t
+            ORDER BY t.CreatedAt DESC, t.id DESC
+            LIMIT ? OFFSET ?`,
+          [currentBalance, brokerId, since, until, pageSize, offset]
+        );
+
+        const movements = movementRows.map((r) => ({
+          id: r.id,
+          Type: r.Type,
+          Amount: Math.round((Number(r.Amount) || 0) * 100) / 100,
+          Reason: r.Reason,
+          Author: r.Author,
+          BlancNumber: r.BlancNumber,
+          CreatedAt:
+            r.CreatedAt instanceof Date ? toLocalDateTime(r.CreatedAt) : r.CreatedAt,
+          BalanceAfter: Math.round((Number(r.BalanceAfter) || 0) * 100) / 100,
+        }));
+
+        res.json({
+          broker: {
+            id: broker.id,
+            Name: broker.Name,
+            CashBalance: currentBalance,
+          },
+          since,
+          until,
+          page,
+          pageSize,
+          total,
+          totalPages,
+          balanceAtStart,
+          netChange,
+          movements,
+        });
+      } catch (err) {
+        console.error("Broker history lookup failed:", err);
+        res.status(500).json({ error: "Failed to fetch broker history" });
       }
     }
   );

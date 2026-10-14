@@ -24,6 +24,7 @@ const {
   restoreBrokerForDeletion,
   adjustBrokerForPriceChange,
   resolveBrokerCutOff,
+  getBrokerAllowNegativeBalance,
 } = require("./Brokers.js");
 const { getSchedule } = require("./PaymentSchedule.js");
 const { sendReply } = require("../Mail/SendReply.js");
@@ -324,9 +325,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   router.get("/admin/users", auth, requireRole(1), async (req, res) => {
     try {
       const [users] = await DBConnection.query(
-        `SELECT Username, Role, Balance, Status, BrokerId
+        `SELECT Username, Role, Balance, Status, BrokerId, Email, CreatedAt
          FROM users
-         ORDER BY Username`
+         ORDER BY CreatedAt DESC, Username`
       );
       res.json({ users });
     } catch (err) {
@@ -406,6 +407,60 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       res.status(500).json({ error: "Failed to update user" });
     }
   });
+
+  // POST /admin/users/:username/approve — approve a pending self-registered
+  // account by activating it and binding it to a broker. Both happen together:
+  // a broker login is only usable once it has an active status AND a broker.
+  router.post(
+    "/admin/users/:username/approve",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      try {
+        const username = String(req.params.username || "").trim();
+        if (!username) {
+          return res.status(400).json({ error: "Username is required" });
+        }
+
+        const brokerId = Number(req.body?.brokerId ?? req.body?.BrokerId);
+        if (!Number.isInteger(brokerId) || brokerId <= 0) {
+          return res
+            .status(400)
+            .json({ error: "brokerId must be a positive integer" });
+        }
+
+        const [rows] = await DBConnection.query(
+          "SELECT Username FROM users WHERE Username = ?",
+          [username]
+        );
+        if (rows.length === 0) {
+          return res.status(404).json({ error: "User not found" });
+        }
+
+        const [brokers] = await DBConnection.query(
+          "SELECT id FROM brokers WHERE id = ?",
+          [brokerId]
+        );
+        if (brokers.length === 0) {
+          return res.status(404).json({ error: "Broker not found" });
+        }
+
+        await DBConnection.withTransaction(async (conn) => {
+          await conn.query(
+            "UPDATE users SET Status = 'active', BrokerId = ? WHERE Username = ?",
+            [brokerId, username]
+          );
+          await conn.query("DELETE FROM tokens WHERE Username = ?", [username]);
+        });
+
+        res.json({ message: "User approved", username, brokerId });
+      } catch (err) {
+        console.error("Admin approve failed:", err);
+        res.status(500).json({ error: "Failed to approve user" });
+      }
+    }
+  );
+
 
   router.get("/admin/stats", auth, requireRole(1), async (req, res) => {
     try {
@@ -841,6 +896,18 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             error:
               "Broker is cut off for an unpaid balance; new insurances cannot be created until the balance is paid",
           });
+        }
+
+        // Optional hard stop (admin toggle): when negative-balance broker
+        // requests are disabled, reject a request that would drive the broker's
+        // balance below zero. Independent of the bi-weekly cut-off above.
+        if (priceDecimal !== null && priceDecimal > 0) {
+          const allowNegative = await getBrokerAllowNegativeBalance(DBConnection);
+          if (!allowNegative && currentBalance - priceDecimal < 0) {
+            return res.status(400).json({
+              error: "Broker request rejected: negative balance not allowed",
+            });
+          }
         }
       }
 

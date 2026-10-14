@@ -57,6 +57,11 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
       const user = rows[0];
 
       if (String(user.Status || "active") !== "active") {
+        if (String(user.Status) === "pending") {
+          return sendLoginResponse(res, 403, {
+            error: "Account is pending admin approval",
+          });
+        }
         return sendLoginResponse(res, 403, { error: "Account suspended" });
       }
 

@@ -1,10 +1,10 @@
 "use strict";
-// Self-service registration. Anyone can create a "client" (role 3) account.
+// Self-service registration. Anyone can create a "client" (role 3) account,
+// but the account starts in a "pending" state and is NOT usable until an admin
+// approves it and binds it to a broker (see /admin/users/:username/approve).
 // Admin/worker accounts are seeded via db/setup.js (or created at the DB).
 const express = require("express");
 const Bcrypt = require("bcryptjs");
-
-const VALID_ROLES = new Set(["1", "2", "3"]);
 
 /**
  * @param {import("mysql2/promise").Connection} DBConnection
@@ -15,9 +15,11 @@ module.exports.createRegRouter = function createRegRouter(DBConnection) {
 
   router.post("/userreg", async (req, res) => {
     try {
-      const Username = req.body.username ?? req.body.Username;
+      const Username = String(
+        req.body.username ?? req.body.Username ?? ""
+      ).trim();
       const Password = req.body.password ?? req.body.Password;
-      const RoleID = req.body.role ?? req.body.RoleID ?? "3";
+      const Email = String(req.body.email ?? req.body.Email ?? "").trim();
 
       if (!Username || !Password) {
         return res
@@ -37,13 +39,6 @@ module.exports.createRegRouter = function createRegRouter(DBConnection) {
           .json({ error: "Password must be at least 6 characters" });
       }
 
-      const role = String(RoleID);
-      if (!VALID_ROLES.has(role)) {
-        return res.status(400).json({
-          error: "RoleID must be one of 1 (admin), 2 (worker), 3 (client)",
-        });
-      }
-
       const [existing] = await DBConnection.query(
         "SELECT Username FROM users WHERE Username = ?",
         [Username]
@@ -53,15 +48,18 @@ module.exports.createRegRouter = function createRegRouter(DBConnection) {
       }
 
       const PassHash = await Bcrypt.hash(Password, 12);
+      // Registration is always a client (role 3) account. It is created in a
+      // pending state: an admin must approve and broker-link it before login.
       await DBConnection.query(
-        "INSERT INTO users (Username, Password, Role, Balance) VALUES (?, ?, ?, 0)",
-        [Username, PassHash, Number(role)]
+        "INSERT INTO users (Username, Password, Role, Balance, Status, Email) VALUES (?, ?, 3, 0, 'pending', ?)",
+        [Username, PassHash, Email || null]
       );
 
       return res.status(201).json({
-        message: "User Created",
+        message:
+          "Registration submitted. It will become active once an admin approves it.",
         username: Username,
-        role,
+        status: "pending",
       });
     } catch (err) {
       console.error("Registration failed:", err);
@@ -71,3 +69,4 @@ module.exports.createRegRouter = function createRegRouter(DBConnection) {
 
   return router;
 };
+

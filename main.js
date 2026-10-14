@@ -6,6 +6,7 @@ const http = require("http");
 const mysql = require("mysql2/promise");
 const { createLoginRouter } = require("./Requests/LoginReq.js");
 const { createRegRouter } = require("./Requests/RegReq.js");
+const { createAccountRouter } = require("./Requests/Account.js");
 const { createTierRouter } = require("./Requests/TierEndpoints.js");
 const { createCurrentCashRouter } = require("./Requests/CurrentCash.js");
 const { createCardPaymentsRouter } = require("./Requests/CardPayments.js");
@@ -194,6 +195,7 @@ async function start() {
   // setup/verification below has not completed or failed.
   app.use(createLoginRouter(DBConnection));
   app.use(createRegRouter(DBConnection));
+  app.use(createAccountRouter(DBConnection));
   app.use(createTierRouter(DBConnection));
   app.use(createCurrentCashRouter(DBConnection));
   app.use(createCardPaymentsRouter(DBConnection));

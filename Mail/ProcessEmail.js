@@ -3,7 +3,7 @@ const path = require("node:path");
 const walkParts = require("./walkParts.js");
 const { notifyUnreadEmail } = require("../Users/websocket.js");
 const mailStore = require("./mailStore.js");
-const { isKnownBrokerSender } = require("./brokerSenders.js");
+const { shouldShowBrokerEmail } = require("./brokerSenders.js");
 
 const RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
@@ -209,8 +209,10 @@ module.exports.ProcessEmail = async function ProcessEmail(
   };
 
   // Only emails from a known broker (database / BrokerInfo.js) are shown to
-  // clients. Anything else is ignored: never stored, broadcast, or marked read.
-  if (!(await isKnownBrokerSender(emailInfo.from))) {
+  // clients. When the admin has disabled negative-balance broker requests,
+  // emails from brokers whose balance is already negative are hidden too.
+  // Anything else is ignored: never stored, broadcast, or marked read.
+  if (!(await shouldShowBrokerEmail(emailInfo.from))) {
     return null;
   }
 

@@ -176,6 +176,8 @@ async function runSetup(config = {}) {
       Role INT NOT NULL DEFAULT 3,
       Balance DECIMAL(15,2) NOT NULL DEFAULT 0,
       Status VARCHAR(20) NOT NULL DEFAULT 'active',
+      Email VARCHAR(255) NULL,
+      CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (Username),
       UNIQUE KEY Username_UNIQUE (Username)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
@@ -234,6 +236,18 @@ async function runSetup(config = {}) {
   if (!userColNames.has("BrokerId")) {
     await db.query("ALTER TABLE users ADD COLUMN BrokerId INT NULL");
     console.log("Added users.BrokerId column");
+  }
+  // Contact email captured at self-service registration (shown to admins while
+  // reviewing pending accounts) and the account creation time.
+  if (!userColNames.has("Email")) {
+    await db.query("ALTER TABLE users ADD COLUMN Email VARCHAR(255) NULL");
+    console.log("Added users.Email column");
+  }
+  if (!userColNames.has("CreatedAt")) {
+    await db.query(
+      "ALTER TABLE users ADD COLUMN CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+    );
+    console.log("Added users.CreatedAt column");
   }
   // Prune the legacy payout percentage column. No percentages are used.
   if (userColNames.has("PayoutPercentage")) {
@@ -807,6 +821,19 @@ async function runSetup(config = {}) {
      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
      COMMENT='Every change to a broker CashBalance (signed Amount)'
    `);
+  // Global key/value settings (e.g. whether broker requests that would push a
+  // broker balance negative are accepted). Keyed by `name` so future toggles
+  // reuse the same table without another migration.
+  await db.query(`
+     CREATE TABLE IF NOT EXISTS app_settings (
+       name VARCHAR(100) NOT NULL,
+       value VARCHAR(255) NOT NULL DEFAULT '',
+       UpdatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+       PRIMARY KEY (name)
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+     COMMENT='Global application key/value settings'
+   `);
+
 
 
   // Migrate brokers to the current schema on existing databases.

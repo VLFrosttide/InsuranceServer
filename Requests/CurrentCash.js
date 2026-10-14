@@ -229,6 +229,67 @@ const getCurrentCash = (module.exports.getCurrentCash =
   });
 
 /**
+ * Read the current cash balance of a branch as it stood at the end of a given
+ * day (inclusive). The live running balance is read first, then walked back
+ * over every movement and reset recorded AFTER that day, so historical dates
+ * show the amount the branch actually had available back then - not today's
+ * balance.
+ *
+ * The identity used here is:
+ *     balance(as of D) = live
+ *                        - signed movements with CreatedAt >= nextDate
+ *                        + kept amounts of resets with CreatedAt >= nextDate
+ * A reset zeroes the drawer, so its KeptAmount is added back when undoing a
+ * reset that happened after the requested day.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ * @param {string} nextDate  "YYYY-MM-DD" of the day AFTER the requested day.
+ * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, USD: 0, TRY: 0 }
+ */
+const getCurrentCashAsOf = (module.exports.getCurrentCashAsOf =
+  async function getCurrentCashAsOf(conn, branch, nextDate) {
+    const b = normalizeBranch(branch);
+    const live = await getCurrentCash(conn, b);
+
+    // Movements recorded after the requested day (increase + / reduce -).
+    const [laterMoves] = await conn.query(
+      `SELECT Currency,
+         ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
+       FROM cash_transactions
+       WHERE Branch = ? AND CreatedAt >= ?
+       GROUP BY Currency`,
+      [b, nextDate]
+    );
+
+    // Resets recorded after the requested day (they zeroed the drawer at the
+    // time, so undoing them adds their kept amount back).
+    const [laterResets] = await conn.query(
+      `SELECT Currency, ROUND(SUM(KeptAmount), 2) AS Kept
+       FROM cash_resets
+       WHERE Branch = ? AND CreatedAt >= ?
+       GROUP BY Currency`,
+      [b, nextDate]
+    );
+
+    const balances = {};
+    for (const currency of CURRENCIES) {
+      balances[currency] = Number(live[currency]) || 0;
+    }
+    for (const row of laterMoves) {
+      const cur = normalizeCurrency(row.Currency);
+      balances[cur] =
+        Math.round((balances[cur] - (Number(row.Net) || 0)) * 100) / 100;
+    }
+    for (const row of laterResets) {
+      const cur = normalizeCurrency(row.Currency);
+      balances[cur] =
+        Math.round((balances[cur] + (Number(row.Kept) || 0)) * 100) / 100;
+    }
+    return balances;
+  });
+
+/**
  * Apply a movement (+increase / -reduce) to a branch/currency balance.
  *
  * NOTE: runs inside the caller's transaction.
@@ -914,15 +975,20 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
 
   // GET /currentcash/daily — country-wide daily report for the day in the
   // query string. It is independent of the branch selector above: insurances
-  // and cash movements are counted across ALL branches.
+  // and cash movements are counted across ALL branches. When ?branch= is
+  // provided, the response also carries `availableCash`: that branch's cash
+  // drawer balance at the end of the requested day (so walking the date back
+  // shows the amount the branch actually had available then, not today's).
   //   ?date=YYYY-MM-DD  day to report on (default: the client's today)
   //   ?tzOffset=N       client UTC offset in minutes, used to work out "today"
+  //   ?branch=...       optional branch whose available cash is returned
   router.get("/currentcash/daily", auth, requireCashRole, async (req, res) => {
     try {
       const day = resolveHistoryDay(req.query.date, req.query.tzOffset);
       if (day.error) {
         return res.status(400).json({ error: day.error });
       }
+      const branch = normalizeBranch(req.query.branch);
 
       // Every non-deleted insurance created that day, split by channel: a
       // broker-linked (email) policy has a BrokerId, a walk-in has none.
@@ -970,14 +1036,29 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         totalDailyCash[normalizeCurrency(row.Currency)] = Number(row.Net) || 0;
       }
 
-      res.json({
+      const report = {
         date: day.date,
         totalInsurances: Number(counts[0].total) || 0,
         brokerInsurances: Number(counts[0].broker) || 0,
         walkInInsurances: Number(counts[0].walkIn) || 0,
         totalDailyCash,
         countryWideInsurances: Math.max(0, lastPolicy - firstPolicy),
-      });
+      };
+
+      // The selected branch's cash drawer balance at the end of the chosen day.
+      // The running balance is read live and then walked back over the
+      // movements/resets recorded after that day, so picking an older date shows
+      // how much cash that branch actually had available back then (not today's
+      // balance).
+      if (branch) {
+        report.availableCash = await getCurrentCashAsOf(
+          DBConnection,
+          branch,
+          day.nextDate
+        );
+      }
+
+      res.json(report);
     } catch (err) {
       console.error("CurrentCash daily report failed:", err);
       res.status(500).json({ error: "Failed to fetch daily report" });
