@@ -301,6 +301,50 @@ function clientLocalDateTime(offsetMinutes, now = new Date()) {
 }
 module.exports.clientLocalDateTime = clientLocalDateTime;
 
+// ---------------------------------------------------------------------------
+// Broker name matching (script-insensitive)
+// ---------------------------------------------------------------------------
+
+// Bulgarian Cyrillic → Latin transliteration, so broker lookups are insensitive
+// to the Cyrillic/Latin script difference. Lowercases first, then maps each
+// Cyrillic letter to its Latin equivalent (Streamlined System for Bulgarian).
+// Latin letters and everything else pass through unchanged, so a Latin query
+// ("Lesovo") and a Cyrillic stored name ("ГКПП Лесово") normalise to the same
+// Latin form ("lesovo" / "gkpp lesovo").
+const BULGARIAN_TO_LATIN = {
+  а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ж: "zh", з: "z",
+  и: "i", й: "y", к: "k", л: "l", м: "m", н: "n", о: "o", п: "p",
+  р: "r", с: "s", т: "t", у: "u", ф: "f", х: "h", ц: "ts", ч: "ch",
+  ш: "sh", щ: "sht", ъ: "a", ь: "y", ю: "yu", я: "ya",
+};
+function transliterateBulgarian(value) {
+  return String(value == null ? "" : value)
+    .toLowerCase()
+    .replace(/[а-я]/g, (ch) => BULGARIAN_TO_LATIN[ch] || ch);
+}
+module.exports.transliterateBulgarian = transliterateBulgarian;
+
+// Whether a stored broker name matches a query, ignoring case and script. The
+// query's words must appear in order as substrings of the stored name (both
+// normalised to Latin first), so:
+//   - "Lesovo"        matches "ГКПП Лесово"
+//   - "kap andreevo"  matches "ГКПП Капитан Андреево" ("kap" prefixes "kapitan")
+//   - "Euro"          matches "Euroins"
+function brokerNameMatches(storedBroker, query) {
+  const haystack = transliterateBulgarian(storedBroker);
+  const words = transliterateBulgarian(query).split(/\s+/).filter(Boolean);
+  if (!words.length) return false;
+  let from = 0;
+  for (const word of words) {
+    const idx = haystack.indexOf(word, from);
+    if (idx === -1) return false;
+    from = idx + word.length;
+  }
+  return true;
+}
+module.exports.brokerNameMatches = brokerNameMatches;
+
+
 /**
  * Create the tiered router.
  *
@@ -1081,12 +1125,15 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // Shared insurance endpoints (roles 1 and 2)
   // ---------------------------------------------------------------------
 
-  // GET /insurances?author=&date=&policyNumber=&blancNumber=&carNumber=&broker=
+  // GET /insurances?author=&date=&policyNumber=&blancNumber=&carNumber=&broker=&annulled=
   // Returns insurances matching any combination of the supplied filters.
   // At least one filter must be provided. Author/date match exactly (date
-  // compares only the calendar day); policyNumber/blancNumber/carNumber/broker
-  // use a partial (substring) match so partially-remembered numbers - and
-  // partially typed broker names such as "Euro" for "Euroins" - still work.
+  // compares only the calendar day); policyNumber/blancNumber/carNumber use a
+  // partial (substring) match so partially-remembered numbers still work. The
+  // broker is matched in JavaScript (not SQL) so it is insensitive to the
+  // Cyrillic/Latin script difference: "Lesovo" finds the walk-in policies stored
+  // under the "ГКПП Лесово" branch and "kap andreevo" finds "ГКПП Капитан
+  // Андреево". ?annulled=1 restricts the result to annulled policies only.
   router.get("/insurances", auth, requireRole(1, 2), async (req, res) => {
     try {
       const author = req.query.author ? String(req.query.author).trim() : "";
@@ -1101,6 +1148,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         ? String(req.query.carNumber).trim()
         : "";
       const broker = req.query.broker ? String(req.query.broker).trim() : "";
+      const annulled = ["1", "true", "yes"].includes(
+        String(req.query.annulled || "").toLowerCase()
+      );
 
       if (
         !author &&
@@ -1108,11 +1158,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         !policyNumber &&
         !blancNumber &&
         !carNumber &&
-        !broker
+        !broker &&
+        !annulled
       ) {
         return res.status(400).json({
           error:
-            "At least one search parameter is required (author, date, policyNumber, blancNumber, carNumber or broker)",
+            "At least one search parameter is required (author, date, policyNumber, blancNumber, carNumber, broker or annulled)",
         });
       }
 
@@ -1154,12 +1205,8 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         conditions.push("CarNumber LIKE ?");
         params.push(`%${carNumber}%`);
       }
-      // The broker is stored as a name on the policy (insurance.Broker), so a
-      // substring match lets the caller type only part of it ("Euro" -> the
-      // policies issued through "Euroins").
-      if (broker) {
-        conditions.push("Broker LIKE ?");
-        params.push(`%${broker}%`);
+      if (annulled) {
+        conditions.push("Annulled = 1");
       }
 
       const [rows] = await DBConnection.query(
@@ -1168,7 +1215,15 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         )} ORDER BY CreationDate DESC`,
         params
       );
-      res.json({ insurances: rows });
+
+      // Broker filtering runs here (not in SQL) so the name match can be
+      // script-insensitive: a Latin query such as "Lesovo" still finds the
+      // walk-in policies whose Broker column holds the Cyrillic branch name.
+      const resultRows = broker
+        ? rows.filter((row) => brokerNameMatches(row.Broker, broker))
+        : rows;
+
+      res.json({ insurances: resultRows });
     } catch (err) {
       console.error("Insurance search lookup failed:", err);
       res.status(500).json({ error: "Failed to fetch insurances" });

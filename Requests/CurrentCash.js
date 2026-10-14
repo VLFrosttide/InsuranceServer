@@ -1036,6 +1036,43 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         totalDailyCash[normalizeCurrency(row.Currency)] = Number(row.Net) || 0;
       }
 
+      // Card payments and broker-balance movements, per branch and per
+      // currency, for the selected day. Both channels are recorded in the total
+      // cash ledger (Source = Card | Broker), so the day's net is their signed
+      // sum of increases minus reductions.
+      const [cardRows] = await DBConnection.query(
+        `SELECT Branch, Currency,
+                ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
+           FROM total_cash_transactions
+          WHERE Source = 'Card' AND CreatedAt >= ? AND CreatedAt < ?
+          GROUP BY Branch, Currency
+          ORDER BY Branch, Currency`,
+        [day.date, day.nextDate]
+      );
+      const [brokerRows] = await DBConnection.query(
+        `SELECT Branch, Currency,
+                ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
+           FROM total_cash_transactions
+          WHERE Source = 'Broker' AND CreatedAt >= ? AND CreatedAt < ?
+          GROUP BY Branch, Currency
+          ORDER BY Branch, Currency`,
+        [day.date, day.nextDate]
+      );
+      const byBranch = (rows) => {
+        const out = [];
+        const index = new Map();
+        for (const row of rows) {
+          let entry = index.get(row.Branch);
+          if (!entry) {
+            entry = { Branch: row.Branch, EUR: 0, USD: 0, TRY: 0 };
+            index.set(row.Branch, entry);
+            out.push(entry);
+          }
+          entry[normalizeCurrency(row.Currency)] = Number(row.Net) || 0;
+        }
+        return out;
+      };
+
       const report = {
         date: day.date,
         totalInsurances: Number(counts[0].total) || 0,
@@ -1043,6 +1080,8 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         walkInInsurances: Number(counts[0].walkIn) || 0,
         totalDailyCash,
         countryWideInsurances: Math.max(0, lastPolicy - firstPolicy),
+        cardPayments: byBranch(cardRows),
+        brokerBalance: byBranch(brokerRows),
       };
 
       // The selected branch's cash drawer balance at the end of the chosen day.
