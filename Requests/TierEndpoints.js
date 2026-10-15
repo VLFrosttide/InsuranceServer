@@ -1125,7 +1125,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // Shared insurance endpoints (roles 1 and 2)
   // ---------------------------------------------------------------------
 
-  // GET /insurances?author=&date=&policyNumber=&blancNumber=&carNumber=&broker=&annulled=
+  // GET /insurances?author=&date=&policyNumber=&blancNumber=&carNumber=&broker=&annulled=&payment=
   // Returns insurances matching any combination of the supplied filters.
   // At least one filter must be provided. Author/date match exactly (date
   // compares only the calendar day); policyNumber/blancNumber/carNumber use a
@@ -1133,7 +1133,8 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // broker is matched in JavaScript (not SQL) so it is insensitive to the
   // Cyrillic/Latin script difference: "Lesovo" finds the walk-in policies stored
   // under the "ГКПП Лесово" branch and "kap andreevo" finds "ГКПП Капитан
-  // Андреево". ?annulled=1 restricts the result to annulled policies only.
+  // Андреево". ?annulled=1 restricts the result to annulled policies only, and
+  // ?payment=Cash|Card|Broker restricts it to a single payment type.
   router.get("/insurances", auth, requireRole(1, 2), async (req, res) => {
     try {
       const author = req.query.author ? String(req.query.author).trim() : "";
@@ -1151,6 +1152,19 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       const annulled = ["1", "true", "yes"].includes(
         String(req.query.annulled || "").toLowerCase()
       );
+      const PAYMENT_TYPES = { cash: "Cash", card: "Card", broker: "Broker" };
+      const paymentRaw = req.query.payment
+        ? String(req.query.payment).trim()
+        : "";
+      const payment = paymentRaw
+        ? PAYMENT_TYPES[paymentRaw.toLowerCase()] || ""
+        : "";
+
+      if (paymentRaw && !payment) {
+        return res
+          .status(400)
+          .json({ error: "payment must be one of Cash, Card or Broker" });
+      }
 
       if (
         !author &&
@@ -1159,11 +1173,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         !blancNumber &&
         !carNumber &&
         !broker &&
-        !annulled
+        !annulled &&
+        !payment
       ) {
         return res.status(400).json({
           error:
-            "At least one search parameter is required (author, date, policyNumber, blancNumber, carNumber, broker or annulled)",
+            "At least one search parameter is required (author, date, policyNumber, blancNumber, carNumber, broker, payment or annulled)",
         });
       }
 
@@ -1207,6 +1222,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       }
       if (annulled) {
         conditions.push("Annulled = 1");
+      }
+      if (payment) {
+        conditions.push("PaymentType = ?");
+        params.push(payment);
       }
 
       const [rows] = await DBConnection.query(
