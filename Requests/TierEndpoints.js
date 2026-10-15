@@ -14,6 +14,7 @@ const { requireAuth, requireRole } = require("./Auth.js");
 const {
   recordCashMovement,
   recordChannelMovement,
+  movePolicyBranch,
   toDecimal,
 } = require("./CurrentCash.js");
 const { recordCardPayment, reduceCardBalance } = require("./CardPayments.js");
@@ -1479,39 +1480,56 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         // Nothing money-related changed (e.g. only the policy number or the
         // start date was corrected): the balances are left untouched, so no
         // pointless reversal/entry pair lands in the ledger.
-        const moneyChanged =
-          newPrice !== oldPrice ||
-          finalPayment !== oldPayment ||
-          newBranch !== oldBranch ||
+        const branchChanged = newBranch !== oldBranch;
+        const priceChanged = newPrice !== oldPrice;
+        const paymentChanged = finalPayment !== oldPayment;
+        const currencyChanged =
           String(newCurrency ?? "") !== String(oldCurrency ?? "");
+        const moneyChanged =
+          branchChanged || priceChanged || paymentChanged || currencyChanged;
 
         params.push(blancNumber);
         await DBConnection.withTransaction(async (conn) => {
           if (moneyChanged && !insurance.Annulled) {
-            // 1) Reverse what the policy contributed before this edit, through
-            //    the channel it was originally paid through.
-            if (oldPrice > 0) {
-              await movePolicyMoney(conn, oldPayment, "reduce", {
-                branch: oldBranch,
-                username: req.user.username,
+            // 1) If the policy moved to another branch, transfer its standing
+            //    money to the new branch and re-branch its ledger rows so the
+            //    policy's history follows it. This replaces the old
+            //    "reduce @ old branch" + "increase @ new branch" pair, which
+            //    stranded the original "increase" entry under the old branch.
+            if (branchChanged) {
+              await movePolicyBranch(conn, oldPayment, {
+                fromBranch: oldBranch,
+                toBranch: newBranch,
                 amount: oldPrice,
-                reason: `Edit ${blancNumber}`,
+                reason: blancNumber,
                 currency: oldCurrency,
               });
             }
 
-            // 2) Apply what the policy contributes after the edit, exactly like
-            //    the creation endpoint does (reason = the blanc number). Email
-            //    policies always go through the Broker channel, so they never
-            //    touch current cash.
-            if (newPrice > 0) {
-              await movePolicyMoney(conn, finalPayment, "increase", {
-                branch: newBranch,
-                username: req.user.username,
-                amount: newPrice,
-                reason: newBlancNumber,
-                currency: newCurrency,
-              });
+            // 2) A price / payment-type / currency correction is then applied
+            //    in the branch the policy now lives in (the new branch after a
+            //    move, the old one otherwise). Email policies always go through
+            //    the Broker channel, so they never touch current cash.
+            const deltaBranch = branchChanged ? newBranch : oldBranch;
+            if (priceChanged || paymentChanged || currencyChanged) {
+              if (oldPrice > 0) {
+                await movePolicyMoney(conn, oldPayment, "reduce", {
+                  branch: deltaBranch,
+                  username: req.user.username,
+                  amount: oldPrice,
+                  reason: `Edit ${blancNumber}`,
+                  currency: oldCurrency,
+                });
+              }
+              if (newPrice > 0) {
+                await movePolicyMoney(conn, finalPayment, "increase", {
+                  branch: deltaBranch,
+                  username: req.user.username,
+                  amount: newPrice,
+                  reason: newBlancNumber,
+                  currency: newCurrency,
+                });
+              }
             }
 
             // 3) Keep the broker's own balance in step with the corrected price.

@@ -650,6 +650,79 @@ const recordChannelMovement = (module.exports.recordChannelMovement =
   });
 
 /**
+ * Move a policy's standing money from one branch to another AND re-branch its
+ * ledger rows so the policy's history follows it.
+ *
+ * Used when a policy's Branch is edited. The old approach wrote a fresh
+ * "reduce @ old branch" + "increase @ new branch" pair, which left the policy's
+ * ORIGINAL entries stranded under the old branch (e.g. the creation "increase"
+ * kept showing in the branch the policy no longer belongs to). Instead, the
+ * existing ledger rows are re-pointed at the new branch and the balances are
+ * transferred in one step.
+ *
+ * Balance side (per channel):
+ *   Cash   -> `current_cash` of both branches.
+ *   Card   -> `branch_card_balance` + the Card part of `total_cash`.
+ *   Broker -> the Broker part of `total_cash`.
+ *
+ * Rows are matched by `Reason` against the values the policy's own movements
+ * are recorded under ("<blanc>", "Edit <blanc>", "Annul <blanc>", …), so only
+ * that policy's history moves and other policies are untouched.
+ *
+ * NOTE: runs inside the caller's transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {"Cash"|"Card"|"Broker"} payment  Channel the policy was paid through.
+ * @param {object} m
+ * @param {string} m.fromBranch  Branch the policy currently belongs to.
+ * @param {string} m.toBranch    Branch the policy is moving to.
+ * @param {number|string} m.amount  The policy's standing contribution.
+ * @param {string} m.reason  The policy's blank number (identifies its rows).
+ * @param {string} [m.currency]
+ */
+const movePolicyBranch = (module.exports.movePolicyBranch =
+  async function movePolicyBranch(conn, payment, m) {
+    const { fromBranch, toBranch, amount, reason, currency } = m;
+    const from = normalizeBranch(fromBranch);
+    const to = normalizeBranch(toBranch);
+    const cur = normalizeCurrency(currency);
+
+    // Transfer the balance the policy still contributes, through its channel.
+    const decimal = toDecimal(amount);
+    if (decimal !== null && decimal > 0) {
+      if (payment === "Cash") {
+        await adjustBalance(conn, from, cur, "reduce", decimal);
+        await adjustBalance(conn, to, cur, "increase", decimal);
+      } else if (payment === "Card") {
+        await adjustBranchCardBalance(conn, from, "reduce", decimal);
+        await adjustBranchCardBalance(conn, to, "increase", decimal);
+        await adjustTotalPart(conn, from, cur, "CardPart", "reduce", decimal);
+        await adjustTotalPart(conn, to, cur, "CardPart", "increase", decimal);
+      } else {
+        await adjustTotalPart(conn, from, cur, "BrokerPart", "reduce", decimal);
+        await adjustTotalPart(conn, to, cur, "BrokerPart", "increase", decimal);
+      }
+    }
+
+    // Re-point the policy's ledger rows at the new branch. Every movement the
+    // policy produced carries one of these Reason values.
+    const n = String(reason ?? "").trim();
+    const reasons = [n, `Edit ${n}`, `Annul ${n}`, `Delete ${n}`, `Restore ${n}`];
+
+    // Cash movements live in both ledgers; Card/Broker only in the total one.
+    if (payment === "Cash") {
+      await conn.query(
+        `UPDATE cash_transactions SET Branch = ? WHERE Branch = ? AND Reason IN (?, ?, ?, ?, ?)`,
+        [to, from, ...reasons]
+      );
+    }
+    await conn.query(
+      `UPDATE total_cash_transactions SET Branch = ? WHERE Branch = ? AND Reason IN (?, ?, ?, ?, ?)`,
+      [to, from, ...reasons]
+    );
+  });
+
+/**
  * Zero every stored CardPart and record what was kept in the Total cash ledger.
  * Called when the card balance is cleared, so Total cash falls by exactly the
  * same amount as the CardBalance it mirrors.
