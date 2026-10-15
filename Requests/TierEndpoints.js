@@ -1787,5 +1787,106 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     }
   );
 
+  // POST /insurances/:blancNumber/restore  (admin panel "Restore" action)
+  //
+  // Reverses DELETE /insurances/:blancNumber for a soft-deleted policy. The
+  // policy comes back exactly as it was when it was deleted (it keeps its
+  // annulled state if it had one), and the money the deletion removed is
+  // re-applied:
+  //   - Walk-in (Cash/Card): the amount the deletion removed is added back to
+  //     current cash / the card balance and to Total cash.
+  //   - Broker (email): the price the deletion refunded is charged back to the
+  //     broker's balance, it is added back to the Broker part of Total cash,
+  //     and the policy's blanc counts as used again (Deleted = 0).
+  // Admin-only; a policy can only be restored while it is deleted.
+  router.post(
+    "/insurances/:blancNumber/restore",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      try {
+        const { blancNumber } = req.params;
+
+        const [existing] = await DBConnection.query(
+          "SELECT * FROM insurance WHERE BlancNumber = ?",
+          [blancNumber]
+        );
+        if (existing.length === 0) {
+          return res.status(404).json({ error: "Insurance not found" });
+        }
+
+        const insurance = existing[0];
+        if (!insurance.Deleted) {
+          return res.status(400).json({ error: "Insurance is not deleted" });
+        }
+
+        const price = toDecimal(insurance.Price) || 0;
+        // What the deletion removed from the payment channel: the full price,
+        // or - for a policy that was annulled first - only the kept annulment
+        // fee (the annulment already refunded the rest).
+        let counted = price;
+        if (insurance.Annulled) {
+          const fee = toDecimal(insurance.AnnulFee) || 0;
+          const refunded = Math.max(0, Math.round((price - fee) * 100) / 100);
+          counted = Math.round((price - refunded) * 100) / 100;
+        }
+        // What the deletion refunded to the broker: the full price for a
+        // non-annulled broker policy, nothing for an annulled one.
+        const brokerCharge =
+          isBrokerLinked(insurance) && !insurance.Annulled ? price : 0;
+
+        await DBConnection.withTransaction(async (conn) => {
+          // Put the money back through the channel it was originally paid
+          // through. Email policies go through the Broker channel.
+          if (counted > 0) {
+            await movePolicyMoney(conn, effectivePayment(insurance), "increase", {
+              branch: insurance.Branch,
+              username: req.user.username,
+              amount: counted,
+              reason: `Restore ${blancNumber}`,
+              currency: insurance.CurrencyType,
+            });
+          }
+
+          // Re-charge the broker (unless an annulment already keeps the money
+          // out of the broker's balance); restoring also re-uses its blanc.
+          if (isBrokerLinked(insurance) && brokerCharge > 0) {
+            await decreaseBrokerForInsurance(
+              conn,
+              insurance.BrokerId,
+              brokerCharge,
+              {
+                reason: `Restore ${blancNumber}`,
+                author: req.user.username,
+                blancNumber,
+              }
+            );
+          }
+
+          await conn.query(
+            `UPDATE insurance
+                SET Deleted = ?, DeletedAt = ?, DeletedBy = ?
+              WHERE BlancNumber = ?`,
+            [0, null, null, blancNumber]
+          );
+        });
+
+        res.json({
+          message: "Insurance restored",
+          blancNumber,
+          restored: counted,
+          brokerCharge,
+        });
+      } catch (err) {
+        const msg = (err && err.message) || "";
+        if (msg.includes("insufficient")) {
+          return res.status(400).json({ error: msg });
+        }
+        console.error("Insurance restore failed:", err);
+        res.status(500).json({ error: "Failed to restore insurance" });
+      }
+    }
+  );
+
   return router;
 };

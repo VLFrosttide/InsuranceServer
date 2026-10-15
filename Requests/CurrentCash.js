@@ -976,12 +976,13 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
   // GET /currentcash/daily — country-wide daily report for the day in the
   // query string. It is independent of the branch selector above: insurances
   // and cash movements are counted across ALL branches. When ?branch= is
-  // provided, the response also carries `availableCash`: that branch's cash
-  // drawer balance at the end of the requested day (so walking the date back
-  // shows the amount the branch actually had available then, not today's).
+  // provided, the report becomes branch-scoped: `cardPayments` and
+  // `brokerBalance` are restricted to that branch, and `availableCash` carries
+  // that branch's cash drawer balance at the end of the requested day (so
+  // walking the date back shows the amount it actually had then, not today's).
   //   ?date=YYYY-MM-DD  day to report on (default: the client's today)
   //   ?tzOffset=N       client UTC offset in minutes, used to work out "today"
-  //   ?branch=...       optional branch whose available cash is returned
+  //   ?branch=...       branch the card/broker/available-cash figures belong to
   router.get("/currentcash/daily", auth, requireCashRole, async (req, res) => {
     try {
       const day = resolveHistoryDay(req.query.date, req.query.tzOffset);
@@ -1036,27 +1037,38 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         totalDailyCash[normalizeCurrency(row.Currency)] = Number(row.Net) || 0;
       }
 
-      // Card payments and broker-balance movements, per branch and per
-      // currency, for the selected day. Both channels are recorded in the total
-      // cash ledger (Source = Card | Broker), so the day's net is their signed
-      // sum of increases minus reductions.
+      // Card payments and broker-balance funding for the selected day, computed
+      // from the policies CREATED on that day (CreationDate, the client's local
+      // time). A policy's net contribution is its full price while active, or
+      // just the annul fee once annulled; deleted policies contribute nothing.
+      // Because everything is keyed on the policy's creation date, a later
+      // annulment/refund reduces the figure on the day the money originally came
+      // in - it never shows up as a negative on the annulment day. When a branch
+      // is supplied the figures are restricted to that branch (a worker's own
+      // branch, or the branch an admin selected).
+      const branchFilter = branch ? " AND Branch = ?" : "";
+      const branchArg = branch ? [branch] : [];
       const [cardRows] = await DBConnection.query(
-        `SELECT Branch, Currency,
-                ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
-           FROM total_cash_transactions
-          WHERE Source = 'Card' AND CreatedAt >= ? AND CreatedAt < ?
-          GROUP BY Branch, Currency
-          ORDER BY Branch, Currency`,
-        [day.date, day.nextDate]
+        `SELECT Branch, CurrencyType AS Currency,
+                ROUND(SUM(CASE WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2))
+                               ELSE COALESCE(AnnulFee, 0) END), 2) AS Net
+           FROM insurance
+          WHERE PaymentType = 'Card' AND BrokerId IS NULL AND Deleted = 0
+            AND CreationDate >= ? AND CreationDate < ?${branchFilter}
+          GROUP BY Branch, CurrencyType
+          ORDER BY Branch, CurrencyType`,
+        [day.date, day.nextDate, ...branchArg]
       );
       const [brokerRows] = await DBConnection.query(
-        `SELECT Branch, Currency,
-                ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
-           FROM total_cash_transactions
-          WHERE Source = 'Broker' AND CreatedAt >= ? AND CreatedAt < ?
-          GROUP BY Branch, Currency
-          ORDER BY Branch, Currency`,
-        [day.date, day.nextDate]
+        `SELECT Branch, CurrencyType AS Currency,
+                ROUND(SUM(CASE WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2))
+                               ELSE COALESCE(AnnulFee, 0) END), 2) AS Net
+           FROM insurance
+          WHERE BrokerId IS NOT NULL AND Deleted = 0
+            AND CreationDate >= ? AND CreationDate < ?${branchFilter}
+          GROUP BY Branch, CurrencyType
+          ORDER BY Branch, CurrencyType`,
+        [day.date, day.nextDate, ...branchArg]
       );
       const byBranch = (rows) => {
         const out = [];
