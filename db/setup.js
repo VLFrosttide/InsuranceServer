@@ -816,6 +816,9 @@ async function runSetup(config = {}) {
        Author VARCHAR(45) NOT NULL DEFAULT '',
        BlancNumber VARCHAR(45) NULL,
        CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       Deleted TINYINT(1) NOT NULL DEFAULT 0,
+       DeletedAt DATETIME NULL,
+       DeletedBy VARCHAR(45) NULL,
        PRIMARY KEY (id),
        KEY idx_broker_movements_broker_time (BrokerId, CreatedAt)
      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
@@ -873,6 +876,34 @@ async function runSetup(config = {}) {
   // Seed demo logins (including the broker test account) after brokers exist,
   // so the broker account can be linked to the "Ahmed" broker.
   await seedDemoAccounts(db);
+
+  // Soft-delete support on the broker balance ledger: a deleted movement is
+  // flagged (Deleted/DeletedAt/DeletedBy) and never physically removed, so an
+  // admin can restore it later. Add the columns to pre-existing ledgers; the
+  // CREATE above already includes them for fresh installs.
+  const [movementCols] = await db.query(
+    "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    [DB_NAME, "broker_balance_movements"]
+  );
+  const movementColNames = new Set(movementCols.map((c) => c.COLUMN_NAME));
+  if (!movementColNames.has("Deleted")) {
+    await db.query(
+      "ALTER TABLE broker_balance_movements ADD COLUMN Deleted TINYINT(1) NOT NULL DEFAULT 0"
+    );
+    console.log("Added broker_balance_movements.Deleted column");
+  }
+  if (!movementColNames.has("DeletedAt")) {
+    await db.query(
+      "ALTER TABLE broker_balance_movements ADD COLUMN DeletedAt DATETIME NULL"
+    );
+    console.log("Added broker_balance_movements.DeletedAt column");
+  }
+  if (!movementColNames.has("DeletedBy")) {
+    await db.query(
+      "ALTER TABLE broker_balance_movements ADD COLUMN DeletedBy VARCHAR(45) NULL"
+    );
+    console.log("Added broker_balance_movements.DeletedBy column");
+  }
 
   // One-time backfill of the broker balance ledger from existing insurances,
   // so historical bi-weekly reports already show balance movement. Only runs

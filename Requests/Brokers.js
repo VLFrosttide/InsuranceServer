@@ -290,6 +290,9 @@ const BROKER_MOVEMENT_TABLE_SQL = `CREATE TABLE IF NOT EXISTS broker_balance_mov
   Author VARCHAR(45) NOT NULL DEFAULT '',
   BlancNumber VARCHAR(45) NULL,
   CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  Deleted TINYINT(1) NOT NULL DEFAULT 0,
+  DeletedAt DATETIME NULL,
+  DeletedBy VARCHAR(45) NULL,
   PRIMARY KEY (id),
   KEY idx_broker_movements_broker_time (BrokerId, CreatedAt)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
@@ -379,7 +382,7 @@ const resolveBrokerCutOff = (module.exports.resolveBrokerCutOff =
     const [[{ since }]] = await conn.query(
       `SELECT COALESCE(SUM(Amount), 0) AS since
          FROM broker_balance_movements
-        WHERE BrokerId = ? AND CreatedAt >= ?`,
+        WHERE BrokerId = ? AND CreatedAt >= ? AND Deleted = 0`,
       [brokerId, `${schedule.periodStart} 00:00:00`]
     );
     const balanceAtPeriodStart = balance - Number(since);
@@ -844,7 +847,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       insParams
     );
 
-    const movWhere = brokerId === null ? "" : "WHERE BrokerId = ?";
+    const movWhere = brokerId === null ? "WHERE Deleted = 0" : "WHERE BrokerId = ? AND Deleted = 0";
     const movParams = brokerId === null ? [] : [brokerId];
     const [movementRows] = await DBConnection.query(
       `SELECT BrokerId, CreatedAt, Amount FROM broker_balance_movements ${movWhere}`,
@@ -907,7 +910,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     const [movSinceRows] = await DBConnection.query(
       `SELECT BrokerId, COALESCE(SUM(Amount), 0) AS since
          FROM broker_balance_movements
-        WHERE CreatedAt >= ?
+        WHERE CreatedAt >= ? AND Deleted = 0
         GROUP BY BrokerId`,
       [`${schedule.periodStart} 00:00:00`]
     );
@@ -1220,6 +1223,13 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           parsePositiveIntParam(req.query.pageSize, 40)
         );
 
+        // Only admins may ask for soft-deleted movements (they are the only ones
+        // who can delete/restore them); everyone else always sees live rows.
+        const includeRaw = String(req.query.includeDeleted || "").toLowerCase();
+        const includeDeleted =
+          String(req.user?.role) === "1" &&
+          ["1", "true", "yes"].includes(includeRaw);
+
         const now = new Date();
         const sinceDate =
           req.query.since === undefined || req.query.since === ""
@@ -1239,7 +1249,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         const [[stats]] = await DBConnection.query(
           `SELECT COUNT(*) AS total, COALESCE(SUM(Amount), 0) AS net
              FROM broker_balance_movements
-            WHERE BrokerId = ? AND CreatedAt >= ? AND CreatedAt < ?`,
+            WHERE BrokerId = ? AND CreatedAt >= ? AND CreatedAt < ?
+              AND Deleted = 0`,
           [brokerId, since, until]
         );
 
@@ -1267,6 +1278,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
                 WHERE m.BrokerId = ?
                   AND m.CreatedAt >= ?
                   AND m.CreatedAt < ?
+                  AND m.Deleted = 0
              ) t
             ORDER BY t.CreatedAt DESC, t.id DESC
             LIMIT ? OFFSET ?`,
@@ -1285,6 +1297,34 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           BalanceAfter: Math.round((Number(r.BalanceAfter) || 0) * 100) / 100,
         }));
 
+        // Soft-deleted movements are excluded from the live running balance but
+        // kept in the database, so an admin can still list and restore them.
+        let deleted = [];
+        if (includeDeleted) {
+          const [deletedRows] = await DBConnection.query(
+            `SELECT id, Type, Amount, Reason, Author, BlancNumber, CreatedAt,
+                    DeletedAt, DeletedBy
+               FROM broker_balance_movements
+              WHERE BrokerId = ? AND Deleted = 1
+              ORDER BY CreatedAt DESC, id DESC
+              LIMIT 200`,
+            [brokerId]
+          );
+          deleted = deletedRows.map((r) => ({
+            id: r.id,
+            Type: r.Type,
+            Amount: Math.round((Number(r.Amount) || 0) * 100) / 100,
+            Reason: r.Reason,
+            Author: r.Author,
+            BlancNumber: r.BlancNumber,
+            CreatedAt:
+              r.CreatedAt instanceof Date ? toLocalDateTime(r.CreatedAt) : r.CreatedAt,
+            DeletedAt:
+              r.DeletedAt instanceof Date ? toLocalDateTime(r.DeletedAt) : r.DeletedAt,
+            DeletedBy: r.DeletedBy,
+          }));
+        }
+
         res.json({
           broker: {
             id: broker.id,
@@ -1300,6 +1340,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           balanceAtStart,
           netChange,
           movements,
+          includeDeleted,
+          deleted,
         });
       } catch (err) {
         console.error("Broker history lookup failed:", err);
@@ -1333,7 +1375,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         const [[existing]] = await DBConnection.query(
           `SELECT id, BrokerId, Amount, Type, Reason, Author, BlancNumber
              FROM broker_balance_movements
-            WHERE id = ? AND BrokerId = ?`,
+            WHERE id = ? AND BrokerId = ? AND Deleted = 0`,
           [movementId, brokerId]
         );
         if (!existing) {
@@ -1432,7 +1474,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   );
 
   // DELETE /brokers/:id/history/:movementId — admin-only removal of a single
-  // movement. Reverses the movement's effect on the broker's CashBalance.
+  // movement. The row is NEVER physically deleted: it is tied off as
+  // (Deleted = 1, DeletedAt, DeletedBy) so it stays recoverable, and its
+  // effect on the broker's CashBalance is reversed. POST …/restore undoes it.
   router.delete(
     "/brokers/:id/history/:movementId",
     auth,
@@ -1451,20 +1495,25 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         await ensureMovementTable();
 
         const [[existing]] = await DBConnection.query(
-          `SELECT id, Amount FROM broker_balance_movements
+          `SELECT id, Amount, Deleted FROM broker_balance_movements
             WHERE id = ? AND BrokerId = ?`,
           [movementId, brokerId]
         );
         if (!existing) {
           return res.status(404).json({ error: "Movement not found" });
         }
+        if (existing.Deleted) {
+          return res.status(400).json({ error: "Movement already deleted" });
+        }
 
         const reversal = Math.round(Number(existing.Amount) * -100) / 100;
 
         await DBConnection.withTransaction(async (conn) => {
           await conn.query(
-            "DELETE FROM broker_balance_movements WHERE id = ?",
-            [movementId]
+            `UPDATE broker_balance_movements
+                SET Deleted = ?, DeletedAt = ?, DeletedBy = ?
+              WHERE id = ?`,
+            [1, new Date(), req.user.username, movementId]
           );
           await conn.query(
             "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
@@ -1480,6 +1529,65 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       } catch (err) {
         console.error("Broker movement delete failed:", err);
         res.status(500).json({ error: "Failed to delete broker movement" });
+      }
+    }
+  );
+
+  // POST /brokers/:id/history/:movementId/restore — admin-only undo of a soft
+  // delete. Re-applies the movement's amount to the broker's CashBalance and
+  // clears Deleted/DeletedAt/DeletedBy, putting the row back as it was.
+  router.post(
+    "/brokers/:id/history/:movementId/restore",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      try {
+        const brokerId = parseBrokerId(req.params.id);
+        if (brokerId === null) {
+          return res.status(400).json({ error: "Invalid broker id" });
+        }
+        const movementId = parseBrokerId(req.params.movementId);
+        if (movementId === null) {
+          return res.status(400).json({ error: "Invalid movement id" });
+        }
+
+        await ensureMovementTable();
+
+        const [[existing]] = await DBConnection.query(
+          `SELECT id, Amount, Deleted FROM broker_balance_movements
+            WHERE id = ? AND BrokerId = ?`,
+          [movementId, brokerId]
+        );
+        if (!existing) {
+          return res.status(404).json({ error: "Movement not found" });
+        }
+        if (!existing.Deleted) {
+          return res.status(400).json({ error: "Movement is not deleted" });
+        }
+
+        const reapply = Math.round((Number(existing.Amount) || 0) * 100) / 100;
+
+        await DBConnection.withTransaction(async (conn) => {
+          await conn.query(
+            `UPDATE broker_balance_movements
+                SET Deleted = ?, DeletedAt = ?, DeletedBy = ?
+              WHERE id = ?`,
+            [0, null, null, movementId]
+          );
+          await conn.query(
+            "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
+            [reapply, brokerId]
+          );
+        });
+
+        const [[broker]] = await DBConnection.query(
+          `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
+          [brokerId]
+        );
+        res.json({ message: "Movement restored", broker });
+      } catch (err) {
+        console.error("Broker movement restore failed:", err);
+        res.status(500).json({ error: "Failed to restore broker movement" });
       }
     }
   );
