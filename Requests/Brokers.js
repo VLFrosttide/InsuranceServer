@@ -1308,6 +1308,182 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     }
   );
 
+  // PATCH /brokers/:id/history/:movementId — admin-only correction of a single
+  // balance movement. `amount` is the only field that changes the balance: the
+  // stored CashBalance is shifted by (new - old) so the ledger and the balance
+  // stay consistent. `type`, `reason`, `author` and `blancNumber` are cosmetic
+  // and are stored verbatim.
+  router.patch(
+    "/brokers/:id/history/:movementId",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      try {
+        const brokerId = parseBrokerId(req.params.id);
+        if (brokerId === null) {
+          return res.status(400).json({ error: "Invalid broker id" });
+        }
+        const movementId = parseBrokerId(req.params.movementId);
+        if (movementId === null) {
+          return res.status(400).json({ error: "Invalid movement id" });
+        }
+
+        await ensureMovementTable();
+
+        const [[existing]] = await DBConnection.query(
+          `SELECT id, BrokerId, Amount, Type, Reason, Author, BlancNumber
+             FROM broker_balance_movements
+            WHERE id = ? AND BrokerId = ?`,
+          [movementId, brokerId]
+        );
+        if (!existing) {
+          return res.status(404).json({ error: "Movement not found" });
+        }
+
+        const b = req.body || {};
+        const sets = [];
+        const params = [];
+        let newAmount = null;
+
+        // Accept both camelCase and PascalCase keys, mirroring the way the
+        // broker PATCH endpoint handles field naming.
+        const pick = (...keys) => {
+          for (const k of keys) {
+            if (b[k] !== undefined && b[k] !== null) return b[k];
+          }
+          return undefined;
+        };
+
+        const rawAmount = pick("amount", "Amount");
+        if (rawAmount !== undefined && rawAmount !== "") {
+          const amount = toDecimal(rawAmount);
+          if (amount === null || amount === 0) {
+            return res
+              .status(400)
+              .json({ error: "amount must be a non-zero number" });
+          }
+          newAmount = Math.round(amount * 100) / 100;
+          sets.push("Amount = ?");
+          params.push(newAmount);
+        }
+
+        const rawType = pick("type", "Type");
+        if (rawType !== undefined && rawType !== "") {
+          const type = String(rawType).trim();
+          if (!type) {
+            return res.status(400).json({ error: "Type cannot be empty" });
+          }
+          sets.push("Type = ?");
+          params.push(type);
+        }
+
+        const rawReason = pick("reason", "Reason");
+        if (rawReason !== undefined) {
+          sets.push("Reason = ?");
+          params.push(String(rawReason));
+        }
+
+        const rawAuthor = pick("author", "Author");
+        if (rawAuthor !== undefined) {
+          sets.push("Author = ?");
+          params.push(String(rawAuthor));
+        }
+
+        const rawBlanc = pick("blancNumber", "BlancNumber");
+        if (rawBlanc !== undefined) {
+          const blanc = String(rawBlanc).trim();
+          sets.push("BlancNumber = ?");
+          params.push(blanc ? blanc : null);
+        }
+
+        if (sets.length === 0) {
+          return res.status(400).json({ error: "Nothing to update" });
+        }
+
+        const previousAmount = Number(existing.Amount) || 0;
+        const delta =
+          Math.round(((newAmount ?? previousAmount) - previousAmount) * 100) /
+          100;
+
+        await DBConnection.withTransaction(async (conn) => {
+          params.push(movementId);
+          await conn.query(
+            `UPDATE broker_balance_movements SET ${sets.join(", ")} WHERE id = ?`,
+            params
+          );
+          if (delta !== 0) {
+            await conn.query(
+              "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
+              [delta, brokerId]
+            );
+          }
+        });
+
+        const [[broker]] = await DBConnection.query(
+          `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
+          [brokerId]
+        );
+        res.json({ message: "Movement updated", broker });
+      } catch (err) {
+        console.error("Broker movement update failed:", err);
+        res.status(500).json({ error: "Failed to update broker movement" });
+      }
+    }
+  );
+
+  // DELETE /brokers/:id/history/:movementId — admin-only removal of a single
+  // movement. Reverses the movement's effect on the broker's CashBalance.
+  router.delete(
+    "/brokers/:id/history/:movementId",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      try {
+        const brokerId = parseBrokerId(req.params.id);
+        if (brokerId === null) {
+          return res.status(400).json({ error: "Invalid broker id" });
+        }
+        const movementId = parseBrokerId(req.params.movementId);
+        if (movementId === null) {
+          return res.status(400).json({ error: "Invalid movement id" });
+        }
+
+        await ensureMovementTable();
+
+        const [[existing]] = await DBConnection.query(
+          `SELECT id, Amount FROM broker_balance_movements
+            WHERE id = ? AND BrokerId = ?`,
+          [movementId, brokerId]
+        );
+        if (!existing) {
+          return res.status(404).json({ error: "Movement not found" });
+        }
+
+        const reversal = Math.round(Number(existing.Amount) * -100) / 100;
+
+        await DBConnection.withTransaction(async (conn) => {
+          await conn.query(
+            "DELETE FROM broker_balance_movements WHERE id = ?",
+            [movementId]
+          );
+          await conn.query(
+            "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
+            [reversal, brokerId]
+          );
+        });
+
+        const [[broker]] = await DBConnection.query(
+          `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
+          [brokerId]
+        );
+        res.json({ message: "Movement deleted", broker });
+      } catch (err) {
+        console.error("Broker movement delete failed:", err);
+        res.status(500).json({ error: "Failed to delete broker movement" });
+      }
+    }
+  );
+
   // POST /brokers/:id/increase  { amount, reason, currency }
   router.post(
     "/brokers/:id/increase",
