@@ -43,6 +43,8 @@ const {
   recordCashMovement,
   normalizeCurrency,
   normalizeBranch,
+  clientLocalDateTime,
+  parseClientDateTime,
 } = require("./CurrentCash.js");
 const { getSchedule } = require("./PaymentSchedule.js");
 
@@ -55,6 +57,29 @@ function parsePositiveAmount(value) {
   const n = toDecimal(value);
   if (n === null || n <= 0) return null;
   return n;
+}
+
+/**
+ * Resolve the CreatedAt for a new broker-balance movement from a request body:
+ * the client's own wall-clock time is stored as sent, otherwise the server
+ * clock shifted by the client's TzOffset (UTC when that is missing too).
+ * Mirrors CurrentCash.resolveRequestCreatedAt so broker movements are stamped
+ * like every other ledger row.
+ *
+ * @param {object} [body]
+ * @returns {{createdAt: string}|{error: string}}
+ */
+function resolveBrokerCreatedAt(body) {
+  const b = body || {};
+  const sent = b.CreatedAt ?? b.createdAt;
+  if (sent !== undefined && sent !== null && sent !== "") {
+    const parsed = parseClientDateTime(sent);
+    if (!parsed) {
+      return { error: "CreatedAt must be in YYYY-MM-DD HH:MM:SS format" };
+    }
+    return { createdAt: parsed };
+  }
+  return { createdAt: clientLocalDateTime(b.TzOffset ?? b.tzOffset ?? null) };
 }
 
 /**
@@ -309,17 +334,22 @@ module.exports.BROKER_MOVEMENT_TABLE_SQL = BROKER_MOVEMENT_TABLE_SQL;
  * @param {string} type  e.g. "policy" | "annulment" | "deletion" |
  *                       "price_change" | "increase" | "reduce" | "adjust"
  * @param {{reason?: string, author?: string, blancNumber?: string,
- *          createdAt?: Date}} [meta]
+ *          createdAt?: string}} [meta]  `createdAt` is an already-resolved
+ *          client-local "YYYY-MM-DD HH:MM:SS" string.
  * @returns {Promise<number>} the (rounded) amount recorded, or 0 if skipped.
  */
 const recordBrokerMovement = (module.exports.recordBrokerMovement =
   async function recordBrokerMovement(conn, brokerId, amount, type, meta = {}) {
     const amt = Math.round((toDecimal(amount) || 0) * 100) / 100;
     if (amt === 0) return 0;
-    const createdAt =
-      meta.createdAt instanceof Date && !Number.isNaN(meta.createdAt.getTime())
-        ? meta.createdAt
-        : new Date();
+    // Store the client's local wall-clock time when a caller resolved it (a
+    // validated "YYYY-MM-DD HH:MM:SS" string); otherwise fall back to the
+    // server's UTC clock — the value the old DEFAULT CURRENT_TIMESTAMP used.
+    let createdAt = clientLocalDateTime(null);
+    if (typeof meta.createdAt === "string") {
+      const parsed = parseClientDateTime(meta.createdAt);
+      if (parsed) createdAt = parsed;
+    }
     await conn.query(
       `INSERT INTO broker_balance_movements
          (BrokerId, Amount, Type, Reason, Author, BlancNumber, CreatedAt)
@@ -791,6 +821,23 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     );
   }
 
+  // Parse a "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" query value into the
+  // CLIENT-local DATETIME literal it denotes. The client sends local calendar
+  // days, so no timezone conversion applies here: broker movements are stored
+  // in the client's wall clock and must be compared against client-local
+  // bounds. Returns null when the value is not a valid date.
+  function parseLocalBound(value) {
+    if (value === undefined || value === null) return null;
+    const s = String(value).trim();
+    if (!s) return null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+      return parseHistoryDate(s) ? `${s} 00:00:00` : null;
+    }
+    const norm = s.replace(" ", "T");
+    const d = new Date(norm);
+    return Number.isNaN(d.getTime()) ? null : s.replace("T", " ");
+  }
+
   function parseBrokerEmails(value) {
     if (value === undefined || value === null) return null;
     const list = Array.isArray(value) ? value : [value];
@@ -1231,20 +1278,30 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           ["1", "true", "yes"].includes(includeRaw);
 
         const now = new Date();
-        const sinceDate =
-          req.query.since === undefined || req.query.since === ""
-            ? new Date(now.getTime() - 30 * DAY_MS)
-            : parseHistoryDate(String(req.query.since));
-        const untilDate =
-          req.query.until === undefined || req.query.until === ""
-            ? now
-            : parseHistoryDate(String(req.query.until));
-        if (sinceDate === null || untilDate === null) {
-          return res.status(400).json({ error: "Invalid date range" });
+        // The broker's movements are stamped in the client's local wall clock, so
+        // the default window ("last 30 days") must be resolved with the client's
+        // UTC offset; otherwise a movement made in the last couple of hours would
+        // fall outside the window's upper bound. Explicit since/until are already
+        // client-local calendar dates, so they are used as literals.
+        const tzOffset = Number(req.query.tzOffset);
+        let since;
+        let until;
+        if (req.query.since === undefined || req.query.since === "") {
+          since = clientLocalDateTime(tzOffset, new Date(now.getTime() - 30 * DAY_MS));
+        } else {
+          since = parseLocalBound(String(req.query.since));
+          if (since === null) {
+            return res.status(400).json({ error: "Invalid date range" });
+          }
         }
-
-        const since = toLocalDateTime(sinceDate);
-        const until = toLocalDateTime(untilDate);
+        if (req.query.until === undefined || req.query.until === "") {
+          until = clientLocalDateTime(tzOffset, now);
+        } else {
+          until = parseLocalBound(String(req.query.until));
+          if (until === null) {
+            return res.status(400).json({ error: "Invalid date range" });
+          }
+        }
 
         const [[stats]] = await DBConnection.query(
           `SELECT COUNT(*) AS total, COALESCE(SUM(Amount), 0) AS net
@@ -1618,6 +1675,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         const currency = normalizeCurrency(req.body?.currency);
         const branch = normalizeBranch(req.body?.branch);
 
+        const moveTime = resolveBrokerCreatedAt(req.body);
+        if (moveTime.error) {
+          return res.status(400).json({ error: moveTime.error });
+        }
+
         // Update the broker balance and mirror the movement into current cash in
         // one transaction, so the two ledgers can never diverge.
         const affectedRows = await DBConnection.withTransaction(
@@ -1635,12 +1697,14 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               "increase",
               amount,
               reason,
-              currency
+              currency,
+              moveTime.createdAt
             );
 
             await recordBrokerMovement(conn, brokerId, amount, "increase", {
               reason,
               author: req.user.username,
+              createdAt: moveTime.createdAt,
             });
 
             return r.affectedRows;
@@ -1701,6 +1765,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         }
         const currency = normalizeCurrency(req.body?.currency);
 
+        const moveTime = resolveBrokerCreatedAt(req.body);
+        if (moveTime.error) {
+          return res.status(400).json({ error: moveTime.error });
+        }
+
         const [r] = await DBConnection.query(
           "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
           [amount, brokerId]
@@ -1713,6 +1782,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         await recordBrokerMovement(DBConnection, brokerId, -amount, "reduce", {
           reason,
           author: req.user.username,
+          createdAt: moveTime.createdAt,
         });
 
         const [[broker]] = await DBConnection.query(
@@ -1874,6 +1944,10 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       }
 
       try {
+        const moveTime = resolveBrokerCreatedAt(req.body);
+        if (moveTime.error) {
+          return res.status(400).json({ error: moveTime.error });
+        }
         await DBConnection.withTransaction(async (conn) => {
           if (sets.length > 0) {
             params.push(brokerId);
@@ -1889,6 +1963,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               await recordBrokerMovement(conn, brokerId, delta, "adjust", {
                 reason: "Balance adjusted",
                 author: req.user.username,
+                createdAt: moveTime.createdAt,
               });
             }
           }

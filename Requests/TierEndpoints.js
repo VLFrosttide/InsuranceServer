@@ -94,7 +94,7 @@ function effectivePayment(insurance) {
  *   Cash   -> current cash (and, through it, Total cash).
  *   Card   -> the branch's card balance + Card part of Total cash.
  */
-async function movePolicyMoney(conn, payment, type, m) {
+async function movePolicyMoney(conn, payment, type, m, createdAt) {
   const { branch, username, amount, reason, currency } = m;
   if (payment === "Broker") {
     return recordChannelMovement(
@@ -105,7 +105,8 @@ async function movePolicyMoney(conn, payment, type, m) {
       amount,
       reason,
       currency,
-      "Broker"
+      "Broker",
+      createdAt
     );
   }
   if (payment === "Cash") {
@@ -116,7 +117,8 @@ async function movePolicyMoney(conn, payment, type, m) {
       type,
       amount,
       reason,
-      currency
+      currency,
+      createdAt
     );
   }
   // The card balance is kept per branch: the policy's branch gets the money.
@@ -133,7 +135,8 @@ async function movePolicyMoney(conn, payment, type, m) {
     amount,
     reason,
     currency,
-    "Card"
+    "Card",
+    createdAt
   );
 }
 
@@ -301,6 +304,31 @@ function clientLocalDateTime(offsetMinutes, now = new Date()) {
   );
 }
 module.exports.clientLocalDateTime = clientLocalDateTime;
+
+/**
+ * Resolve the client's local wall-clock time for a ledger entry a policy
+ * operation (edit / annul / delete / restore) produces. The client sends
+ * CreatedAt (its local "YYYY-MM-DD HH:MM:SS"); older clients fall back to the
+ * server clock shifted by their TzOffset (UTC when that is missing too).
+ *
+ * Mirrors CurrentCash.resolveRequestCreatedAt, but lives here so TierEndpoints
+ * needs no extra import and validates with the same datetime rules.
+ *
+ * @param {object} [body]
+ * @returns {{createdAt: string}|{error: string}}
+ */
+function resolveMoveCreatedAt(body) {
+  const b = body || {};
+  const sent = b.CreatedAt ?? b.createdAt;
+  if (sent !== undefined && sent !== null && sent !== "") {
+    const parsed = parseClientDateTime(sent);
+    if (!parsed) {
+      return { error: "CreatedAt must be in YYYY-MM-DD HH:MM:SS format" };
+    }
+    return { createdAt: parsed };
+  }
+  return { createdAt: clientLocalDateTime(b.TzOffset ?? b.tzOffset ?? null) };
+}
 
 // ---------------------------------------------------------------------------
 // Broker name matching (script-insensitive)
@@ -1004,7 +1032,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             amount: priceDecimal,
             reason: blancNumber,
             currency: currencyType,
-          });
+          }, creationDate);
         }
 
         // Flat fee: when the sender's email is associated with a broker, the
@@ -1018,6 +1046,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             reason: blancNumber,
             author: req.user.username,
             blancNumber,
+            createdAt: creationDate,
           });
         }
       });
@@ -1489,6 +1518,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           branchChanged || priceChanged || paymentChanged || currencyChanged;
 
         params.push(blancNumber);
+        const moveTime = resolveMoveCreatedAt(req.body);
+        if (moveTime.error) {
+          return res.status(400).json({ error: moveTime.error });
+        }
         await DBConnection.withTransaction(async (conn) => {
           if (moneyChanged && !insurance.Annulled) {
             // 1) If the policy moved to another branch, transfer its standing
@@ -1519,7 +1552,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                   amount: oldPrice,
                   reason: `Edit ${blancNumber}`,
                   currency: oldCurrency,
-                });
+                }, moveTime.createdAt);
               }
               if (newPrice > 0) {
                 await movePolicyMoney(conn, finalPayment, "increase", {
@@ -1528,7 +1561,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                   amount: newPrice,
                   reason: newBlancNumber,
                   currency: newCurrency,
-                });
+                }, moveTime.createdAt);
               }
             }
 
@@ -1545,6 +1578,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                   reason: `Price change ${insurance.BlancNumber}`,
                   author: req.user.username,
                   blancNumber: insurance.BlancNumber,
+                  createdAt: moveTime.createdAt,
                 }
               );
             }
@@ -1650,6 +1684,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         );
         const refund = Math.max(0, Math.round((price - fee) * 100) / 100);
 
+        const moveTime = resolveMoveCreatedAt(req.body);
+        if (moveTime.error) {
+          return res.status(400).json({ error: moveTime.error });
+        }
+
         await DBConnection.withTransaction(async (conn) => {
           // The refund leaves through the channel the policy was paid through.
           // An email policy was paid from the broker's balance, so its refund
@@ -1662,7 +1701,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               amount: refund,
               reason: `Annul ${blancNumber}`,
               currency: insurance.CurrencyType,
-            });
+            }, moveTime.createdAt);
           }
 
           if (isBrokerLinked(insurance)) {
@@ -1678,6 +1717,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                 reason: `Annul ${blancNumber}`,
                 author: req.user.username,
                 blancNumber,
+                createdAt: moveTime.createdAt,
               }
             );
           }
@@ -1768,6 +1808,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const brokerRefund =
           isBrokerLinked(insurance) && !insurance.Annulled ? price : 0;
 
+        const moveTime = resolveMoveCreatedAt(req.body);
+        if (moveTime.error) {
+          return res.status(400).json({ error: moveTime.error });
+        }
+
         await DBConnection.withTransaction(async (conn) => {
           // Remove the money through the channel the policy was paid through.
           // Email policies go through the Broker channel and never touch
@@ -1779,7 +1824,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               amount: counted,
               reason: `Delete ${blancNumber}`,
               currency: insurance.CurrencyType,
-            });
+            }, moveTime.createdAt);
           }
 
           // Refund the broker (unless an annulment already did) and give the
@@ -1793,6 +1838,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                 reason: `Delete ${blancNumber}`,
                 author: req.user.username,
                 blancNumber,
+                createdAt: moveTime.createdAt,
               }
             );
           }
@@ -1872,6 +1918,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const brokerCharge =
           isBrokerLinked(insurance) && !insurance.Annulled ? price : 0;
 
+        const moveTime = resolveMoveCreatedAt(req.body);
+        if (moveTime.error) {
+          return res.status(400).json({ error: moveTime.error });
+        }
+
         await DBConnection.withTransaction(async (conn) => {
           // Put the money back through the channel it was originally paid
           // through. Email policies go through the Broker channel.
@@ -1882,7 +1933,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               amount: counted,
               reason: `Restore ${blancNumber}`,
               currency: insurance.CurrencyType,
-            });
+            }, moveTime.createdAt);
           }
 
           // Re-charge the broker (unless an annulment already keeps the money
@@ -1896,6 +1947,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                 reason: `Restore ${blancNumber}`,
                 author: req.user.username,
                 blancNumber,
+                createdAt: moveTime.createdAt,
               }
             );
           }

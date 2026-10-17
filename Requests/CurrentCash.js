@@ -843,7 +843,11 @@ const movePolicyBranch = (module.exports.movePolicyBranch =
  * @returns {Promise<number>} The net amount removed across all branches.
  */
 const zeroAllCardParts = (module.exports.zeroAllCardParts =
-  async function zeroAllCardParts(conn, username) {
+  async function zeroAllCardParts(conn, username, createdAt) {
+    const ts =
+      typeof createdAt === "string" && createdAt.trim() !== ""
+        ? createdAt.trim()
+        : clientLocalDateTime(0);
     const [rows] = await conn.query(
       "SELECT Branch, Currency, CardPart FROM total_cash WHERE CardPart != 0"
     );
@@ -862,7 +866,8 @@ const zeroAllCardParts = (module.exports.zeroAllCardParts =
         Math.abs(kept),
         "Card balance cleared",
         row.Currency,
-        "Card"
+        "Card",
+        ts
       );
     }
 
@@ -1489,6 +1494,13 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         const oldCurrency = normalizeCurrency(tx.Currency);
         const oldAmount = Number(tx.Amount);
 
+        // The correction's own ledger entries are stamped with the client's
+        // local time (the original transaction keeps its CreatedAt).
+        const time = resolveRequestCreatedAt(req.body);
+        if (time.error) {
+          return res.status(400).json({ error: time.error });
+        }
+
         await DBConnection.withTransaction(async (conn) => {
           // Reverse the original movement.
           if (oldType === "increase") {
@@ -1523,7 +1535,8 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
             oldAmount,
             `Correction of cash transaction #${id}`,
             oldCurrency,
-            "Cash"
+            "Cash",
+            time.createdAt
           );
           await logTotalCash(
             conn,
@@ -1533,7 +1546,8 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
             newAmount,
             `Correction of cash transaction #${id}`,
             newCurrency,
-            "Cash"
+            "Cash",
+            time.createdAt
           );
 
           await conn.query(

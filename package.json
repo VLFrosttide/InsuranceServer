@@ -5,6 +5,7 @@
   "bin": "main.js",
   "scripts": {
     "start": "node --env-file=.env main.js",
+    "sync-web": "node sync-web.js",
     "db:setup": "node --env-file=.env db/setup.js",
     "test:e2e": "node test_e2e.mjs",
     "test": "node test_e2e.mjs",
