@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title data-i18n="title.register">Insurance Broker Portal — Register</title>
+    <link rel="stylesheet" href="style.css"/>
+</head>
+<body class="login-body">
+    <main class="login-card">
+        <div class="lang-switcher" role="group" aria-label="Language">
+            <button type="button" data-lang="en">EN</button>
+            <button type="button" data-lang="bg">BG</button>
+            <button type="button" data-lang="tr">TR</button>
+        </div>
+        <h1 class="login-title" data-i18n="register.heading">Create account</h1>
+        <p class="login-subtitle" data-i18n="register.subtitle">Brokers — the account is activated by an admin</p>
+        <form id="RegisterForm" autocomplete="off" novalidate>
+            <label for="RegUsernameInput" data-i18n="register.username">Username</label>
+            <input id="RegUsernameInput" name="username" type="text" autocomplete="username" required />
+
+            <label for="RegEmailInput" data-i18n="register.email">Email</label>
+            <input id="RegEmailInput" name="email" type="email" autocomplete="email" required />
+
+            <label for="RegPassInput" data-i18n="register.password">Password</label>
+            <input id="RegPassInput" name="password" type="password" autocomplete="new-password" required />
+
+            <label for="RegConfirmInput" data-i18n="register.confirm">Confirm password</label>
+            <input id="RegConfirmInput" name="confirm" type="password" autocomplete="new-password" required />
+
+            <button type="submit" data-i18n="register.button">Register</button>
+        </form>
+        <p id="RegMsg" class="msg" role="alert" aria-live="polite"></p>
+        <p class="login-alt"><a href="index3.html" data-i18n="register.backToLogin">Back to login</a></p>
+    </main>
+    <script src="i18n.js"></script>
+    <script src="common.js"></script>
+    <script src="register.js"></script>
+</body>
+</html>

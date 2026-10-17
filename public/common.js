@@ -1,0 +1,221 @@
+"use strict";
+// Shared helpers for the Insurance website (broker/admin dashboard).
+//
+// The InsuranceServer API base. When the website is served by InsuranceServer
+// (same origin), we call the API relative to the current host so the site works
+// no matter which domain it is deployed on. For local development open the
+// site as index3.html?api=http://127.0.0.1:5501 to talk to a locally running
+// InsuranceServer instead.
+
+const API_BASE = new URLSearchParams(window.location.search).get("api") || "";
+
+const ROLE_LABELS = { "1": "Admin", "2": "Worker", "3": "Client" };
+
+// --- Internationalisation helpers (translation strings live in i18n.js) ----
+function getLang() {
+  const lang = localStorage.getItem("lang");
+  return SUPPORTED_LANGS.includes(lang) ? lang : "en";
+}
+
+function t(key, vars) {
+  const lang = getLang();
+  let str = (I18N[lang] && I18N[lang][key]) ?? I18N.en[key] ?? key;
+  if (vars) {
+    str = String(str).replace(/\{(\w+)\}/g, (m, k) =>
+      vars[k] !== undefined ? String(vars[k]) : m
+    );
+  }
+  return str;
+}
+
+const langChangeListeners = new Set();
+function onLangChange(fn) {
+  langChangeListeners.add(fn);
+  return () => langChangeListeners.delete(fn);
+}
+
+function applyI18n() {
+  const lang = getLang();
+  document.documentElement.lang = lang;
+  document.querySelectorAll("[data-i18n]").forEach((el) => {
+    el.textContent = t(el.getAttribute("data-i18n"));
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
+    el.setAttribute("placeholder", t(el.getAttribute("data-i18n-placeholder")));
+  });
+  document.querySelectorAll("[data-lang]").forEach((el) => {
+    const active = el.getAttribute("data-lang") === lang;
+    el.classList.toggle("active", active);
+    el.setAttribute("aria-pressed", String(active));
+  });
+}
+
+function setLang(lang) {
+  if (!SUPPORTED_LANGS.includes(lang)) lang = "en";
+  localStorage.setItem("lang", lang);
+  applyI18n();
+  for (const fn of langChangeListeners) {
+    try {
+      fn(lang);
+    } catch (err) {
+      console.error(err);
+    }
+  }
+}
+
+function setupLangSwitcher() {
+  document.querySelectorAll("[data-lang]").forEach((btn) => {
+    btn.addEventListener("click", () => setLang(btn.getAttribute("data-lang")));
+  });
+}
+
+function getToken() {
+  return localStorage.getItem("token") || "";
+}
+function getUsername() {
+  return localStorage.getItem("username") || "";
+}
+function getRole() {
+  return localStorage.getItem("role") || "";
+}
+
+function setSession(data) {
+  localStorage.setItem("token", data.token || "");
+  localStorage.setItem("username", data.username || "");
+  localStorage.setItem("role", String(data.role || ""));
+  if (data.brokerId !== undefined && data.brokerId !== null) {
+    localStorage.setItem("brokerId", String(data.brokerId));
+  } else {
+    localStorage.removeItem("brokerId");
+  }
+}
+
+function clearSession() {
+  localStorage.removeItem("token");
+  localStorage.removeItem("username");
+  localStorage.removeItem("role");
+  localStorage.removeItem("brokerId");
+}
+
+function getBrokerId() {
+  return localStorage.getItem("brokerId") || "";
+}
+
+// Generic authenticated fetch wrapper against the InsuranceServer API.
+async function api(path, options = {}) {
+  const headers = Object.assign(
+    { "Content-Type": "application/json" },
+    options.headers || {}
+  );
+  const token = getToken();
+  if (token) headers["Authorization"] = "Bearer " + token;
+
+  const res = await fetch(API_BASE + path, Object.assign({}, options, { headers }));
+  let data = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
+  }
+  if (!res.ok) {
+    const err = new Error(
+      (data && (data.error || data.message)) || "Request failed (" + res.status + ")"
+    );
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+function formatMoney(n) {
+  return Number(n || 0).toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function formatSignedMoney(n) {
+  const v = Number(n || 0);
+  return (v > 0 ? "+" : "") + formatMoney(v);
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+  );
+}
+
+function toDate(v) {
+  if (!v) return null;
+  if (v instanceof Date) return v;
+  const s = String(v);
+  // Date-only strings ("YYYY-MM-DD") are parsed as UTC by `new Date`,
+  // which can shift the day in some timezones; parse them as local instead.
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const d = m
+    ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+    : new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function formatDate(v) {
+  const d = toDate(v);
+  if (!d) return String(v || "");
+  const p = (n) => String(n).padStart(2, "0");
+  return p(d.getDate()) + "-" + p(d.getMonth() + 1) + "-" + String(d.getFullYear()).slice(-2);
+}
+
+const MONTH_NAMES = {
+  en: ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+  bg: ["януари", "февруари", "март", "април", "май", "юни", "юли", "август", "септември", "октомври", "ноември", "декември"],
+  tr: ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"],
+};
+
+function monthName(index) {
+  const names = MONTH_NAMES[getLang()] || MONTH_NAMES.en;
+  return names[index];
+}
+
+function ordinal(n) {
+  const rem = n % 100;
+  if (rem >= 11 && rem <= 13) return "th";
+  switch (n % 10) {
+    case 1: return "st";
+    case 2: return "nd";
+    case 3: return "rd";
+    default: return "th";
+  }
+}
+
+// "18th of October 2026" (en), "18 октомври 2026" (bg), "18 Ekim 2026" (tr)
+function formatDateLong(v) {
+  const d = toDate(v);
+  if (!d) return String(v || "");
+  const lang = getLang();
+  const day = lang === "en" ? d.getDate() + ordinal(d.getDate()) : d.getDate();
+  const month = monthName(d.getMonth());
+  return lang === "en"
+    ? day + " of " + month + " " + d.getFullYear()
+    : day + " " + month + " " + d.getFullYear();
+}
+
+// "16 to 18th of October 2026" (en), "16 – 18 октомври 2026" (bg), "16 – 18 Ekim 2026" (tr)
+function formatDateRangeHuman(start, end) {
+  const ds = toDate(start);
+  const de = toDate(end);
+  if (!ds || !de) return formatDate(start) + " – " + formatDate(end);
+  const lang = getLang();
+  if (ds.getFullYear() === de.getFullYear() && ds.getMonth() === de.getMonth()) {
+    const startDay = ds.getDate();
+    const endDay = lang === "en" ? de.getDate() + ordinal(de.getDate()) : de.getDate();
+    const month = monthName(de.getMonth());
+    if (lang === "en") {
+      return startDay + " to " + endDay + " of " + month + " " + de.getFullYear();
+    }
+    return startDay + " – " + endDay + " " + month + " " + de.getFullYear();
+  }
+  return formatDateLong(ds) + " – " + formatDateLong(de);
+}
+
+setupLangSwitcher();
+applyI18n();

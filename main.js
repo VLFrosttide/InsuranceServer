@@ -203,6 +203,32 @@ async function start() {
   app.use(createTariffsRouter(DBConnection));
   app.use(createTestRouter(DBConnection));
 
+  // ---------------------------------------------------------------------------
+  // Serve the InsuranceWebsite frontend from this same server so the API and
+  // the website share one origin (no separate static deployment, no CORS gap).
+  //
+  // The web root is configurable via WEB_DIR. By default it uses the sibling
+  // "InsuranceWebsite" directory (the normal local layout), and falls back to a
+  // bundled "public" folder when this server is deployed standalone. Only the
+  // statically-available files are served - there is no catch-all fallback, so
+  // the API routers above always take precedence.
+  // ---------------------------------------------------------------------------
+  const WEB_DIR =
+    process.env.WEB_DIR ||
+    (fs.existsSync(path.join(__dirname, "..", "InsuranceWebsite"))
+      ? path.join(__dirname, "..", "InsuranceWebsite")
+      : path.join(__dirname, "public"));
+
+  if (fs.existsSync(WEB_DIR)) {
+    app.use(express.static(WEB_DIR));
+    console.log(`Serving website from ${WEB_DIR}`);
+  } else {
+    console.warn(
+      `Website directory not found (${WEB_DIR}). The static site is not ` +
+        "served. Set WEB_DIR or place the InsuranceWebsite files in a matching folder."
+    );
+  }
+
   // Live state used by /health. It becomes true only after a successful
   // database ping, so /health accurately reports degraded vs. ready.
   let dbHealthy = false;

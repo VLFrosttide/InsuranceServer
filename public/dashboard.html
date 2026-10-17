@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title data-i18n="title.dashboard">Broker Bi-Weekly Report</title>
+    <link rel="stylesheet" href="style.css"/>
+</head>
+<body class="app-body">
+    <header class="topbar">
+        <div class="brand" data-i18n="brand">Insurance &middot; Broker Portal</div>
+        <div class="userbox">
+            <div class="lang-switcher" role="group" aria-label="Language">
+                <button type="button" data-lang="en">EN</button>
+                <button type="button" data-lang="bg">BG</button>
+                <button type="button" data-lang="tr">TR</button>
+            </div>
+            <span id="UserName" class="username"></span>
+            <button id="SettingsBtn" class="btn-ghost" data-i18n="settings.button">Settings</button>
+            <button id="RegistrationsBtn" class="btn-ghost hidden" data-i18n="admin.pending.button">Registrations</button>
+            <button id="LogoutBtn" class="btn-ghost" data-i18n="logout">Logout</button>
+        </div>
+    </header>
+
+    <main class="layout">
+        <aside class="sidebar">
+            <h2 data-i18n="nav.brokers">Brokers</h2>
+            <input id="BrokerSearch" type="search" data-i18n-placeholder="search.placeholder" placeholder="Search brokers…" />
+            <ul id="BrokerList" class="broker-list"></ul>
+        </aside>
+
+        <section class="content">
+            <div id="EmptyState" class="empty hidden" data-i18n="empty.selectBroker">Select a broker to view its bi-weekly data.</div>
+
+            <div id="Detail" class="detail hidden">
+                <div class="detail-head">
+                    <div class="detail-title">
+                        <h2 id="DetailName"></h2>
+                        <div class="detail-actions">
+                            <button id="PoliciesBtn" class="btn-primary" type="button" data-i18n="policies.button">Policies</button>
+                            <button id="InactivePoliciesBtn" class="btn-primary" type="button" data-i18n="inactive.button">Blancs</button>
+                        </div>
+                    </div>
+                    <div id="PaymentBanner" class="banner" hidden></div>
+                    <div class="stat-grid">
+                        <div class="stat">
+                            <span class="stat-label" data-i18n="stat.balance">Balance</span>
+                            <span id="StatBalance" class="stat-value"></span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-label" data-i18n="stat.inactive">Empty blancs</span>
+                            <span id="StatInactive" class="stat-value"></span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-label" data-i18n="stat.totalPolicies">Total policies</span>
+                            <span id="StatPolicies" class="stat-value"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="table-wrap">
+                    <table class="report-table">
+                        <thead>
+                            <tr>
+                                <th data-i18n="table.period">Period (2 weeks)</th>
+                                <th class="num" data-i18n="table.policies">Policies</th>
+                                <th class="num" data-i18n="table.balanceMovement">Balance movement</th>
+                            </tr>
+                        </thead>
+                        <tbody id="PeriodRows"></tbody>
+                        <tfoot>
+                            <tr>
+                                <th data-i18n="table.total">Total</th>
+                                <th class="num" id="TotalPolicies"></th>
+                                <th class="num" id="TotalMovement"></th>
+                            </tr>
+                        </tfoot>
+                    </table>
+                </div>
+
+                <div id="PoliciesPanel" class="policies-panel hidden">
+                    <div class="policies-head">
+                        <div class="policies-title">
+                            <h3 data-i18n="policies.title">Policies since last payment</h3>
+                            <span id="PoliciesSince" class="policies-since"></span>
+                        </div>
+                        <div class="policies-controls">
+                            <label class="history-filter-label" for="PoliciesDate" data-i18n="policies.date">Date</label>
+                            <input id="PoliciesDate" type="text" class="date-input" readonly autocomplete="off"
+                                   data-i18n-placeholder="policies.date.placeholder" placeholder="dd/mm/yyyy" />
+                            <button id="PoliciesDateClear" type="button" class="date-clear hidden"
+                                    data-i18n="policies.date.clear">Clear</button>
+                            <input id="PoliciesDatePicker" type="date" class="date-picker-native" tabindex="-1" aria-hidden="true" />
+                            <span id="PoliciesTotalBalance" class="policies-total"></span>
+                        </div>
+                    </div>
+                    <div class="table-wrap">
+                        <table class="report-table">
+                            <thead>
+                                <tr>
+                                    <th class="sortable" data-sort="policy" data-i18n="policies.col.policy">Policy #</th>
+                                    <th class="sortable" data-sort="blanc" data-i18n="policies.col.blanc">Blanc #</th>
+                                    <th class="num" data-i18n="policies.col.price">Price</th>
+                                    <th data-i18n="policies.col.currency">Currency</th>
+                                    <th class="sortable" data-sort="created" data-i18n="policies.col.created">Created</th>
+                                </tr>
+                            </thead>
+                            <tbody id="PoliciesRows"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div id="InactivePoliciesPanel" class="policies-panel hidden">
+                    <div class="policies-head">
+                        <h3 data-i18n="inactive.title">Empty blancs</h3>
+                        <span id="InactivePoliciesCount" class="policies-since"></span>
+                    </div>
+                    <div class="table-wrap">
+                        <table class="report-table">
+                            <thead>
+                                <tr>
+                                    <th data-i18n="policies.col.blanc">Blanc #</th>
+                                </tr>
+                            </thead>
+                            <tbody id="InactivePoliciesRows"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div id="SettingsOverlay" class="overlay hidden">
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="SettingsTitle">
+            <div class="modal-head">
+                <h2 id="SettingsTitle" data-i18n="settings.title">Account settings</h2>
+                <button id="SettingsCloseBtn" class="btn-ghost" type="button" data-i18n="close">Close</button>
+            </div>
+            <div class="modal-body">
+                <section class="settings-section">
+                    <h3 data-i18n="settings.password.title">Change password</h3>
+                    <form id="PasswordForm" autocomplete="off" novalidate>
+                        <label for="CurrentPassInput" data-i18n="settings.password.current">Current password</label>
+                        <input id="CurrentPassInput" type="password" autocomplete="current-password" required />
+
+                        <label for="NewPassInput" data-i18n="settings.password.new">New password</label>
+                        <input id="NewPassInput" type="password" autocomplete="new-password" required />
+
+                        <label for="ConfirmPassInput" data-i18n="settings.password.confirm">Confirm new password</label>
+                        <input id="ConfirmPassInput" type="password" autocomplete="new-password" required />
+
+                        <button type="submit" class="btn-primary" data-i18n="settings.password.submit">Change password</button>
+                    </form>
+                    <p id="PasswordMsg" class="msg" role="alert" aria-live="polite"></p>
+                </section>
+
+                <section id="EmailSection" class="settings-section hidden">
+                    <h3 data-i18n="settings.emails.title">Emails associated with your account</h3>
+                    <p class="settings-hint" data-i18n="settings.emails.hint">These are the email addresses linked to your broker. Incoming policy emails from these addresses are attributed to you.</p>
+                    <ul id="EmailList" class="email-list"></ul>
+                    <div class="email-add">
+                        <input id="EmailInput" type="email" data-i18n-placeholder="settings.emails.placeholder" placeholder="name@example.com" />
+                        <button id="EmailAddBtn" type="button" class="btn-ghost" data-i18n="settings.emails.add">Add</button>
+                    </div>
+                    <button id="EmailSaveBtn" type="button" class="btn-primary" data-i18n="settings.emails.save">Save emails</button>
+                    <p id="EmailMsg" class="msg" role="alert" aria-live="polite"></p>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <div id="RegistrationsOverlay" class="overlay hidden">
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="RegistrationsTitle">
+            <div class="modal-head">
+                <h2 id="RegistrationsTitle" data-i18n="admin.pending.title">Pending registrations</h2>
+                <button id="RegistrationsCloseBtn" class="btn-ghost" type="button" data-i18n="close">Close</button>
+            </div>
+            <div class="modal-body">
+                <ul id="PendingList" class="pending-list"></ul>
+                <p id="PendingMsg" class="msg" role="alert" aria-live="polite"></p>
+            </div>
+        </div>
+    </div>
+
+    <script src="i18n.js"></script>
+    <script src="common.js"></script>
+    <script src="dashboard.js"></script>
+</body>
+</html>
