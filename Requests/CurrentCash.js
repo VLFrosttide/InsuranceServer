@@ -174,6 +174,95 @@ const resolveHistoryDay = (module.exports.resolveHistoryDay =
   });
 
 /**
+ * Validate a wall-clock time computed by the client (a MySQL DATETIME string
+ * "YYYY-MM-DD HH:MM:SS"; a "T" separator is accepted too). Impossible
+ * dates/times (2026-02-31, 25:00) are rejected.
+ *
+ * @param {unknown} value
+ * @returns {string|null} The normalised "YYYY-MM-DD HH:MM:SS", or null.
+ */
+const parseClientDateTime = (module.exports.parseClientDateTime =
+  function parseClientDateTime(value) {
+    if (typeof value !== "string") return null;
+    const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/.exec(
+      value.trim()
+    );
+    if (!m) return null;
+    const [y, mo, d, h, mi, s] = m.slice(1).map(Number);
+    const t = new Date(Date.UTC(y, mo - 1, d, h, mi, s));
+    if (
+      t.getUTCFullYear() !== y ||
+      t.getUTCMonth() !== mo - 1 ||
+      t.getUTCDate() !== d ||
+      t.getUTCHours() !== h ||
+      t.getUTCMinutes() !== mi ||
+      t.getUTCSeconds() !== s
+    ) {
+      return null;
+    }
+    return `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`;
+  });
+
+/**
+ * The server clock shifted by the client's UTC offset in minutes (east
+ * positive), as a MySQL DATETIME string. This is the fallback when the client
+ * does not send its own wall-clock time. A missing/invalid offset yields the
+ * server's UTC clock — the same value the old DEFAULT CURRENT_TIMESTAMP (the
+ * database's NOW()) used to stamp, so non-cash flows keep their old behaviour.
+ * Never calls the database's NOW().
+ *
+ * @param {unknown} offsetMinutes
+ * @param {Date} [now]
+ * @returns {string}
+ */
+const clientLocalDateTime = (module.exports.clientLocalDateTime =
+  function clientLocalDateTime(offsetMinutes, now = new Date()) {
+    let offset = Number(offsetMinutes);
+    if (
+      !Number.isFinite(offset) ||
+      offset < MIN_TZ_OFFSET_MINUTES ||
+      offset > MAX_TZ_OFFSET_MINUTES
+    ) {
+      offset = 0;
+    }
+    const local = new Date(now.getTime() + Math.round(offset) * 60000);
+    const p = (n) => String(n).padStart(2, "0");
+    return (
+      `${local.getUTCFullYear()}-${p(local.getUTCMonth() + 1)}-${p(
+        local.getUTCDate()
+      )} ` +
+      `${p(local.getUTCHours())}:${p(local.getUTCMinutes())}:${p(
+        local.getUTCSeconds()
+      )}`
+    );
+  });
+
+/**
+ * Resolve the CreatedAt for a new ledger row from a request body: the client's
+ * own wall-clock time is stored as sent, otherwise the server clock shifted by
+ * the client's TzOffset. Returns `{ createdAt }` or `{ error }`.
+ *
+ * @param {object} [body]
+ * @param {Date} [now]
+ * @returns {{createdAt: string}|{error: string}}
+ */
+const resolveRequestCreatedAt = (module.exports.resolveRequestCreatedAt =
+  function resolveRequestCreatedAt(body, now = new Date()) {
+    const b = body || {};
+    const sent = b.CreatedAt ?? b.createdAt;
+    if (sent !== undefined && sent !== null && sent !== "") {
+      const parsed = parseClientDateTime(sent);
+      if (!parsed) {
+        return { error: "CreatedAt must be in YYYY-MM-DD HH:MM:SS format" };
+      }
+      return { createdAt: parsed };
+    }
+    return {
+      createdAt: clientLocalDateTime(b.TzOffset ?? b.tzOffset ?? null, now),
+    };
+  });
+
+/**
  * Ensure the current_cash row exists for a given branch and currency.
  *
  * @param {import("mysql2/promise").Connection} conn
@@ -439,6 +528,8 @@ const getTotalCash = (module.exports.getTotalCash =
  * @param {number|string} amount  Positive value to add/subtract.
  * @param {string} reason  Human-readable reason for the transaction.
  * @param {string} [currency]  Currency code (EUR/USD/TRY).
+ * @param {string} [createdAt]  Client's local wall-clock time
+ *   ("YYYY-MM-DD HH:MM:SS"). Defaults to the server's UTC clock.
  * @returns {Promise<number>} The applied amount (rounded to 2 decimals).
  */
 const recordCashMovement = (module.exports.recordCashMovement =
@@ -449,7 +540,8 @@ const recordCashMovement = (module.exports.recordCashMovement =
     type,
     amount,
     reason,
-    currency
+    currency,
+    createdAt
   ) {
     const decimal = toDecimal(amount);
     if (decimal === null || decimal <= 0) {
@@ -463,13 +555,17 @@ const recordCashMovement = (module.exports.recordCashMovement =
     }
     const b = normalizeBranch(branch);
     const cur = normalizeCurrency(currency);
+    const ts =
+      typeof createdAt === "string" && createdAt.trim() !== ""
+        ? createdAt.trim()
+        : clientLocalDateTime(0);
 
     await adjustBalance(conn, b, cur, type, decimal);
 
     await conn.query(
-      `INSERT INTO cash_transactions (Branch, Type, Amount, Currency, Username, Reason)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [b, type, decimal, cur, username, reason.trim()]
+      `INSERT INTO cash_transactions (Branch, Type, Amount, Currency, Username, Reason, CreatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [b, type, decimal, cur, username, reason.trim(), ts]
     );
 
     // Cash money is one of the three payment types counted in Total cash. The
@@ -484,7 +580,8 @@ const recordCashMovement = (module.exports.recordCashMovement =
       decimal,
       reason,
       cur,
-      "Cash"
+      "Cash",
+      ts
     );
 
     return decimal;
@@ -541,6 +638,8 @@ const adjustTotalPart = (module.exports.adjustTotalPart =
  * @param {string} reason
  * @param {string} [currency]
  * @param {"Cash"|"Card"|"Broker"} [source]
+ * @param {string} [createdAt]  Client's local wall-clock time
+ *   ("YYYY-MM-DD HH:MM:SS"). Defaults to the server's UTC clock.
  * @returns {Promise<number|null>} The logged amount, or null when nothing moved.
  */
 const logTotalCash = (module.exports.logTotalCash =
@@ -552,7 +651,8 @@ const logTotalCash = (module.exports.logTotalCash =
     amount,
     reason,
     currency,
-    source
+    source,
+    createdAt
   ) {
     const decimal = toDecimal(amount);
     if (decimal === null || decimal <= 0) return null;
@@ -560,10 +660,14 @@ const logTotalCash = (module.exports.logTotalCash =
       throw new Error("type must be 'increase' or 'reduce'");
     }
     const src = CASH_SOURCES.includes(source) ? source : "Cash";
+    const ts =
+      typeof createdAt === "string" && createdAt.trim() !== ""
+        ? createdAt.trim()
+        : clientLocalDateTime(0);
 
     await conn.query(
-      `INSERT INTO total_cash_transactions (Branch, Type, Amount, Currency, Source, Username, Reason)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO total_cash_transactions (Branch, Type, Amount, Currency, Source, Username, Reason, CreatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         normalizeBranch(branch),
         type,
@@ -572,6 +676,7 @@ const logTotalCash = (module.exports.logTotalCash =
         src,
         username,
         String(reason ?? "").trim(),
+        ts,
       ]
     );
 
@@ -600,6 +705,8 @@ const logTotalCash = (module.exports.logTotalCash =
  * @param {string} reason
  * @param {string} [currency]
  * @param {"Card"|"Broker"} source
+ * @param {string} [createdAt]  Client's local wall-clock time
+ *   ("YYYY-MM-DD HH:MM:SS"). Defaults to the server's UTC clock.
  * @returns {Promise<number>} The applied amount.
  */
 const recordChannelMovement = (module.exports.recordChannelMovement =
@@ -611,7 +718,8 @@ const recordChannelMovement = (module.exports.recordChannelMovement =
     amount,
     reason,
     currency,
-    source
+    source,
+    createdAt
   ) {
     const decimal = toDecimal(amount);
     if (decimal === null || decimal <= 0) {
@@ -643,7 +751,8 @@ const recordChannelMovement = (module.exports.recordChannelMovement =
       decimal,
       reason,
       currency,
-      source
+      source,
+      createdAt
     );
 
     return decimal;
@@ -836,21 +945,27 @@ const adjustBranchCardBalance = (module.exports.adjustBranchCardBalance =
  * @param {import("mysql2/promise").Connection} conn
  * @param {string} branch
  * @param {string} username
+ * @param {string} [createdAt]  Client's local wall-clock time. Defaults to the
+ *   server's UTC clock.
  * @returns {Promise<number>} The card balance kept (just before zeroing).
  */
 const resetBranchCard = (module.exports.resetBranchCard =
-  async function resetBranchCard(conn, branch, username) {
+  async function resetBranchCard(conn, branch, username, createdAt) {
     const b = normalizeBranch(branch);
     await ensureBranchCardRow(conn, b);
     const kept = await getBranchCardBalance(conn, b);
+    const ts =
+      typeof createdAt === "string" && createdAt.trim() !== ""
+        ? createdAt.trim()
+        : clientLocalDateTime(0);
 
     await conn.query(
       "UPDATE branch_card_balance SET CardBalance = 0 WHERE Branch = ?",
       [b]
     );
     await conn.query(
-      "INSERT INTO card_resets (Branch, Username, KeptAmount) VALUES (?, ?, ?)",
-      [b, username, kept]
+      "INSERT INTO card_resets (Branch, Username, KeptAmount, CreatedAt) VALUES (?, ?, ?, ?)",
+      [b, username, kept, ts]
     );
 
     const [parts] = await conn.query(
@@ -869,7 +984,8 @@ const resetBranchCard = (module.exports.resetBranchCard =
         Math.abs(part),
         "Card balance cleared",
         row.Currency,
-        "Card"
+        "Card",
+        ts
       );
     }
     await conn.query(
@@ -889,12 +1005,18 @@ const resetBranchCard = (module.exports.resetBranchCard =
  * @param {import("mysql2/promise").Connection} conn
  * @param {string} branch  Branch to reset.
  * @param {string} username  Username who performed the reset.
+ * @param {string} [createdAt]  Client's local wall-clock time. Defaults to the
+ *   server's UTC clock.
  * @returns {Promise<Record<string, number>>} Kept amount per currency.
  */
 const resetCurrentCash = (module.exports.resetCurrentCash =
-  async function resetCurrentCash(conn, branch, username) {
+  async function resetCurrentCash(conn, branch, username, createdAt) {
     const b = normalizeBranch(branch);
     await ensureAllCashRows(conn, b);
+    const ts =
+      typeof createdAt === "string" && createdAt.trim() !== ""
+        ? createdAt.trim()
+        : clientLocalDateTime(0);
 
     const [rows] = await conn.query(
       "SELECT Currency, CurrentCash FROM current_cash WHERE id = ? AND Branch = ?",
@@ -914,8 +1036,8 @@ const resetCurrentCash = (module.exports.resetCurrentCash =
     );
     for (const currency of CURRENCIES) {
       await conn.query(
-        "INSERT INTO cash_resets (Branch, Username, Currency, KeptAmount) VALUES (?, ?, ?, ?)",
-        [b, username, currency, kept[currency]]
+        "INSERT INTO cash_resets (Branch, Username, Currency, KeptAmount, CreatedAt) VALUES (?, ?, ?, ?, ?)",
+        [b, username, currency, kept[currency], ts]
       );
       // Total cash is a strict superset of current cash, so zeroing the drawer
       // drags it down by the same kept amount. The balance follows automatically
@@ -928,7 +1050,8 @@ const resetCurrentCash = (module.exports.resetCurrentCash =
         kept[currency],
         "Current cash reset",
         currency,
-        "Cash"
+        "Cash",
+        ts
       );
     }
 
@@ -950,10 +1073,11 @@ const resetCurrentCash = (module.exports.resetCurrentCash =
 const resetBranch = (module.exports.resetBranch = async function resetBranch(
   conn,
   branch,
-  username
+  username,
+  createdAt
 ) {
-  const cash = await resetCurrentCash(conn, branch, username);
-  const card = await resetBranchCard(conn, branch, username);
+  const cash = await resetCurrentCash(conn, branch, username, createdAt);
+  const card = await resetBranchCard(conn, branch, username, createdAt);
   return { cash, card };
 });
 
@@ -1199,6 +1323,10 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         const { amount, reason, currency, branch } = req.body || {};
         const cur = normalizeCurrency(currency);
         const b = normalizeBranch(branch);
+        const time = resolveRequestCreatedAt(req.body);
+        if (time.error) {
+          return res.status(400).json({ error: time.error });
+        }
         const applied = await DBConnection.withTransaction((conn) =>
           recordCashMovement(
             conn,
@@ -1207,7 +1335,8 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
             "increase",
             amount,
             reasonText(reason),
-            cur
+            cur,
+            time.createdAt
           )
         );
 
@@ -1240,6 +1369,10 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         const { amount, reason, currency, branch } = req.body || {};
         const cur = normalizeCurrency(currency);
         const b = normalizeBranch(branch);
+        const time = resolveRequestCreatedAt(req.body);
+        if (time.error) {
+          return res.status(400).json({ error: time.error });
+        }
         const applied = await DBConnection.withTransaction((conn) =>
           recordCashMovement(
             conn,
@@ -1248,7 +1381,8 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
             "reduce",
             amount,
             reasonText(reason),
-            cur
+            cur,
+            time.createdAt
           )
         );
 
@@ -1280,8 +1414,12 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
     try {
       const { branch } = req.body || {};
       const b = normalizeBranch(branch);
+      const time = resolveRequestCreatedAt(req.body);
+      if (time.error) {
+        return res.status(400).json({ error: time.error });
+      }
       const { cash, card } = await DBConnection.withTransaction((conn) =>
-        resetBranch(conn, b, req.user.username)
+        resetBranch(conn, b, req.user.username, time.createdAt)
       );
 
       res.status(200).json({
