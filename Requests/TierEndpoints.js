@@ -382,7 +382,8 @@ module.exports.brokerNameMatches = brokerNameMatches;
 // creation and editing.
 const TRY_BRANCH_QUERIES = ["lesovo", "kap andreevo"];
 const AUTO_VEHICLE_NAMES = new Set([
-  "auto", "otomobil", "araba", "car", "avtomobil", "kola", "leka kola",
+  "auto", "automobile", "otomobil", "araba", "car", "avtomobil", "automobil",
+  "kola", "leka kola",
 ]);
 
 function isTryEligibleBranch(branch) {
