@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# Cache busting — always serve the newest version of the site.
+# Works on Hostinger (LiteSpeed) and Apache.
+# ---------------------------------------------------------------------------
+
+<IfModule mod_headers.c>
+
+    # HTML pages: never cache — force a fresh copy on every request.
+    <FilesMatch "\.(html|htm)$">
+        Header set Cache-Control "no-cache, no-store, must-revalidate, max-age=0"
+        Header set Pragma "no-cache"
+        Header set Expires "Thu, 01 Jan 1970 00:00:00 GMT"
+        Header set X-LiteSpeed-Cache-Control "no-cache"
+    </FilesMatch>
+
+    # Assets (CSS/JS/images/fonts): revalidate on every load so changes show
+    # immediately; unchanged files return 304 (no download) to stay fast.
+    <FilesMatch "\.(css|js|json|png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|otf|eot)$">
+        Header set Cache-Control "no-cache, must-revalidate, max-age=0"
+        Header set X-LiteSpeed-Cache-Control "no-cache"
+    </FilesMatch>
+
+</IfModule>
+
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresDefault "access plus 0 seconds"
+</IfModule>

@@ -1162,11 +1162,21 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
           ORDER BY id DESC`,
         [branch, day.date, day.nextDate]
       );
+      // "Reset to 0" also clears the branch's card balance, recorded in
+      // `card_resets`. Return it too so the Current cash screen can show the
+      // card amount kept alongside the cash in its Resets table.
+      const [cardResets] = await DBConnection.query(
+        `SELECT * FROM card_resets
+          WHERE Branch = ? AND CreatedAt >= ? AND CreatedAt < ?
+          ORDER BY id DESC`,
+        [branch, day.date, day.nextDate]
+      );
       res.json({
         balances,
         cardBalance,
         transactions: txs,
         resets,
+        cardResets,
         date: day.date,
       });
     } catch (err) {

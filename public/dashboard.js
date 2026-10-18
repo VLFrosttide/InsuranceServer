@@ -44,6 +44,20 @@ const PoliciesDate = document.getElementById("PoliciesDate");
 const PoliciesDatePicker = document.getElementById("PoliciesDatePicker");
 const PoliciesDateClear = document.getElementById("PoliciesDateClear");
 const PoliciesTotalBalance = document.getElementById("PoliciesTotalBalance");
+const Report = document.getElementById("Report");
+const ReportFrom = document.getElementById("ReportFrom");
+const ReportTo = document.getElementById("ReportTo");
+const ReportBrokerBalance = document.getElementById("ReportBrokerBalance");
+const ReportKapAndreevoCash = document.getElementById("ReportKapAndreevoCash");
+const ReportKapAndreevoCard = document.getElementById("ReportKapAndreevoCard");
+const ReportLesovoCash = document.getElementById("ReportLesovoCash");
+const ReportLesovoCard = document.getElementById("ReportLesovoCard");
+const ReportTotal = document.getElementById("ReportTotal");
+const ReportMsg = document.getElementById("ReportMsg");
+
+// The report is a company-wide aggregate, so broker accounts never see it.
+// Hide immediately (before any async load) to avoid a flash of empty report.
+if (Report && isBroker) Report.classList.add("hidden");
 
 UserName.textContent = getUsername();
 LogoutBtn.addEventListener("click", () => {
@@ -154,6 +168,117 @@ function localDateString(d = new Date()) {
   const p = (n) => String(n).padStart(2, "0");
   return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
 }
+
+// --- Payment report (company-wide totals) ------------------------------------
+
+// Read a number from a set of candidate field names on an object. Returns
+// `undefined` when no usable value is found, so callers can chain fallbacks.
+function pickPaymentValue(data, keys) {
+  if (!data) return undefined;
+  for (const key of keys) {
+    const v = data[key];
+    if (v === undefined || v === null || v === "") continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+// Accept both a flat shape ({ kapAndreevoCash, kapAndreevoCard, ... }) and a
+// nested shape ({ kapAndreevo: { cash, card }, lesovo: { cash, card } }).
+function normalizePayments(data) {
+  data = data || {};
+  const kap = data.kapAndreevo || data.KapAndreevo || {};
+  const les = data.lesovo || data.Lesovo || {};
+  return {
+    kapAndreevoCash:
+      pickPaymentValue(data, ["kapAndreevoCash", "KapAndreevoCash", "cashKapAndreevo"]) ??
+      pickPaymentValue(kap, ["cash"]) ??
+      0,
+    kapAndreevoCard:
+      pickPaymentValue(data, ["kapAndreevoCard", "KapAndreevoCard", "cardKapAndreevo"]) ??
+      pickPaymentValue(kap, ["card"]) ??
+      0,
+    lesovoCash:
+      pickPaymentValue(data, ["lesovoCash", "LesovoCash", "cashLesovo"]) ??
+      pickPaymentValue(les, ["cash"]) ??
+      0,
+    lesovoCard:
+      pickPaymentValue(data, ["lesovoCard", "LesovoCard", "cardLesovo"]) ??
+      pickPaymentValue(les, ["card"]) ??
+      0,
+  };
+}
+
+// Default range = the current biweekly payment window; fall back to the last
+// two weeks when no schedule is available yet.
+function defaultReportRange() {
+  const start = schedule && schedule.windowStart ? toDate(schedule.windowStart) : null;
+  const end = schedule && schedule.windowEnd ? toDate(schedule.windowEnd) : null;
+  if (start && end) return { from: localDateString(start), to: localDateString(end) };
+  const e = new Date();
+  const s = new Date();
+  s.setDate(e.getDate() - 13);
+  return { from: localDateString(s), to: localDateString(e) };
+}
+
+async function loadReport() {
+  if (!Report) return;
+
+  // Company-wide aggregate — only meaningful for admins/workers.
+  if (isBroker) {
+    Report.classList.add("hidden");
+    return;
+  }
+  Report.classList.remove("hidden");
+
+  if (!ReportFrom.value || !ReportTo.value) {
+    const r = defaultReportRange();
+    if (!ReportFrom.value) ReportFrom.value = r.from;
+    if (!ReportTo.value) ReportTo.value = r.to;
+  }
+
+  const brokerTotal = brokers.reduce(
+    (sum, b) => sum + Number(b.CashBalance || 0),
+    0
+  );
+  ReportBrokerBalance.textContent = formatMoney(brokerTotal);
+
+  const from = ReportFrom.value.trim();
+  const to = ReportTo.value.trim();
+  const qs = [];
+  if (from) qs.push("from=" + encodeURIComponent(from));
+  if (to) qs.push("to=" + encodeURIComponent(to));
+
+  let payments = { kapAndreevoCash: 0, kapAndreevoCard: 0, lesovoCash: 0, lesovoCard: 0 };
+  ReportMsg.textContent = "";
+  ReportMsg.className = "msg report-msg";
+  try {
+    const data = await api(
+      "/reports/payments" + (qs.length ? "?" + qs.join("&") : "")
+    );
+    payments = normalizePayments(data);
+  } catch (err) {
+    ReportMsg.textContent = err.message || t("report.loadFailed");
+    ReportMsg.className = "msg report-msg error";
+  }
+
+  ReportKapAndreevoCash.textContent = formatMoney(payments.kapAndreevoCash);
+  ReportKapAndreevoCard.textContent = formatMoney(payments.kapAndreevoCard);
+  ReportLesovoCash.textContent = formatMoney(payments.lesovoCash);
+  ReportLesovoCard.textContent = formatMoney(payments.lesovoCard);
+
+  const total =
+    brokerTotal +
+    payments.kapAndreevoCash +
+    payments.kapAndreevoCard +
+    payments.lesovoCash +
+    payments.lesovoCard;
+  ReportTotal.textContent = formatMoney(total);
+}
+
+ReportFrom.addEventListener("change", loadReport);
+ReportTo.addEventListener("change", loadReport);
 
 // Local calendar day of a policy's creation date, as "YYYY-MM-DD".
 function policyDay(p) {
@@ -450,6 +575,7 @@ async function load() {
     brokers = data.brokers || [];
     schedule = data.schedule || null;
     renderBrokerList();
+    loadReport();
     if (brokers.length > 0) await selectBroker(brokers[0].id);
   } catch (err) {
     if (err.status === 401 || err.status === 403) {

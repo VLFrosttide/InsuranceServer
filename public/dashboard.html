@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title data-i18n="title.dashboard">Broker Bi-Weekly Report</title>
-    <link rel="stylesheet" href="style.css"/>
+    <link rel="stylesheet" href="style.css?v=1"/>
 </head>
 <body class="app-body">
     <header class="topbar">
@@ -21,6 +21,45 @@
             <button id="LogoutBtn" class="btn-ghost" data-i18n="logout">Logout</button>
         </div>
     </header>
+
+    <section id="Report" class="report">
+        <div class="report-head">
+            <h2 data-i18n="report.title">Payment report</h2>
+            <div class="report-controls">
+                <label for="ReportFrom" data-i18n="report.from">From</label>
+                <input id="ReportFrom" type="date" class="date-input" />
+                <label for="ReportTo" data-i18n="report.to">To</label>
+                <input id="ReportTo" type="date" class="date-input" />
+            </div>
+        </div>
+        <div class="report-grid">
+            <div class="report-item">
+                <span class="report-label" data-i18n="report.brokerBalance">Total broker balance</span>
+                <span id="ReportBrokerBalance" class="report-value">—</span>
+            </div>
+            <div class="report-item">
+                <span class="report-label" data-i18n="report.kapAndreevoCash">Cash · Kapitan Andreevo</span>
+                <span id="ReportKapAndreevoCash" class="report-value">—</span>
+            </div>
+            <div class="report-item">
+                <span class="report-label" data-i18n="report.kapAndreevoCard">Card · Kapitan Andreevo</span>
+                <span id="ReportKapAndreevoCard" class="report-value">—</span>
+            </div>
+            <div class="report-item">
+                <span class="report-label" data-i18n="report.lesovoCash">Cash · Lesovo</span>
+                <span id="ReportLesovoCash" class="report-value">—</span>
+            </div>
+            <div class="report-item">
+                <span class="report-label" data-i18n="report.lesovoCard">Card · Lesovo</span>
+                <span id="ReportLesovoCard" class="report-value">—</span>
+            </div>
+            <div class="report-item report-total">
+                <span class="report-label" data-i18n="report.sum">Grand total</span>
+                <span id="ReportTotal" class="report-value">—</span>
+            </div>
+        </div>
+        <p id="ReportMsg" class="msg report-msg" role="alert" aria-live="polite"></p>
+    </section>
 
     <main class="layout">
         <aside class="sidebar">
@@ -215,8 +254,8 @@
         </div>
     </div>
 
-    <script src="i18n.js"></script>
-    <script src="common.js"></script>
-    <script src="dashboard.js"></script>
+    <script src="i18n.js?v=1"></script>
+    <script src="common.js?v=1"></script>
+    <script src="dashboard.js?v=1"></script>
 </body>
 </html>

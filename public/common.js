@@ -1,13 +1,13 @@
 "use strict";
 // Shared helpers for the Insurance website (broker/admin dashboard).
 //
-// The InsuranceServer API base. When the website is served by InsuranceServer
-// (same origin), we call the API relative to the current host so the site works
-// no matter which domain it is deployed on. For local development open the
-// site as index3.html?api=http://127.0.0.1:5501 to talk to a locally running
-// InsuranceServer instead.
+// The InsuranceServer API base. The production server is the default; for
+// local development open the site as  index.html?api=http://127.0.0.1:5501
+// so the same page talks to a locally running InsuranceServer.
 
-const API_BASE = new URLSearchParams(window.location.search).get("api") || "";
+const API_BASE =
+  new URLSearchParams(window.location.search).get("api") ||
+  "https://lavender-quail-935384.hostingersite.com";
 
 const ROLE_LABELS = { "1": "Admin", "2": "Worker", "3": "Client" };
 
