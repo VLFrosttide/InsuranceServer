@@ -373,6 +373,47 @@ function brokerNameMatches(storedBroker, query) {
 }
 module.exports.brokerNameMatches = brokerNameMatches;
 
+// ---------------------------------------------------------------------------
+// Policy currency rules: TRY is restricted to Lesovo / Kap Andreevo Auto.
+// ---------------------------------------------------------------------------
+// Turkish lira is only valid for Auto policies issued at the two border
+// crossings (Lesovo and Kap Andreevo). Every other vehicle type and every
+// other branch is EUR only. These helpers enforce that rule on both policy
+// creation and editing.
+const TRY_BRANCH_QUERIES = ["lesovo", "kap andreevo"];
+const AUTO_VEHICLE_NAMES = new Set([
+  "auto", "otomobil", "araba", "car", "avtomobil", "kola", "leka kola",
+]);
+
+function isTryEligibleBranch(branch) {
+  return TRY_BRANCH_QUERIES.some((q) => brokerNameMatches(branch, q));
+}
+module.exports.isTryEligibleBranch = isTryEligibleBranch;
+
+function isAutoVehicle(otomobil) {
+  const s = transliterateBulgarian(otomobil).replace(/\s+/g, " ").trim();
+  return AUTO_VEHICLE_NAMES.has(s);
+}
+module.exports.isAutoVehicle = isAutoVehicle;
+
+// Normalise an incoming currency code to "EUR" or "TRY". Anything unknown,
+// empty (or the removed "USD" code) falls back to EUR so legacy callers and
+// older records keep working.
+function normalizePolicyCurrency(value) {
+  const s = String(value == null ? "" : value).trim().toUpperCase();
+  return s === "TRY" ? "TRY" : "EUR";
+}
+module.exports.normalizePolicyCurrency = normalizePolicyCurrency;
+
+// Return a human-readable error when a policy's (branch, vehicle, currency)
+// combination breaks the rule, or null when it is allowed.
+function validatePolicyCurrency(branch, otomobil, currency) {
+  if (currency !== "TRY") return null;
+  if (isTryEligibleBranch(branch) && isAutoVehicle(otomobil)) return null;
+  return "Turkish lira is only allowed for Auto policies at the Lesovo / Kap Andreevo border crossings";
+}
+module.exports.validatePolicyCurrency = validatePolicyCurrency;
+
 
 /**
  * Create the tiered router.
@@ -836,10 +877,15 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       const blancNumber = b.BlancNumber ?? b.blancNumber ?? "";
       const carNumber = b.CarNumber ?? b.carNumber ?? "";
       const price = String(b.Price ?? b.price ?? "0");
-      const currencyType = b.CurrencyType ?? b.currencyType ?? "";
+      const currencyType = normalizePolicyCurrency(b.CurrencyType ?? b.currencyType ?? "");
       const duration = parseDurationDays(b.Duration ?? b.duration ?? 0);
       const branch = b.Branch ?? b.branch ?? "";
       const otomobil = b.Otomobil ?? b.otomobil ?? "";
+      // Turkish lira only applies to Auto policies at Lesovo / Kap Andreevo.
+      const currencyError = validatePolicyCurrency(branch, otomobil, currencyType);
+      if (currencyError) {
+        return res.status(400).json({ error: currencyError });
+      }
       const requestedPayment = resolvePaymentType(
         b.Cash ?? b.cash ?? b.PaymentType ?? b.paymentType
       );
@@ -1379,6 +1425,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             if (column === "PaymentType") v = finalPayment;
             else if (column === "Price") v = String(value);
             else if (column === "NonTurk") v = toFlag(value) ? 1 : 0;
+            else if (column === "CurrencyType") v = normalizePolicyCurrency(value);
             else if (column === "CardFee") {
               v = finalPayment === "Card" && toFlag(value) ? 1 : 0;
               cardFeeHandled = true;
@@ -1501,10 +1548,28 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             ? String(newBranchValue)
             : oldBranch;
         const newCurrencyValue = b.CurrencyType ?? b.currencyType;
-        const newCurrency =
+        const newCurrency = normalizePolicyCurrency(
           newCurrencyValue !== undefined && newCurrencyValue !== null
             ? newCurrencyValue
-            : oldCurrency;
+            : oldCurrency
+        );
+
+        // Turkish lira only applies to Auto policies at the Lesovo / Kap
+        // Andreevo border crossings. Validate the edited combination before
+        // any money moves or the row is written.
+        const newOtomobilValue = b.Otomobil ?? b.otomobil;
+        const newOtomobil =
+          newOtomobilValue !== undefined && newOtomobilValue !== null
+            ? String(newOtomobilValue)
+            : String(insurance.Otomobil ?? "");
+        const currencyError = validatePolicyCurrency(
+          newBranch,
+          newOtomobil,
+          newCurrency
+        );
+        if (currencyError) {
+          return res.status(400).json({ error: currencyError });
+        }
 
         // Nothing money-related changed (e.g. only the policy number or the
         // start date was corrected): the balances are left untouched, so no

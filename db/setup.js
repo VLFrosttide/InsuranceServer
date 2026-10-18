@@ -777,13 +777,29 @@ async function runSetup(config = {}) {
        InsuranceType VARCHAR(45) NOT NULL,
        Duration INT NOT NULL,
        Price DECIMAL(10,2) NOT NULL,
+       Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
        CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
        UpdatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
        PRIMARY KEY (id),
-       UNIQUE KEY uq_branch_tariff (Branch, InsuranceType, Duration),
+       UNIQUE KEY uq_branch_tariff (Branch, InsuranceType, Duration, Currency),
        KEY idx_branch_tariffs_branch (Branch)
      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
    `);
+
+  // branch_tariffs now stores a Currency (EUR/TRY) so the Lesovo / Kap
+  // Andreevo crossings can quote Auto policies in Turkish lira separately
+  // from their EUR walk-in rates. Re-key the unique index for older DBs.
+  const [branchTariffCols] = await db.query(
+    "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    [DB_NAME, "branch_tariffs"]
+  );
+  const branchTariffColNames = new Set(branchTariffCols.map((c) => c.COLUMN_NAME));
+  if (!branchTariffColNames.has("Currency")) {
+    await db.query("ALTER TABLE branch_tariffs ADD COLUMN Currency VARCHAR(3) NOT NULL DEFAULT 'EUR'");
+    await db.query("ALTER TABLE branch_tariffs DROP INDEX uq_branch_tariff");
+    await db.query("ALTER TABLE branch_tariffs ADD UNIQUE KEY uq_branch_tariff (Branch, InsuranceType, Duration, Currency)");
+    console.log("Added branch_tariffs.Currency column and re-keyed its unique index");
+  }
 
   // Blanc batches handed to brokers: one row per [RangeStart, RangeEnd]
   // batch. A broker's inactive blancs are calculated from all of its batches

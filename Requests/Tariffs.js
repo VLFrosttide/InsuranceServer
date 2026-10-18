@@ -14,6 +14,20 @@ const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
 const { resolveBrokerByEmail, effectivePricingFor } = require("./Brokers.js");
 
+// Split branch tariff rows into EUR (default) and TRY maps. TRY rows only
+// exist for Auto policies at the Lesovo / Kap Andreevo border crossings.
+function toCurrencyPricing(rows) {
+  const pricing = {};
+  const tryPricing = {};
+  for (const tariff of rows) {
+    const isTry = String(tariff.Currency || "").toUpperCase() === "TRY";
+    const target = isTry ? tryPricing : pricing;
+    if (!target[tariff.InsuranceType]) target[tariff.InsuranceType] = {};
+    target[tariff.InsuranceType][tariff.Duration] = parseFloat(tariff.Price);
+  }
+  return { pricing, tryPricing };
+}
+
 /**
  * Create the tariffs router.
  *
@@ -60,29 +74,26 @@ module.exports.createTariffsRouter = function createTariffsRouter(
       if (!brokerId) {
         const branch =
           typeof req.query.branch === "string" ? req.query.branch.trim() : "";
-        const fallback = {};
+        let pricing = {};
+        let tryPricing = {};
         if (branch) {
           const [branchTariffs] = await DBConnection.query(
-            `SELECT InsuranceType, Duration, Price
+            `SELECT InsuranceType, Duration, Price, Currency
                FROM branch_tariffs
               WHERE Branch = ?
               ORDER BY InsuranceType, Duration`,
             [branch]
           );
-          for (const tariff of branchTariffs) {
-            if (!fallback[tariff.InsuranceType]) {
-              fallback[tariff.InsuranceType] = {};
-            }
-            fallback[tariff.InsuranceType][tariff.Duration] = parseFloat(
-              tariff.Price
-            );
-          }
+          const split = toCurrencyPricing(branchTariffs);
+          pricing = split.pricing;
+          tryPricing = split.tryPricing;
         }
         return res.json({
           brokerName: null,
           brokerId: null,
           source: branch ? "branch" : "none",
-          pricing: fallback,
+          pricing,
+          tryPricing,
         });
       }
 
@@ -119,19 +130,6 @@ module.exports.createTariffsRouter = function createTariffsRouter(
         const branch =
           typeof req.query.branch === "string" ? req.query.branch.trim() : "";
 
-        const toPricing = (rows) => {
-          const pricing = {};
-          for (const tariff of rows) {
-            if (!pricing[tariff.InsuranceType]) {
-              pricing[tariff.InsuranceType] = {};
-            }
-            pricing[tariff.InsuranceType][tariff.Duration] = parseFloat(
-              tariff.Price
-            );
-          }
-          return pricing;
-        };
-
         if (from.trim()) {
           const broker = await resolveBrokerByEmail(DBConnection, from);
           if (broker) {
@@ -152,17 +150,20 @@ module.exports.createTariffsRouter = function createTariffsRouter(
         }
 
         let pricing = {};
+        let tryPricing = {};
         if (branch) {
           const [rows] = await DBConnection.query(
-            `SELECT InsuranceType, Duration, Price
+            `SELECT InsuranceType, Duration, Price, Currency
                FROM branch_tariffs
               WHERE Branch = ?
               ORDER BY InsuranceType, Duration`,
             [branch]
           );
-          pricing = toPricing(rows);
+          const split = toCurrencyPricing(rows);
+          pricing = split.pricing;
+          tryPricing = split.tryPricing;
         }
-        res.json({ source: "branch", branch, pricing });
+        res.json({ source: "branch", branch, pricing, tryPricing });
       } catch (err) {
         console.error("Failed to fetch policy pricing:", err);
         res.status(500).json({ error: "Failed to fetch pricing" });
@@ -381,26 +382,19 @@ module.exports.createTariffsRouter = function createTariffsRouter(
       const branchName = decodeURIComponent(req.params.branchName);
 
       const [tariffs] = await DBConnection.query(
-        `SELECT InsuranceType, Duration, Price
+        `SELECT InsuranceType, Duration, Price, Currency
            FROM branch_tariffs
           WHERE Branch = ?
           ORDER BY InsuranceType, Duration`,
         [branchName]
       );
 
-      const pricing = {};
-      for (const tariff of tariffs) {
-        if (!pricing[tariff.InsuranceType]) {
-          pricing[tariff.InsuranceType] = {};
-        }
-        pricing[tariff.InsuranceType][tariff.Duration] = parseFloat(
-          tariff.Price
-        );
-      }
+      const { pricing, tryPricing } = toCurrencyPricing(tariffs);
 
       res.json({
         branch: branchName,
         pricing,
+        tryPricing,
       });
     } catch (err) {
       console.error("Failed to fetch branch pricing:", err);

@@ -65,7 +65,7 @@ let Sevgin = [
 let Varna = ["goro_emirates@abv.bg"]; // Kap.andreevo.
 let Barutcu = ["barutcudinlenmetesisi@gmail.com"]; // Lesovo
 
-let Pricing = {
+let EuroPricing = {
   Nikolay: {
     Auto: {
       15: 25,
@@ -771,6 +771,18 @@ let Pricing = {
   },
 };
 
+// Turkish-lira pricing applies ONLY to Auto policies issued at the Lesovo
+// and Kap Andreevo border crossings. Every other vehicle type and every
+// other broker/branch is EUR only.
+let TryPricing = {
+  Lesovo: {
+    Auto: { 15: 1600, 30: 2000, 90: 2200 },
+  },
+  KapAndreevo: {
+    Auto: { 15: 1600, 30: 2000, 90: 2200 },
+  },
+};
+
 // Broker data mapping
 const BrokerData = {
   Ahmed: Ahmed,
@@ -816,7 +828,7 @@ const BrokerData = {
 };
 
 /**
- * Seed the tariffs of one broker from the Pricing table above, but only when
+ * Seed the tariffs of one broker from the EuroPricing table above, but only when
  * the database holds no tariffs for that broker yet (never overwrites data).
  *
  * @param {import("mysql2/promise").Connection} db
@@ -825,7 +837,7 @@ const BrokerData = {
  * @returns {Promise<number>} number of tariff rows inserted
  */
 async function seedBrokerTariffsIfMissing(db, brokerId, brokerName) {
-  const brokerPricing = Pricing[brokerName];
+  const brokerPricing = EuroPricing[brokerName];
   if (!brokerPricing) return 0;
 
   const [[{ n }]] = await db.query(
@@ -861,7 +873,7 @@ const BranchPricingKeys = {
 };
 
 /**
- * Seed the walk-in tariffs (branch_tariffs) of every branch from the Pricing
+ * Seed the walk-in tariffs (branch_tariffs) of every branch from the EuroPricing
  * table, but only for branches that have no tariffs in the database yet (never
  * overwrites admin edits).
  *
@@ -871,26 +883,34 @@ const BranchPricingKeys = {
 async function seedBranchTariffsIfMissing(db) {
   let inserted = 0;
   for (const [branch, pricingKey] of Object.entries(BranchPricingKeys)) {
-    const branchPricing = Pricing[pricingKey];
-    if (!branchPricing) continue;
+    const euroPricing = EuroPricing[pricingKey];
+    const tryPricing = TryPricing[pricingKey] || null;
+    if (!euroPricing && !tryPricing) continue;
 
-    const [[{ n }]] = await db.query(
-      "SELECT COUNT(*) AS n FROM branch_tariffs WHERE Branch = ?",
-      [branch]
-    );
-    if (n > 0) continue;
+    const seed = async (currency, pricing) => {
+      // Only seed a currency that has no rows yet, so existing EUR tariffs
+      // (and any admin edits) are left untouched while TRY rows are added.
+      const [[{ n }]] = await db.query(
+        "SELECT COUNT(*) AS n FROM branch_tariffs WHERE Branch = ? AND Currency = ?",
+        [branch, currency]
+      );
+      if (n > 0) return;
 
-    for (const [insuranceType, durations] of Object.entries(branchPricing)) {
-      for (const [duration, price] of Object.entries(durations)) {
-        await db.query(
-          `INSERT INTO branch_tariffs (Branch, InsuranceType, Duration, Price)
-           VALUES (?, ?, ?, ?)
-           ON DUPLICATE KEY UPDATE Price = Price`,
-          [branch, insuranceType, parseInt(duration, 10), parseFloat(price)]
-        );
-        inserted++;
+      for (const [insuranceType, durations] of Object.entries(pricing)) {
+        for (const [duration, price] of Object.entries(durations)) {
+          await db.query(
+            `INSERT INTO branch_tariffs (Branch, InsuranceType, Duration, Price, Currency)
+             VALUES (?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE Price = Price`,
+            [branch, insuranceType, parseInt(duration, 10), parseFloat(price), currency]
+          );
+          inserted++;
+        }
       }
-    }
+    };
+
+    if (euroPricing) await seed("EUR", euroPricing);
+    if (tryPricing) await seed("TRY", tryPricing);
   }
   return inserted;
 }
@@ -951,7 +971,7 @@ async function seedBrokersFromInfo(db) {
       );
     }
 
-    // Insert broker tariffs from Pricing data
+    // Insert broker tariffs from EuroPricing data
     await seedBrokerTariffsIfMissing(db, brokerId, brokerName);
 
     seedCount++;
@@ -996,7 +1016,8 @@ async function seedBrokerEmailsIfMissing(db, brokerId, brokerName) {
 
 module.exports = {
   seedBrokerEmailsIfMissing,
-  Pricing,
+  EuroPricing,
+  TryPricing,
   BrokerData,
   seedBrokersFromInfo,
   seedBrokerTariffsIfMissing,

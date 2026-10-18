@@ -2,7 +2,7 @@
 // CurrentCash support (multi-currency, per-branch).
 //
 // Current cash is now tracked as one running balance PER BRANCH PER CURRENCY.
-// Each branch has its own independent cash balance for EUR, USD, and TRY.
+// Each branch has its own independent cash balance for EUR and TRY.
 // It is NOT reset automatically; it resets to 0 only when an admin (role 1) or
 // worker (role 2) explicitly requests it via POST /currentcash/reset, which
 // zeroes every currency at once for the specified branch.
@@ -52,7 +52,7 @@ const { requireAuth, requireRole } = require("./Auth.js");
 const CASH_ROW_ID = 1;
 
 // Supported cash currencies.
-const CURRENCIES = ["EUR", "USD", "TRY"];
+const CURRENCIES = ["EUR", "TRY"];
 
 /**
  * Parse a money value into a number rounded to 2 decimals.
@@ -76,7 +76,7 @@ const toDecimal = (module.exports.toDecimal = function toDecimal(value) {
  * Unknown/empty values fall back to EUR so legacy callers keep working.
  *
  * @param {string} value
- * @returns {"EUR"|"USD"|"TRY"}
+ * @returns {"EUR"|"TRY"}
  */
 const normalizeCurrency = (module.exports.normalizeCurrency =
   function normalizeCurrency(value) {
@@ -297,7 +297,7 @@ const ensureAllCashRows = (module.exports.ensureAllCashRows =
  *
  * @param {import("mysql2/promise").Connection} conn
  * @param {string} branch
- * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, USD: 0, TRY: 0 }
+ * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, TRY: 0 }
  */
 const getCurrentCash = (module.exports.getCurrentCash =
   async function getCurrentCash(conn, branch) {
@@ -334,7 +334,7 @@ const getCurrentCash = (module.exports.getCurrentCash =
  * @param {import("mysql2/promise").Connection} conn
  * @param {string} branch
  * @param {string} nextDate  "YYYY-MM-DD" of the day AFTER the requested day.
- * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, USD: 0, TRY: 0 }
+ * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, TRY: 0 }
  */
 const getCurrentCashAsOf = (module.exports.getCurrentCashAsOf =
   async function getCurrentCashAsOf(conn, branch, nextDate) {
@@ -495,7 +495,7 @@ const getTotalParts = (module.exports.getTotalParts =
  *
  * @param {import("mysql2/promise").Connection} conn
  * @param {string} branch
- * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, USD: 0, TRY: 0 }
+ * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, TRY: 0 }
  */
 const getTotalCash = (module.exports.getTotalCash =
   async function getTotalCash(conn, branch) {
@@ -527,7 +527,7 @@ const getTotalCash = (module.exports.getTotalCash =
  * @param {"increase"|"reduce"} type
  * @param {number|string} amount  Positive value to add/subtract.
  * @param {string} reason  Human-readable reason for the transaction.
- * @param {string} [currency]  Currency code (EUR/USD/TRY).
+ * @param {string} [currency]  Currency code (EUR/TRY).
  * @param {string} [createdAt]  Client's local wall-clock time
  *   ("YYYY-MM-DD HH:MM:SS"). Defaults to the server's UTC clock.
  * @returns {Promise<number>} The applied amount (rounded to 2 decimals).
@@ -1244,7 +1244,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
          GROUP BY Currency`,
         [day.date, day.nextDate]
       );
-      const totalDailyCash = { EUR: 0, USD: 0, TRY: 0 };
+      const totalDailyCash = { EUR: 0, TRY: 0 };
       for (const row of cash) {
         totalDailyCash[normalizeCurrency(row.Currency)] = Number(row.Net) || 0;
       }
@@ -1288,7 +1288,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         for (const row of rows) {
           let entry = index.get(row.Branch);
           if (!entry) {
-            entry = { Branch: row.Branch, EUR: 0, USD: 0, TRY: 0 };
+            entry = { Branch: row.Branch, EUR: 0, TRY: 0 };
             index.set(row.Branch, entry);
             out.push(entry);
           }

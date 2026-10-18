@@ -74,7 +74,7 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
       const toParam = addOneDay(toRaw);
 
       // Aggregate walk-in Cash/Card policies by branch and payment type. Sums
-      // across currencies (EUR/USD/TRY) into a single figure per metric, which
+      // across currencies (EUR/TRY) into a single figure per metric, which
       // is what the website's single-number report expects.
       const [rows] = await DBConnection.query(
         `SELECT Branch, PaymentType,

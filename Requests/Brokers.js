@@ -37,7 +37,7 @@
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
-const { Pricing, seedBrokerTariffsIfMissing } = require("../db/BrokerInfo.js");
+const { EuroPricing, seedBrokerTariffsIfMissing } = require("../db/BrokerInfo.js");
 const {
   toDecimal,
   recordCashMovement,
@@ -2178,7 +2178,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       // Parent (main) broker mapping. Undefined = unchanged; null = clear the
       // mapping; a positive number = map this broker as an underling of it.
       if (b.ParentBrokerId !== undefined || b.parentBrokerId !== undefined) {
-        const raw = b.ParentBrokerId ?? b.parentBrokerId;
+        // An explicit `null` must survive: `??` would collapse it into the
+        // absent camelCase fallback (undefined), turning "clear" into NaN and
+        // wrongly rejecting the request.
+        const raw =
+          b.ParentBrokerId !== undefined ? b.ParentBrokerId : b.parentBrokerId;
         const parentBrokerId =
           raw === null || raw === "" ? null : Number(raw);
         if (
@@ -2554,7 +2558,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         let sourceBrokerName = null;
 
         // Nothing in the database yet: fall back to BrokerInfo.js and seed it.
-        if (Object.keys(pricing).length === 0 && Pricing[brokerName]) {
+        if (Object.keys(pricing).length === 0 && EuroPricing[brokerName]) {
           try {
             await seedBrokerTariffsIfMissing(
               DBConnection,
@@ -2568,7 +2572,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           if (Object.keys(pricing).length === 0) {
             // Seeding failed: still show the BrokerInfo.js values.
             for (const [type, durations] of Object.entries(
-              Pricing[brokerName]
+              EuroPricing[brokerName]
             )) {
               pricing[type] = {};
               for (const [d, p] of Object.entries(durations)) {
