@@ -12,7 +12,7 @@
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
-const { resolveBrokerByEmail } = require("./Brokers.js");
+const { resolveBrokerByEmail, effectivePricingFor } = require("./Brokers.js");
 
 /**
  * Create the tariffs router.
@@ -47,7 +47,11 @@ module.exports.createTariffsRouter = function createTariffsRouter(
   router.get("/tariffs/my-pricing", auth, async (req, res) => {
     try {
       const brokerName = req.user.username;
-      const brokerId = await getBrokerIdByName(brokerName);
+      // Prefer the broker link carried by the session; fall back to resolving
+      // by username (legacy behaviour).
+      const brokerId = req.user.brokerId
+        ? Number(req.user.brokerId)
+        : await getBrokerIdByName(brokerName);
 
       // The logged-in user is not a broker (e.g. a worker or admin). That is a
       // normal situation, not an error: fall back to the walk-in tariffs of the
@@ -82,29 +86,16 @@ module.exports.createTariffsRouter = function createTariffsRouter(
         });
       }
 
-      const [tariffs] = await DBConnection.query(
-        `SELECT InsuranceType, Duration, Price
-           FROM broker_tariffs
-          WHERE BrokerId = ?
-          ORDER BY InsuranceType, Duration`,
-        [brokerId]
-      );
-
-      // Format as nested structure for easier client consumption
-      const pricing = {};
-      for (const tariff of tariffs) {
-        if (!pricing[tariff.InsuranceType]) {
-          pricing[tariff.InsuranceType] = {};
-        }
-        pricing[tariff.InsuranceType][tariff.Duration] = parseFloat(
-          tariff.Price
-        );
-      }
+      // Use effective pricing: a sub-broker (underling) without its own tariffs
+      // inherits the main broker's price for its insurances.
+      const eff = await effectivePricingFor(DBConnection, brokerId);
 
       res.json({
         brokerName,
         brokerId,
-        pricing,
+        pricing: eff.pricing,
+        inherited: eff.inherited,
+        sourceBrokerName: eff.sourceBrokerName,
       });
     } catch (err) {
       console.error("Failed to fetch broker pricing:", err);
@@ -144,19 +135,17 @@ module.exports.createTariffsRouter = function createTariffsRouter(
         if (from.trim()) {
           const broker = await resolveBrokerByEmail(DBConnection, from);
           if (broker) {
-            const [rows] = await DBConnection.query(
-              `SELECT InsuranceType, Duration, Price
-                 FROM broker_tariffs
-                WHERE BrokerId = ?
-                ORDER BY InsuranceType, Duration`,
-              [broker.id]
-            );
-            if (rows.length) {
+            // Effective pricing with parent inheritance: a sub-broker without
+            // its own tariffs gets its main broker's price.
+            const eff = await effectivePricingFor(DBConnection, broker.id);
+            if (Object.keys(eff.pricing).length > 0) {
               return res.json({
                 source: "broker",
                 brokerId: broker.id,
                 brokerName: broker.name,
-                pricing: toPricing(rows),
+                inherited: eff.inherited,
+                sourceBrokerName: eff.sourceBrokerName,
+                pricing: eff.pricing,
               });
             }
           }
@@ -185,7 +174,7 @@ module.exports.createTariffsRouter = function createTariffsRouter(
   router.get(
     "/tariffs/broker/:brokerId",
     auth,
-    requireWorkerOrAdmin,
+    requireAdmin,
     async (req, res) => {
       try {
         const brokerId = parseInt(req.params.brokerId, 10);

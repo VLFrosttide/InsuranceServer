@@ -865,6 +865,16 @@ async function runSetup(config = {}) {
     "ALTER TABLE brokers MODIFY COLUMN CashBalance DECIMAL(15,2) NOT NULL DEFAULT 0"
   );
 
+  // Parent broker relationship: a sub-broker ("underling") can be mapped to a
+  // main broker. Sub-brokers without their own tariffs inherit the main
+  // broker's pricing (see Requests/Brokers.js effectivePricingFor).
+  if (!brokerColNames.has("ParentBrokerId")) {
+    await db.query(
+      "ALTER TABLE brokers ADD COLUMN ParentBrokerId INT NULL, ADD KEY idx_brokers_parent (ParentBrokerId)"
+    );
+    console.log("Added brokers.ParentBrokerId column");
+  }
+
   // Seed brokers + their tariffs from BrokerInfo.js. Idempotent: existing
   // brokers/tariffs are never overwritten.
   try {

@@ -6,7 +6,7 @@ const role = getRole();
 const isBroker = role === "3" && !!getBrokerId();
 if (!getToken() || (role !== "1" && role !== "2" && !isBroker)) {
   clearSession();
-  window.location.replace("index3.html");
+  window.location.replace("index.html");
 }
 
 // A broker only ever has one broker, so hide the search box and relabel.
@@ -48,7 +48,7 @@ const PoliciesTotalBalance = document.getElementById("PoliciesTotalBalance");
 UserName.textContent = getUsername();
 LogoutBtn.addEventListener("click", () => {
   clearSession();
-  window.location.replace("index3.html");
+  window.location.replace("index.html");
 });
 
 let brokers = [];
@@ -454,7 +454,7 @@ async function load() {
   } catch (err) {
     if (err.status === 401 || err.status === 403) {
       clearSession();
-      window.location.replace("index3.html");
+      window.location.replace("index.html");
       return;
     }
     BrokerList.innerHTML = "";
@@ -752,3 +752,210 @@ RegistrationsBtn.addEventListener("click", openRegistrations);
 RegistrationsCloseBtn.addEventListener("click", () =>
   closeOverlay(RegistrationsOverlay)
 );
+
+// --- Main broker: sub-brokers (underlings) + per-broker pricing -------------
+
+const SubBrokersPanel = document.getElementById("SubBrokersPanel");
+const UnderlingsList = document.getElementById("UnderlingsList");
+const UnderlingFrom = document.getElementById("UnderlingFrom");
+const UnderlingTo = document.getElementById("UnderlingTo");
+const UnderlingClearBtn = document.getElementById("UnderlingClearBtn");
+const PricingOverlay = document.getElementById("PricingOverlay");
+const PricingTitle = document.getElementById("PricingTitle");
+const PricingMeta = document.getElementById("PricingMeta");
+const PricingTable = document.getElementById("PricingTable");
+const PricingSaveBtn = document.getElementById("PricingSaveBtn");
+const PricingMsg = document.getElementById("PricingMsg");
+const PricingCloseBtn = document.getElementById("PricingCloseBtn");
+
+const myBrokerId = getBrokerId() ? Number(getBrokerId()) : null;
+let pricingTarget = null; // { id, name }
+let pricingData = null;   // { vehicleType: { duration: price } }
+
+function underlingDateParams() {
+  const from = UnderlingFrom ? UnderlingFrom.value.trim() : "";
+  const to = UnderlingTo ? UnderlingTo.value.trim() : "";
+  const qs = [];
+  if (from) qs.push("from=" + encodeURIComponent(from));
+  if (to) qs.push("to=" + encodeURIComponent(to));
+  return qs.length ? "?" + qs.join("&") : "";
+}
+
+async function loadUnderlings() {
+  if (!isBroker || !myBrokerId || !SubBrokersPanel) return;
+  try {
+    const data = await api(
+      "/brokers/" + myBrokerId + "/underlings" + underlingDateParams()
+    );
+    const list = data.underlings || [];
+    if (list.length === 0) {
+      SubBrokersPanel.classList.add("hidden");
+      return;
+    }
+    SubBrokersPanel.classList.remove("hidden");
+    renderUnderlings(list);
+  } catch (err) {
+    if (err.status === 403) {
+      SubBrokersPanel.classList.add("hidden");
+      return;
+    }
+    UnderlingsList.innerHTML = "";
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = err.message || t("underlings.loadFailed");
+    UnderlingsList.appendChild(li);
+    SubBrokersPanel.classList.remove("hidden");
+  }
+}
+
+function renderUnderlings(list) {
+  UnderlingsList.innerHTML = "";
+  for (const u of list) {
+    const li = document.createElement("li");
+    li.className = "underling-item";
+
+    const name = document.createElement("button");
+    name.type = "button";
+    name.className = "underling-name";
+    name.textContent = u.Name;
+    name.title = t("pricing.title");
+    name.addEventListener("click", () => openPricing(u.id, u.Name));
+
+    const meta = document.createElement("span");
+    meta.className = "underling-meta";
+    meta.textContent =
+      t("underlings.policiesCount", { n: u.policyCount }) +
+      " · " + formatMoney(u.totalPrice);
+
+    li.appendChild(name);
+    li.appendChild(meta);
+    UnderlingsList.appendChild(li);
+  }
+}
+
+UnderlingFrom.addEventListener("change", loadUnderlings);
+UnderlingTo.addEventListener("change", loadUnderlings);
+UnderlingClearBtn.addEventListener("click", () => {
+  UnderlingFrom.value = "";
+  UnderlingTo.value = "";
+  loadUnderlings();
+});
+
+// --- Per-broker pricing modal ---------------------------------------------
+
+function buildPricingGrid(pricing) {
+  const types = Object.keys(pricing || {}).sort();
+  const durations = new Set();
+  for (const t of types) {
+    for (const d of Object.keys(pricing[t] || {})) durations.add(Number(d));
+  }
+  return { types, durations: Array.from(durations).sort((a, b) => a - b) };
+}
+
+function renderPricingGrid() {
+  const pricing = pricingData || {};
+  const { types, durations } = buildPricingGrid(pricing);
+
+  PricingTable.innerHTML = "";
+
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+  const thType = document.createElement("th");
+  thType.textContent = t("pricing.vehicleType");
+  hr.appendChild(thType);
+  for (const d of durations) {
+    const th = document.createElement("th");
+    th.className = "num";
+    th.textContent = d;
+    hr.appendChild(th);
+  }
+  thead.appendChild(hr);
+  PricingTable.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  for (const typeName of types) {
+    const tr = document.createElement("tr");
+    const tdType = document.createElement("td");
+    tdType.textContent = typeName;
+    tr.appendChild(tdType);
+    for (const d of durations) {
+      const td = document.createElement("td");
+      td.className = "num";
+      const input = document.createElement("input");
+      input.type = "number";
+      input.min = "0";
+      input.step = "0.01";
+      input.className = "pricing-input";
+      input.dataset.type = typeName;
+      input.dataset.duration = String(d);
+      const val = pricing[typeName] && pricing[typeName][String(d)];
+      if (val !== undefined && val !== null && val !== "") input.value = val;
+      td.appendChild(input);
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  PricingTable.appendChild(tbody);
+}
+
+async function openPricing(brokerId, brokerName) {
+  pricingTarget = { id: brokerId, name: brokerName };
+  PricingTitle.textContent = t("pricing.title") + ": " + brokerName;
+  PricingMeta.textContent = "";
+  PricingMsg.textContent = "";
+  PricingMsg.className = "msg";
+  openOverlay(PricingOverlay);
+  try {
+    const data = await api("/brokers/" + brokerId + "/pricing");
+    pricingData = data.pricing || {};
+    if (data.inherited && data.sourceBrokerName) {
+      PricingMeta.textContent = t("pricing.inherited", {
+        name: data.sourceBrokerName,
+      });
+    }
+    renderPricingGrid();
+  } catch (err) {
+    PricingTable.innerHTML = "";
+    PricingMeta.textContent = "";
+    setMsg(PricingMsg, err.message || t("pricing.loadFailed"), true);
+  }
+}
+
+function collectPricing() {
+  const pricing = {};
+  PricingTable.querySelectorAll("input.pricing-input").forEach((input) => {
+    const typeName = input.dataset.type;
+    const duration = input.dataset.duration;
+    const raw = input.value.trim();
+    if (raw === "") return;
+    const num = Number(raw);
+    if (!Number.isFinite(num) || num < 0) return;
+    if (!pricing[typeName]) pricing[typeName] = {};
+    pricing[typeName][duration] = num;
+  });
+  return pricing;
+}
+
+PricingSaveBtn.addEventListener("click", async () => {
+  if (!pricingTarget) return;
+  try {
+    const data = await api("/brokers/" + pricingTarget.id + "/pricing", {
+      method: "PUT",
+      body: JSON.stringify({ pricing: collectPricing() }),
+    });
+    pricingData = data.pricing || {};
+    setMsg(PricingMsg, t("pricing.saved"), false);
+    renderPricingGrid();
+    if (isBroker) await loadUnderlings();
+  } catch (err) {
+    setMsg(PricingMsg, err.message || t("pricing.saveFailed"), true);
+  }
+});
+
+PricingCloseBtn.addEventListener("click", () => closeOverlay(PricingOverlay));
+
+onLangChange(() => {
+  if (isBroker) loadUnderlings();
+});
+
+if (isBroker) loadUnderlings();

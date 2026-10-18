@@ -127,6 +127,22 @@
                     </div>
                 </div>
             </div>
+
+            <div id="SubBrokersPanel" class="detail hidden">
+                <div class="detail-head">
+                    <div class="detail-title">
+                        <h2 data-i18n="underlings.title">Sub-brokers</h2>
+                    </div>
+                    <div class="date-row">
+                        <label for="UnderlingFrom" data-i18n="underlings.from">From</label>
+                        <input id="UnderlingFrom" type="date" class="date-input" />
+                        <label for="UnderlingTo" data-i18n="underlings.to">To</label>
+                        <input id="UnderlingTo" type="date" class="date-input" />
+                        <button id="UnderlingClearBtn" type="button" class="btn-ghost" data-i18n="policies.date.clear">Clear</button>
+                    </div>
+                </div>
+                <ul id="UnderlingsList" class="underling-list"></ul>
+            </div>
         </section>
     </main>
 
@@ -178,6 +194,23 @@
             <div class="modal-body">
                 <ul id="PendingList" class="pending-list"></ul>
                 <p id="PendingMsg" class="msg" role="alert" aria-live="polite"></p>
+            </div>
+        </div>
+    </div>
+
+    <div id="PricingOverlay" class="overlay hidden">
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="PricingTitle">
+            <div class="modal-head">
+                <h2 id="PricingTitle" data-i18n="pricing.title">Set pricing</h2>
+                <button id="PricingCloseBtn" class="btn-ghost" type="button" data-i18n="close">Close</button>
+            </div>
+            <div class="modal-body">
+                <p id="PricingMeta" class="settings-hint"></p>
+                <div class="table-wrap">
+                    <table id="PricingTable" class="report-table pricing-table"></table>
+                </div>
+                <button id="PricingSaveBtn" class="btn-primary" type="button" data-i18n="pricing.save">Save</button>
+                <p id="PricingMsg" class="msg" role="alert" aria-live="polite"></p>
             </div>
         </div>
     </div>

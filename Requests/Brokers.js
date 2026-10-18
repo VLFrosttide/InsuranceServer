@@ -159,6 +159,95 @@ const resolveBrokerByEmail = (module.exports.resolveBrokerByEmail =
   });
 
 /**
+ * Resolve the effective pricing of a broker, inheriting from its parent chain.
+ *
+ * A broker's own rows in `broker_tariffs` always win. When a broker has no
+ * tariffs of its own, its effective pricing is inherited from its main broker
+ * (its `ParentBrokerId`), and recursively up the chain. This lets a main broker
+ * set one price that all of its sub-brokers ("underlings") see for their
+ * insurances, while still allowing a per-underling override.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @returns {Promise<{pricing: object, sourceBrokerId: number|null, sourceBrokerName: string|null, inherited: boolean}>}
+ */
+const effectivePricingFor = (module.exports.effectivePricingFor =
+  async function effectivePricingFor(conn, brokerId) {
+    const toPricing = (rows) => {
+      const pricing = {};
+      for (const row of rows) {
+        if (!pricing[row.InsuranceType]) pricing[row.InsuranceType] = {};
+        pricing[row.InsuranceType][String(row.Duration)] = parseFloat(row.Price);
+      }
+      return pricing;
+    };
+
+    let cursor = brokerId;
+    const visited = new Set();
+    while (cursor && !visited.has(cursor)) {
+      visited.add(cursor);
+      const [[broker]] = await conn.query(
+        "SELECT id, Name, ParentBrokerId FROM brokers WHERE id = ?",
+        [cursor]
+      );
+      if (!broker) break;
+
+      const [rows] = await conn.query(
+        `SELECT InsuranceType, Duration, Price
+           FROM broker_tariffs
+          WHERE BrokerId = ?
+          ORDER BY InsuranceType, Duration`,
+        [cursor]
+      );
+      if (rows.length > 0) {
+        return {
+          pricing: toPricing(rows),
+          sourceBrokerId: broker.id,
+          sourceBrokerName: broker.Name,
+          inherited: broker.id !== brokerId,
+        };
+      }
+
+      cursor = broker.ParentBrokerId ? Number(broker.ParentBrokerId) : null;
+    }
+
+    return {
+      pricing: {},
+      sourceBrokerId: null,
+      sourceBrokerName: null,
+      inherited: false,
+    };
+  });
+
+/**
+ * Return the broker ids a user may manage pricing for. Admins (1) manage every
+ * broker. Workers (2) have no access. A broker (role 3) may manage only their
+ * direct underlings (brokers whose ParentBrokerId points at them) — a broker
+ * cannot set their own price.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {{role: string, brokerId: number|null}} user
+ * @returns {Promise<number|null>} null when unrestricted (admin), or a set of
+ *   allowed ids (possibly empty) for workers/brokers.
+ */
+async function manageableBrokerIds(conn, user) {
+  const role = String(user?.role ?? "");
+  if (role === "1") return null;
+  if (role === "3") {
+    const own = user.brokerId ? Number(user.brokerId) : null;
+    if (!own) return new Set();
+    const ids = new Set();
+    const [underlings] = await conn.query(
+      "SELECT id FROM brokers WHERE ParentBrokerId = ?",
+      [own]
+    );
+    for (const u of underlings) ids.add(u.id);
+    return ids;
+  }
+  return new Set();
+}
+
+/**
  * Deduct the flat fee (the policy price) from a broker's balance. The balance
  * is allowed to go negative. Runs inside the caller's transaction.
  *
@@ -675,7 +764,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
   // InactivePolicies / PolicyRange* are no longer selected: inactive blancs
   // are calculated from the blanc batches (see applyBlancSummary).
-  const BROKER_COLUMNS = "id, Name, CashBalance";
+  const BROKER_COLUMNS = "id, Name, CashBalance, ParentBrokerId";
 
   // The batches table is created on first use (and by db/setup.js), so the
   // server also works on a database that has not been set up again yet.
@@ -1209,14 +1298,42 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           return res.status(404).json({ error: "Broker not found" });
         }
 
+        // Optional date window (?from / ?to, both YYYY-MM-DD) scopes the policy
+        // list. When omitted, the endpoint keeps its historical behaviour of
+        // returning policies since the start of the current bi-weekly period.
+        const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+        const fromParam = String(req.query.from ?? "").trim();
+        const toParam = String(req.query.to ?? "").trim();
+        if ((fromParam && !DATE_RE.test(fromParam)) || (toParam && !DATE_RE.test(toParam))) {
+          return res
+            .status(400)
+            .json({ error: "from/to must be YYYY-MM-DD dates" });
+        }
+
         const schedule = getSchedule(new Date());
+        const conditions = ["BrokerId = ?", "Deleted = 0"];
+        const params = [brokerId];
+        if (fromParam || toParam) {
+          if (fromParam) {
+            conditions.push("CreationDate >= ?");
+            params.push(`${fromParam} 00:00:00`);
+          }
+          if (toParam) {
+            conditions.push("CreationDate < ?");
+            params.push(`${toParam} 23:59:59`);
+          }
+        } else {
+          conditions.push("CreationDate >= ?");
+          params.push(`${schedule.periodStart} 00:00:00`);
+        }
+
         const [policies] = await DBConnection.query(
           `SELECT PolicyNumber, BlancNumber, CarNumber, Price, CurrencyType,
                   Duration, Branch, PaymentType, CreationDate, StartDate
              FROM insurance
-            WHERE BrokerId = ? AND Deleted = 0 AND CreationDate >= ?
+            WHERE ${conditions.join(" AND ")}
             ORDER BY CreationDate DESC`,
-          [brokerId, `${schedule.periodStart} 00:00:00`]
+          params
         );
 
         res.json({
@@ -1231,6 +1348,110 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       } catch (err) {
         console.error("Broker policies lookup failed:", err);
         res.status(500).json({ error: "Failed to fetch broker policies" });
+      }
+    }
+  );
+
+  // GET /brokers/:id/underlings — the sub-brokers mapped to this (main) broker,
+  // each with its insurance count + total price scoped by optional ?from / ?to
+  // dates. A main broker uses this to review each underling and set their price.
+  router.get(
+    "/brokers/:id/underlings",
+    auth,
+    requireBrokerView,
+    async (req, res) => {
+      try {
+        const brokerId = parseBrokerId(req.params.id);
+        if (brokerId === null) {
+          return res.status(400).json({ error: "Invalid broker id" });
+        }
+        if (req.brokerScope !== null && req.brokerScope !== brokerId) {
+          return res
+            .status(403)
+            .json({ error: "Forbidden: you can only view your own underlings" });
+        }
+
+        const [[broker]] = await DBConnection.query(
+          `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
+          [brokerId]
+        );
+        if (!broker) {
+          return res.status(404).json({ error: "Broker not found" });
+        }
+
+        const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+        const fromParam = String(req.query.from ?? "").trim();
+        const toParam = String(req.query.to ?? "").trim();
+        if (
+          (fromParam && !DATE_RE.test(fromParam)) ||
+          (toParam && !DATE_RE.test(toParam))
+        ) {
+          return res
+            .status(400)
+            .json({ error: "from/to must be YYYY-MM-DD dates" });
+        }
+
+        const [underlings] = await DBConnection.query(
+          `SELECT ${BROKER_COLUMNS} FROM brokers WHERE ParentBrokerId = ? ORDER BY id`,
+          [brokerId]
+        );
+        if (underlings.length === 0) {
+          return res.json({
+            broker: { id: broker.id, Name: broker.Name },
+            underlings: [],
+          });
+        }
+
+        const conditions = [
+          `BrokerId IN (${underlings.map(() => "?").join(", ")})`,
+          "Deleted = 0",
+        ];
+        const params = underlings.map((u) => u.id);
+        if (fromParam) {
+          conditions.push("CreationDate >= ?");
+          params.push(`${fromParam} 00:00:00`);
+        }
+        if (toParam) {
+          conditions.push("CreationDate < ?");
+          params.push(`${toParam} 23:59:59`);
+        }
+
+        const [policyRows] = await DBConnection.query(
+          `SELECT BrokerId, COUNT(*) AS policyCount, COALESCE(SUM(Price), 0) AS totalPrice
+             FROM insurance
+            WHERE ${conditions.join(" AND ")}
+            GROUP BY BrokerId`,
+          params
+        );
+        const statsByBroker = new Map(
+          policyRows.map((r) => [
+            r.BrokerId,
+            { policyCount: Number(r.policyCount), totalPrice: Number(r.totalPrice) },
+          ])
+        );
+
+        const result = underlings.map((u) => {
+          const stats = statsByBroker.get(u.id) || {
+            policyCount: 0,
+            totalPrice: 0,
+          };
+          return {
+            id: u.id,
+            Name: u.Name,
+            CashBalance: u.CashBalance,
+            ParentBrokerId: u.ParentBrokerId,
+            policyCount: stats.policyCount,
+            totalPrice: stats.totalPrice,
+          };
+        });
+
+        res.json({
+          broker: { id: broker.id, Name: broker.Name },
+          underlings: result,
+        });
+      } catch (err) {
+        console.error("Broker underlings lookup failed:", err);
+        res.status(500).json({ error: "Failed to fetch underlings" });
       }
     }
   );
@@ -1833,6 +2054,10 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       const cashBalance =
         toNumber(req.body?.CashBalance ?? req.body?.cashBalance) ?? 0;
 
+      // Optional parent (main) broker, mapping this broker as an underling.
+      const parentBrokerId =
+        toNumber(req.body?.ParentBrokerId ?? req.body?.parentBrokerId) ?? null;
+
       // Blanc batches are optional on creation: more can be added any time
       // through POST /brokers/:id/batches.
       const batchList = parseBatchList(req.body);
@@ -1852,13 +2077,23 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           conflict = await findBatchConflict(conn, batches);
           if (conflict) return null;
 
+          if (parentBrokerId !== null) {
+            const [[parent]] = await conn.query(
+              "SELECT id FROM brokers WHERE id = ?",
+              [parentBrokerId]
+            );
+            if (!parent) {
+              throw new Error("Parent broker not found");
+            }
+          }
+
           // The legacy range / counter columns are kept at 0: inactive blancs
           // are calculated from broker_blanc_batches.
           const [result] = await conn.query(
             `INSERT INTO brokers
-               (Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
-             VALUES (?, ?, ?, ?, ?)`,
-            [name, cashBalance, 0, 0, 0]
+               (Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies, ParentBrokerId)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [name, cashBalance, 0, 0, 0, parentBrokerId]
           );
           const id = result.insertId;
           await insertBatches(conn, id, batches, req.user?.username);
@@ -1885,6 +2120,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       const broker = await fetchBroker(res, brokerId);
       res.status(201).json({ message: "Broker created", broker });
     } catch (err) {
+      if (err?.message === "Parent broker not found") {
+        return res.status(400).json({ error: "Parent broker not found" });
+      }
       console.error("Broker create failed:", err);
       res.status(500).json({ error: "Failed to create broker" });
     }
@@ -1935,6 +2173,38 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           params.push(v);
           if (column === "CashBalance") newCashBalance = v;
         }
+      }
+
+      // Parent (main) broker mapping. Undefined = unchanged; null = clear the
+      // mapping; a positive number = map this broker as an underling of it.
+      if (b.ParentBrokerId !== undefined || b.parentBrokerId !== undefined) {
+        const raw = b.ParentBrokerId ?? b.parentBrokerId;
+        const parentBrokerId =
+          raw === null || raw === "" ? null : Number(raw);
+        if (
+          parentBrokerId !== null &&
+          (!Number.isFinite(parentBrokerId) || parentBrokerId <= 0)
+        ) {
+          return res
+            .status(400)
+            .json({ error: "ParentBrokerId must be a positive number or null" });
+        }
+        if (parentBrokerId !== null) {
+          if (parentBrokerId === brokerId) {
+            return res
+              .status(400)
+              .json({ error: "A broker cannot be its own parent" });
+          }
+          const [[parent]] = await DBConnection.query(
+            "SELECT id FROM brokers WHERE id = ?",
+            [parentBrokerId]
+          );
+          if (!parent) {
+            return res.status(400).json({ error: "Parent broker not found" });
+          }
+        }
+        sets.push("ParentBrokerId = ?");
+        params.push(parentBrokerId);
       }
 
       const emails = parseBrokerEmails(b.emails);
@@ -2211,14 +2481,36 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   );
 
   // ---------------------------------------------------------------
-  // Broker Pricing endpoints (admin-only)
+  // Broker Pricing endpoints.
   // ---------------------------------------------------------------
+  // Admins (1) manage every broker's pricing. Workers (2) have no access. A
+  // broker-linked client (role 3) may only manage the pricing of their direct
+  // underlings (sub-brokers) — a main broker sets a price that its underlings
+  // inherit for their insurances, but cannot set their own price.
+
+  // Allow a broker (role 3) to read/manage pricing for their direct underlings
+  // only; admins (1) manage every broker and workers (2) have no access.
+  const requirePricingAccess = async (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    const brokerId = parseBrokerId(req.params.brokerId);
+    if (brokerId === null) {
+      return res.status(400).json({ error: "Invalid broker ID" });
+    }
+    const allowed = await manageableBrokerIds(DBConnection, req.user);
+    if (allowed === null || allowed.has(brokerId)) {
+      req.pricingBrokerId = brokerId;
+      return next();
+    }
+    return res.status(403).json({
+      error: "Forbidden: you can only manage your sub-brokers' pricing",
+    });
+  };
 
   // GET /brokers/:brokerId/pricing — retrieve all pricing for a broker
   router.get(
     "/brokers/:brokerId/pricing",
     auth,
-    requireBrokerRole,
+    requirePricingAccess,
     async (req, res) => {
       try {
         const brokerId = parseBrokerId(req.params.brokerId);
@@ -2258,6 +2550,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
         let pricing = await loadPricing();
         let source = "database";
+        let inherited = false;
+        let sourceBrokerName = null;
 
         // Nothing in the database yet: fall back to BrokerInfo.js and seed it.
         if (Object.keys(pricing).length === 0 && Pricing[brokerName]) {
@@ -2282,7 +2576,21 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               }
             }
           }
-          source = "BrokerInfo";
+          if (Object.keys(pricing).length > 0) {
+            source = "BrokerInfo";
+          }
+        }
+
+        // Still no own tariffs: inherit from the parent (main) broker so a
+        // sub-broker sees the main broker's price for its insurances.
+        if (Object.keys(pricing).length === 0) {
+          const eff = await effectivePricingFor(DBConnection, brokerId);
+          pricing = eff.pricing;
+          inherited = eff.inherited;
+          sourceBrokerName = eff.sourceBrokerName;
+          if (eff.sourceBrokerId !== null && eff.sourceBrokerId !== brokerId) {
+            source = "inherited";
+          }
         }
 
         res.json({
@@ -2290,6 +2598,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           brokerId,
           brokerName,
           source,
+          inherited,
+          sourceBrokerName,
           pricing: pricing,
         });
       } catch (err) {
@@ -2306,7 +2616,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   router.put(
     "/brokers/:brokerId/pricing",
     auth,
-    requireAdmin,
+    requirePricingAccess,
     async (req, res) => {
       try {
         const brokerId = parseBrokerId(req.params.brokerId);
