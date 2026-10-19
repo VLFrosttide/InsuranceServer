@@ -24,10 +24,8 @@ const {
   restoreBrokerForAnnulment,
   restoreBrokerForDeletion,
   adjustBrokerForPriceChange,
-  resolveBrokerCutOff,
   getBrokerAllowNegativeBalance,
 } = require("./Brokers.js");
-const { getSchedule } = require("./PaymentSchedule.js");
 const { sendReply } = require("../Mail/SendReply.js");
 
 /**
@@ -995,32 +993,28 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
       const priceDecimal = toDecimal(price);
 
-      // A broker who missed the last payment and is still negative is cut off:
-      // no new insurances may be created for them until the balance is paid.
+      // A broker that an admin has manually cut off (the "cut off" button in the
+      // brokers list) cannot have new insurances created until re-enabled. This
+      // is no longer automatic: being "two weeks behind on payment" now only
+      // highlights the row and enables the button.
       if (brokerId !== null) {
-        const schedule = getSchedule(new Date());
         const [[brokerRow]] = await DBConnection.query(
-          "SELECT CashBalance FROM brokers WHERE id = ?",
+          "SELECT CashBalance, CutOff FROM brokers WHERE id = ?",
           [brokerId]
         );
         const currentBalance = brokerRow ? Number(brokerRow.CashBalance) : 0;
-        if (
-          await resolveBrokerCutOff(
-            DBConnection,
-            brokerId,
-            currentBalance,
-            schedule
-          )
-        ) {
+        const cutOff = brokerRow ? Boolean(brokerRow.CutOff) : false;
+
+        if (cutOff) {
           return res.status(403).json({
             error:
-              "Broker is cut off for an unpaid balance; new insurances cannot be created until the balance is paid",
+              "Broker is cut off; new insurances cannot be created until the broker is re-enabled",
           });
         }
 
         // Optional hard stop (admin toggle): when negative-balance broker
         // requests are disabled, reject a request that would drive the broker's
-        // balance below zero. Independent of the bi-weekly cut-off above.
+        // balance below zero. Independent of the manual cut-off above.
         if (priceDecimal !== null && priceDecimal > 0) {
           const allowNegative = await getBrokerAllowNegativeBalance(DBConnection);
           if (!allowNegative && currentBalance - priceDecimal < 0) {

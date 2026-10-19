@@ -733,6 +733,7 @@ async function runSetup(config = {}) {
        id INT NOT NULL AUTO_INCREMENT,
        Name VARCHAR(100) NOT NULL,
        CashBalance DECIMAL(15,2) NOT NULL DEFAULT 0,
+       CutOff TINYINT(1) NOT NULL DEFAULT 0,
        PolicyRangeStart INT NOT NULL,
        PolicyRangeEnd INT NOT NULL,
        InactivePolicies INT NOT NULL DEFAULT 0,
@@ -889,6 +890,16 @@ async function runSetup(config = {}) {
       "ALTER TABLE brokers ADD COLUMN ParentBrokerId INT NULL, ADD KEY idx_brokers_parent (ParentBrokerId)"
     );
     console.log("Added brokers.ParentBrokerId column");
+  }
+
+  // Manual cut-off flag: an admin can block new insurances for a broker (the
+  // "cut off" button in the brokers list). Separate from the automatic
+  // two-week-behind detection, which now only highlights the row as overdue.
+  if (!brokerColNames.has("CutOff")) {
+    await db.query(
+      "ALTER TABLE brokers ADD COLUMN CutOff TINYINT(1) NOT NULL DEFAULT 0"
+    );
+    console.log("Added brokers.CutOff column");
   }
 
   // Seed brokers + their tariffs from BrokerInfo.js. Idempotent: existing

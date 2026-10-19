@@ -482,31 +482,11 @@ const biweekKey = (module.exports.biweekKey = function biweekKey(value) {
   return s ? s.toISOString().slice(0, 10) : null;
 });
 
-/**
- * Whether a broker is cut off for an unpaid balance: their balance was already
- * negative at the start of the current payment period and is still negative
- * now (i.e. they missed the last payment and have not paid it off).
- *
- * @param {import("mysql2/promise").Connection} conn
- * @param {number} brokerId
- * @param {number|string} currentBalance
- * @param {{periodStart: string}} schedule
- * @returns {Promise<boolean>}
- */
-const resolveBrokerCutOff = (module.exports.resolveBrokerCutOff =
-  async function resolveBrokerCutOff(conn, brokerId, currentBalance, schedule) {
-    const balance = Number(currentBalance) || 0;
-    if (balance >= 0) return false;
-
-    const [[{ since }]] = await conn.query(
-      `SELECT COALESCE(SUM(Amount), 0) AS since
-         FROM broker_balance_movements
-        WHERE BrokerId = ? AND CreatedAt >= ? AND Deleted = 0`,
-      [brokerId, `${schedule.periodStart} 00:00:00`]
-    );
-    const balanceAtPeriodStart = balance - Number(since);
-    return balanceAtPeriodStart < 0;
-  });
+// A broker is "overdue" when their balance was already negative at the start
+// of the current two-week payment period and is still negative (i.e. they
+// missed the last payment and have not paid it off). The rule is applied by
+// attachPaymentStatus inside createBrokerRouter; enforcement is now manual via
+// the brokers.CutOff flag — the automatic block has been removed.
 
 // ---------------------------------------------------------------------------
 // Blanc batches
@@ -764,7 +744,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
   // InactivePolicies / PolicyRange* are no longer selected: inactive blancs
   // are calculated from the blanc batches (see applyBlancSummary).
-  const BROKER_COLUMNS = "id, Name, CashBalance, ParentBrokerId";
+  const BROKER_COLUMNS = "id, Name, CashBalance, ParentBrokerId, CutOff";
 
   // The batches table is created on first use (and by db/setup.js), so the
   // server also works on a database that has not been set up again yet.
@@ -792,6 +772,31 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       });
     }
     return movementTableReady;
+  }
+
+  // Attach payment status to each broker row in place:
+  //   overdue — missed the last payment: the balance was already negative at
+  //             the start of the current two-week period and is still negative.
+  //   cutOff —  the manual cut-off flag (an admin pressed the cut-off button).
+  async function attachPaymentStatus(rows) {
+    const schedule = getSchedule(new Date());
+    await ensureMovementTable();
+    const [movSinceRows] = await DBConnection.query(
+      `SELECT BrokerId, COALESCE(SUM(Amount), 0) AS since
+         FROM broker_balance_movements
+        WHERE CreatedAt >= ? AND Deleted = 0
+        GROUP BY BrokerId`,
+      [`${schedule.periodStart} 00:00:00`]
+    );
+    const sinceByBroker = new Map(
+      movSinceRows.map((r) => [r.BrokerId, Number(r.since)])
+    );
+    for (const b of rows) {
+      const balance = Number(b.CashBalance) || 0;
+      const since = sinceByBroker.get(b.id) || 0;
+      b.overdue = balance < 0 && balance - since < 0;
+      b.cutOff = Boolean(b.CutOff);
+    }
   }
 
   async function loadSummaries(brokerId) {
@@ -1040,24 +1045,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       b.periods = periods;
     }
 
-    // Payment cut-off status: a broker is cut off when their balance was
-    // already negative at the start of the current period and is still
-    // negative now (i.e. they missed the last payment and haven't paid).
-    const [movSinceRows] = await DBConnection.query(
-      `SELECT BrokerId, COALESCE(SUM(Amount), 0) AS since
-         FROM broker_balance_movements
-        WHERE CreatedAt >= ? AND Deleted = 0
-        GROUP BY BrokerId`,
-      [`${schedule.periodStart} 00:00:00`]
-    );
-    const sinceByBroker = new Map(
-      movSinceRows.map((r) => [r.BrokerId, Number(r.since)])
-    );
-    for (const b of brokers) {
-      const balance = Number(b.CashBalance) || 0;
-      const since = sinceByBroker.get(b.id) || 0;
-      b.cutOff = balance < 0 && balance - since < 0;
-    }
+    // Payment status: overdue (missed a payment) + manual cut-off flag.
+    await attachPaymentStatus(brokers);
 
     return { periodLengthDays: 14, schedule, brokers };
   }
@@ -1087,6 +1076,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         emailsByBroker.get(e.BrokerId).push(e.Email);
       }
       for (const b of rows) b.emails = emailsByBroker.get(b.id) || [];
+      await attachPaymentStatus(rows);
       const allowNegativeBalance = await getBrokerAllowNegativeBalance(
         DBConnection
       );
@@ -2306,6 +2296,47 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     } catch (err) {
       console.error("Broker delete failed:", err);
       res.status(500).json({ error: "Failed to delete broker" });
+    }
+  });
+
+  // POST /brokers/:id/cutoff  { cutOff: boolean } — admin-only manual cut-off.
+  // When cutOff is set, new insurances for the broker are blocked. The automatic
+  // two-week-behind detection no longer blocks anything; it only flags the
+  // broker as overdue (see attachPaymentStatus) and enables the client button.
+  router.post("/brokers/:id/cutoff", auth, requireAdmin, async (req, res) => {
+    try {
+      const brokerId = parseBrokerId(req.params.id);
+      if (brokerId === null) {
+        return res.status(400).json({ error: "Invalid broker id" });
+      }
+      const raw = req.body?.cutOff;
+      const cutOff =
+        typeof raw === "string" ? raw !== "0" && raw !== "false" : Boolean(raw);
+
+      const [existing] = await DBConnection.query(
+        "SELECT id FROM brokers WHERE id = ?",
+        [brokerId]
+      );
+      if (existing.length === 0) {
+        return res.status(404).json({ error: "Broker not found" });
+      }
+
+      await DBConnection.query(
+        "UPDATE brokers SET CutOff = ? WHERE id = ?",
+        [cutOff ? 1 : 0, brokerId]
+      );
+
+      const [[broker]] = await DBConnection.query(
+        `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
+        [brokerId]
+      );
+      res.json({
+        message: cutOff ? "Broker cut off" : "Broker re-enabled",
+        broker,
+      });
+    } catch (err) {
+      console.error("Broker cut-off toggle failed:", err);
+      res.status(500).json({ error: "Failed to update broker cut-off" });
     }
   });
 
