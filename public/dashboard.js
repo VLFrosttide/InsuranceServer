@@ -238,12 +238,6 @@ async function loadReport() {
     if (!ReportTo.value) ReportTo.value = r.to;
   }
 
-  const brokerTotal = brokers.reduce(
-    (sum, b) => sum + Number(b.CashBalance || 0),
-    0
-  );
-  ReportBrokerBalance.textContent = formatMoney(brokerTotal);
-
   const from = ReportFrom.value.trim();
   const to = ReportTo.value.trim();
   const qs = [];
@@ -251,6 +245,7 @@ async function loadReport() {
   if (to) qs.push("to=" + encodeURIComponent(to));
 
   let payments = { kapAndreevoCash: 0, kapAndreevoCard: 0, lesovoCash: 0, lesovoCard: 0 };
+  let brokerBalance = 0;
   ReportMsg.textContent = "";
   ReportMsg.className = "msg report-msg";
   try {
@@ -258,18 +253,20 @@ async function loadReport() {
       "/reports/payments" + (qs.length ? "?" + qs.join("&") : "")
     );
     payments = normalizePayments(data);
+    brokerBalance = pickPaymentValue(data, ["brokerBalance", "BrokerBalance"]) ?? 0;
   } catch (err) {
     ReportMsg.textContent = err.message || t("report.loadFailed");
     ReportMsg.className = "msg report-msg error";
   }
 
+  ReportBrokerBalance.textContent = formatMoney(brokerBalance);
   ReportKapAndreevoCash.textContent = formatMoney(payments.kapAndreevoCash);
   ReportKapAndreevoCard.textContent = formatMoney(payments.kapAndreevoCard);
   ReportLesovoCash.textContent = formatMoney(payments.lesovoCash);
   ReportLesovoCard.textContent = formatMoney(payments.lesovoCard);
 
   const total =
-    brokerTotal +
+    brokerBalance +
     payments.kapAndreevoCash +
     payments.kapAndreevoCard +
     payments.lesovoCash +

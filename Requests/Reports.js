@@ -4,11 +4,10 @@
 //   GET /reports/payments?from=YYYY-MM-DD&to=YYYY-MM-DD
 //
 // Returns the walk-in payments collected at the two border crossings
-// (Kapitan Andreevo and Lesovo), split by cash vs. card, within an inclusive
-// date range. "Total broker balance" is computed client-side from
-// GET /brokers/biweekly, so this endpoint only supplies the four crossing
-// figures. Only admins (role 1) and workers (role 2) may call it: a broker
-// (role 3) account never sees the company-wide report.
+// (Kapitan Andreevo and Lesovo), split by cash vs. card, plus the total
+// broker balance (the sum of broker-attributed policies' net value), all
+// within an inclusive date range. Only admins (role 1) and workers (role 2)
+// may call it: a broker (role 3) account never sees the company-wide report.
 //
 // A walk-in policy (BrokerId IS NULL) is the money physically collected at a
 // crossing: PaymentType is "Cash" or "Card", and the crossing is stored on the
@@ -91,6 +90,23 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
         [fromParam, toParam]
       );
 
+      // "Total broker balance" for the report = the sum of the net value of
+      // broker-attributed policies created within the range. It mirrors the
+      // walk-in net-value convention above (full price while active, annul fee
+      // once annulled, deleted policies contribute nothing) and is keyed on the
+      // policy's creation date.
+      const [[brokerAgg]] = await DBConnection.query(
+        `SELECT ROUND(SUM(CASE
+                  WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2))
+                  ELSE COALESCE(AnnulFee, 0)
+                END), 2) AS Net
+           FROM insurance
+          WHERE BrokerId IS NOT NULL AND Deleted = 0
+            AND CreationDate >= ? AND CreationDate < ?`,
+        [fromParam, toParam]
+      );
+      const brokerBalance = round2(Number(brokerAgg && brokerAgg.Net) || 0);
+
       const totals = {
         kapAndreevoCash: 0,
         kapAndreevoCard: 0,
@@ -114,6 +130,7 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
       }
 
       res.json({
+        brokerBalance,
         kapAndreevoCash: round2(totals.kapAndreevoCash),
         kapAndreevoCard: round2(totals.kapAndreevoCard),
         lesovoCash: round2(totals.lesovoCash),
