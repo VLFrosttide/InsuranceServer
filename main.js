@@ -71,7 +71,41 @@ if (envFile) loadEnvFile(envFile);
 const app = express();
 const httpServer = http.createServer(app);
 
+// Keep long-lived keep-alive connections alive across a reverse proxy/CDN that
+// closes idle sockets around the 60s mark. headersTimeout must stay above
+// keepAliveTimeout. This avoids spurious 502/504 responses on slow keep-alive
+// connections — a common cause of intermittent "can't log in" reports.
+httpServer.keepAliveTimeout = 65 * 1000;
+httpServer.headersTimeout = 66 * 1000;
+
 let DBConnection = null;
+
+// Start timestamp for uptime reporting in /health and /ping.
+const SERVER_STARTED_AT = Date.now();
+
+// ---------------------------------------------------------------------------
+// In-memory diagnostic rings. Kept small on purpose: they let an operator
+// inspect what was failing during an incident window (e.g. a daily 13:00-17:00
+// login outage) without a separate log dashboard.
+// ---------------------------------------------------------------------------
+const RECENT_REQUESTS_LIMIT = 500;
+const RECENT_FAILURES_LIMIT = 100;
+const recentRequests = [];
+const recentFailures = [];
+
+function pushRing(items, item, limit) {
+  items.push(item);
+  if (items.length > limit) items.shift();
+}
+
+// Never let a transient error (a rejected promise or an uncaught exception)
+// take the whole process down during a network/DB blip. Log and keep serving.
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err);
+});
 
 // ---------------------------------------------------------------------------
 // Deployment-friendly configuration.
@@ -151,6 +185,36 @@ async function start() {
     next();
   });
 
+  // ---------------------------------------------------------------------------
+  // Request access log + failure capture. Every request is logged with its
+  // duration and status, so the server's own log can be correlated against a
+  // reported outage window (e.g. the daily 13:00-17:00 login failures).
+  // Failures are also kept in an in-memory ring surfaced by /health.
+  // ---------------------------------------------------------------------------
+  app.use((req, res, next) => {
+    const started = process.hrtime.bigint();
+    res.on("finish", () => {
+      const durationMs = Math.round(
+        Number(process.hrtime.bigint() - started) / 1e6
+      );
+      const entry = {
+        at: new Date().toISOString(),
+        method: req.method,
+        path: req.originalUrl || req.url,
+        status: res.statusCode,
+        durationMs,
+      };
+      pushRing(recentRequests, entry, RECENT_REQUESTS_LIMIT);
+      if (res.statusCode >= 400) {
+        pushRing(recentFailures, entry, RECENT_FAILURES_LIMIT);
+      }
+      console.log(
+        `[request] ${entry.method} ${entry.path} -> ${entry.status} (${entry.durationMs}ms)`
+      );
+    });
+    next();
+  });
+
   // Create the connection pool immediately. A pool does not open a socket
   // until the first query, so mounting routes and binding the HTTP server is
   // never blocked by MySQL availability. Endpoints stay registered even when
@@ -160,9 +224,15 @@ async function start() {
     ...DB_CONFIG,
     waitForConnections: true,
     connectionLimit: 10,
+    maxIdle: 10,
     queueLimit: 0,
     enableKeepAlive: true,
     keepAliveInitialDelay: 0,
+    // Recycle connections that have sat idle for a minute. A connection the
+    // MySQL server dropped (e.g. during a nightly maintenance/backup window) is
+    // discarded and transparently replaced on the next query, instead of being
+    // handed to a login attempt that then fails.
+    idleTimeout: 60 * 1000,
   });
 
   // Transaction helper: run a sequence of statements on one dedicated
@@ -231,17 +301,66 @@ async function start() {
     );
   }
 
-  // Live state used by /health. It becomes true only after a successful
-  // database ping, so /health accurately reports degraded vs. ready.
+  // Live state used by /health. It becomes true (or false again) after each
+  // database ping, so /health reflects the current state, not just startup.
   let dbHealthy = false;
 
-  app.get("/health", (req, res) => {
-    if (dbHealthy) {
-      return res.json({ status: "ok", service: "InsuranceServer" });
+  // Lightweight liveness probe that never touches MySQL. Client-side network
+  // monitors poll this to measure reachability/latency without loading the DB.
+  app.get("/ping", (req, res) => {
+    res.json({
+      status: "ok",
+      service: "InsuranceServer",
+      time: new Date().toISOString(),
+      uptimeSeconds: Math.round((Date.now() - SERVER_STARTED_AT) / 1000),
+    });
+  });
+
+  // Readiness probe. Pings the database live so it also detects a database
+  // that became unreachable after boot, and reports the round-trip time plus a
+  // snapshot of the most recent failed requests for correlation.
+  app.get("/health", async (req, res) => {
+    let dbLatencyMs = null;
+    let dbError = null;
+    try {
+      const started = Date.now();
+      const conn = await pool.getConnection();
+      try {
+        await conn.ping();
+      } finally {
+        conn.release();
+      }
+      dbLatencyMs = Date.now() - started;
+      dbHealthy = true;
+    } catch (err) {
+      dbHealthy = false;
+      dbError = err && err.message ? err.message : String(err);
+      pushRing(
+        recentFailures,
+        {
+          at: new Date().toISOString(),
+          method: "HEALTH",
+          path: "/health",
+          status: 503,
+          durationMs: null,
+          error: dbError,
+        },
+        RECENT_FAILURES_LIMIT
+      );
     }
-    return res
-      .status(503)
-      .json({ status: "degraded", error: "Database unavailable" });
+
+    const body = {
+      status: dbHealthy ? "ok" : "degraded",
+      service: "InsuranceServer",
+      time: new Date().toISOString(),
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      uptimeSeconds: Math.round((Date.now() - SERVER_STARTED_AT) / 1000),
+      dbHealthy,
+      dbLatencyMs,
+      ...(dbError ? { dbError } : {}),
+      recentFailures: recentFailures.slice(-20),
+    };
+    return res.status(dbHealthy ? 200 : 503).json(body);
   });
 
   // Plain-HTTP probe for the WebSocket route. The upgrade itself cannot be

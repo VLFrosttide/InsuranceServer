@@ -102,29 +102,79 @@ function getBrokerId() {
 }
 
 // Generic authenticated fetch wrapper against the InsuranceServer API.
-async function api(path, options = {}) {
-  const headers = Object.assign(
-    { "Content-Type": "application/json" },
-    options.headers || {}
-  );
-  const token = getToken();
-  if (token) headers["Authorization"] = "Bearer " + token;
+//
+// Idempotent requests (GET) are retried a few times with a per-attempt timeout
+// so a transient network blip or a server 5xx (e.g. a hosting maintenance
+// window) recovers automatically instead of failing the whole page. Mutating
+// requests are never retried because a retry could apply the change twice.
+const API_TIMEOUT_MS = 20000;
+const API_MAX_ATTEMPTS = 3;
 
-  const res = await fetch(API_BASE + path, Object.assign({}, options, { headers }));
-  let data = null;
-  try {
-    data = await res.json();
-  } catch {
-    data = null;
-  }
-  if (!res.ok) {
-    const err = new Error(
-      (data && (data.error || data.message)) || "Request failed (" + res.status + ")"
+function apiIsRetryable(method) {
+  return String(method || "GET").toUpperCase() === "GET";
+}
+
+async function api(path, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const retryable = apiIsRetryable(method);
+  const attempts = retryable ? API_MAX_ATTEMPTS : 1;
+
+  let lastError = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, 700 * Math.pow(2, attempt - 1)));
+    }
+
+    const headers = Object.assign(
+      { "Content-Type": "application/json" },
+      options.headers || {}
     );
-    err.status = res.status;
-    throw err;
+    const token = getToken();
+    if (token) headers["Authorization"] = "Bearer " + token;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+
+    let res;
+    try {
+      res = await fetch(
+        API_BASE + path,
+        Object.assign({}, options, { headers, signal: controller.signal })
+      );
+    } catch (err) {
+      clearTimeout(timer);
+      if (retryable && (err.name === "AbortError" || err instanceof TypeError)) {
+        lastError = err;
+        continue;
+      }
+      throw err;
+    }
+
+    let data = null;
+    try {
+      data = await res.json();
+    } catch {
+      data = null;
+    }
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      const message =
+        (data && (data.error || data.message)) ||
+        "Request failed (" + res.status + ")";
+      if (retryable && (res.status === 429 || res.status >= 500)) {
+        lastError = new Error(message);
+        lastError.status = res.status;
+        continue;
+      }
+      const err = new Error(message);
+      err.status = res.status;
+      throw err;
+    }
+    return data;
   }
-  return data;
+
+  throw lastError || new Error("Request failed");
 }
 
 function formatMoney(n) {

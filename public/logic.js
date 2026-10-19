@@ -42,6 +42,44 @@ function saveRemembered(username, password) {
   }
 }
 
+// Retry helper for the login POST. Login is idempotent from the client's point
+// of view (the server deletes any prior token before issuing a new one), so a
+// transient network blip or a server 5xx auto-recovers instead of failing the
+// form with a bare "Server Error".
+const LOGIN_TIMEOUT_MS = 15000;
+const LOGIN_MAX_ATTEMPTS = 3;
+
+async function loginFetch(username, password) {
+  let lastNetworkError = null;
+  for (let attempt = 0; attempt < LOGIN_MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      setMessage(t("login.retrying"), false);
+      await new Promise((r) => setTimeout(r, 800 * Math.pow(2, attempt - 1)));
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LOGIN_TIMEOUT_MS);
+    try {
+      const res = await fetch(API_BASE + "/logme", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      const data = await res.json().catch(() => ({}));
+      return { res, data };
+    } catch (err) {
+      clearTimeout(timer);
+      if (err.name === "AbortError" || err instanceof TypeError) {
+        lastNetworkError = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastNetworkError || new Error("Login request failed");
+}
+
 async function doLogin() {
   const username = UsernameInput.value.trim();
   const password = PassInput.value;
@@ -52,13 +90,7 @@ async function doLogin() {
   }
 
   try {
-    const res = await fetch(API_BASE + "/logme", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
-    });
-
-    const data = await res.json().catch(() => ({}));
+    const { res, data } = await loginFetch(username, password);
 
     if (!res.ok) {
       setMessage(data.error || t("login.failed"), true);
