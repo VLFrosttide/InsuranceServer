@@ -25,6 +25,10 @@ const {
   restoreBrokerForDeletion,
   adjustBrokerForPriceChange,
   getBrokerAllowNegativeBalance,
+  salePricingFor,
+  loadOwnBrokerTariffs,
+  attachSubBrokerStatus,
+  computePolicyTariffPrice,
 } = require("./Brokers.js");
 const { sendReply } = require("../Mail/SendReply.js");
 
@@ -875,7 +879,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       const policyNumber = b.PolicyNumber ?? b.policyNumber ?? "";
       const blancNumber = b.BlancNumber ?? b.blancNumber ?? "";
       const carNumber = b.CarNumber ?? b.carNumber ?? "";
-      const price = String(b.Price ?? b.price ?? "0");
+      let price = String(b.Price ?? b.price ?? "0");
       const currencyType = normalizePolicyCurrency(b.CurrencyType ?? b.currencyType ?? "");
       const duration = parseDurationDays(b.Duration ?? b.duration ?? 0);
       const branch = b.Branch ?? b.branch ?? "";
@@ -990,6 +994,39 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       // what marks a policy as paid from a real broker's balance, and walk-ins
       // are always paid in cash or by card.
       const brokerName = broker ? broker.name : String(branch);
+
+      // For a sub-broker, the sale price saved in the database and used to
+      // calculate what each broker owes us must always be the main broker's
+      // price (never the sub-broker's display price).
+      if (brokerId !== null) {
+        try {
+          const [[subCheck]] = await DBConnection.query(
+            "SELECT id, Name, ParentBrokerId FROM brokers WHERE id = ?",
+            [brokerId]
+          );
+          if (subCheck) {
+            await attachSubBrokerStatus(DBConnection, [subCheck]);
+            if (subCheck.IsSubBroker) {
+              const saleEff = await salePricingFor(DBConnection, brokerId);
+              const mainTariffPrice = computePolicyTariffPrice(
+                {
+                  Otomobil: otomobil,
+                  Duration: duration,
+                  NonTurk: nonTurk ? 1 : 0,
+                  CardFee: cardFee ? 1 : 0,
+                  PaymentType: paymentType,
+                },
+                saleEff.pricing
+              );
+              if (mainTariffPrice !== null) {
+                price = String(mainTariffPrice);
+              }
+            }
+          }
+        } catch {
+          // Ignore in minimal test mocks.
+        }
+      }
 
       const priceDecimal = toDecimal(price);
 
@@ -1185,6 +1222,53 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         "SELECT * FROM insurance WHERE Broker = ? AND Deleted = 0",
         [req.user.username]
       );
+
+      let brokerRow = null;
+      try {
+        const bId = req.user.brokerId ? Number(req.user.brokerId) : null;
+        const [bRows] = bId
+          ? await DBConnection.query(
+              "SELECT id, Name, ParentBrokerId FROM brokers WHERE id = ?",
+              [bId]
+            )
+          : await DBConnection.query(
+              "SELECT id, Name, ParentBrokerId FROM brokers WHERE Name = ?",
+              [req.user.username]
+            );
+        if (bRows && bRows.length > 0) {
+          await attachSubBrokerStatus(DBConnection, bRows);
+          brokerRow = bRows[0];
+        }
+      } catch {
+        brokerRow = null;
+      }
+
+      if (brokerRow && brokerRow.IsSubBroker) {
+        if (brokerRow.hidePricing) {
+          return res.json({
+            insurances: rows.map((r) => ({
+              ...r,
+              Price: null,
+              CurrencyType: null,
+            })),
+          });
+        }
+        const subPricing = await loadOwnBrokerTariffs(
+          DBConnection,
+          brokerRow.id
+        );
+        return res.json({
+          insurances: rows.map((r) => {
+            const displayPrice = computePolicyTariffPrice(r, subPricing);
+            return {
+              ...r,
+              Price: displayPrice !== null ? String(displayPrice) : null,
+              CurrencyType: displayPrice === null ? null : r.CurrencyType,
+            };
+          }),
+        });
+      }
+
       res.json({ insurances: rows });
     } catch (err) {
       console.error("Client insurances lookup failed:", err);

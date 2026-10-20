@@ -177,6 +177,121 @@ const resolveBrokerByEmail = (module.exports.resolveBrokerByEmail =
   });
 
 /**
+ * Load only the tariffs explicitly stored in `broker_tariffs` for `brokerId`
+ * (never inherits from a parent broker or `EuroPricing`).
+ *
+ * For a sub-broker, these rows are the display prices configured by its main
+ * broker.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @returns {Promise<object>}
+ */
+const loadOwnBrokerTariffs = (module.exports.loadOwnBrokerTariffs =
+  async function loadOwnBrokerTariffs(conn, brokerId) {
+    try {
+      const [rows] = await conn.query(
+        `SELECT InsuranceType, Duration, Price
+           FROM broker_tariffs
+          WHERE BrokerId = ?
+          ORDER BY InsuranceType, Duration`,
+        [brokerId]
+      );
+      const pricing = {};
+      for (const row of rows) {
+        if (!pricing[row.InsuranceType]) pricing[row.InsuranceType] = {};
+        pricing[row.InsuranceType][String(row.Duration)] = parseFloat(
+          row.Price
+        );
+      }
+      return pricing;
+    } catch {
+      return {};
+    }
+  });
+
+// Map an insurance row's Otomobil value to its tariff vehicle key.
+const mapPolicyVehicleKey = (module.exports.mapPolicyVehicleKey =
+  function mapPolicyVehicleKey(otomobil) {
+    const v = String(otomobil ?? "").trim().toLowerCase();
+    if (
+      v === "automobile" ||
+      v === "otomobil" ||
+      v === "auto" ||
+      v === "автомобил" ||
+      v === "лек автомобил"
+    ) {
+      return "Auto";
+    }
+    if (v === "motor" || v === "мотор") return "Motor";
+    if (v === "bus" || v === "бус" || v === "микробус") return "Bus";
+    if (v === "trailer" || v === "ремарке") return "Trailer";
+    return String(otomobil ?? "").trim();
+  });
+
+// Parse an insurance row's Duration to integer days (15 / 30 / 90 / 365).
+const mapPolicyDurationDays = (module.exports.mapPolicyDurationDays =
+  function mapPolicyDurationDays(duration) {
+    if (duration === undefined || duration === null || duration === "") {
+      return null;
+    }
+    if (typeof duration === "number" && Number.isFinite(duration)) {
+      return duration > 0 ? duration : null;
+    }
+    const s = String(duration).trim().toLowerCase();
+    if (!s) return null;
+    const num = parseInt(s.replace(/[^0-9]/g, ""), 10);
+    if (s.includes("годин") || s.includes("year")) {
+      return !Number.isNaN(num) && num > 0 ? num * 365 : 365;
+    }
+    if (s.includes("месеца")) {
+      return !Number.isNaN(num) && num > 0 ? num * 30 : 90;
+    }
+    if (s.includes("месец") || s.includes("month")) {
+      return !Number.isNaN(num) && num > 0 ? num * 30 : 30;
+    }
+    if (s.includes("15")) return 15;
+    return !Number.isNaN(num) && num > 0 ? num : null;
+  });
+
+/**
+ * Compute a policy's price strictly from a tariff `pricing` map (plus stored
+ * NonTurk / CardFee flags). Returns `null` when the vehicle type or duration is
+ * missing from `pricing` — never falls back to `row.Price` so a sub-broker can
+ * never see the stored sale price.
+ *
+ * @param {object} row
+ * @param {object} pricing
+ * @returns {number|null}
+ */
+const computePolicyTariffPrice = (module.exports.computePolicyTariffPrice =
+  function computePolicyTariffPrice(row, pricing) {
+    if (!row || !pricing || typeof pricing !== "object") return null;
+    const vehicleKey = mapPolicyVehicleKey(row.Otomobil);
+    const durationDays = mapPolicyDurationDays(row.Duration);
+    if (!vehicleKey || !durationDays) return null;
+
+    const typeMap = pricing[vehicleKey];
+    if (!typeMap || typeof typeMap !== "object") return null;
+    const baseRaw = typeMap[String(durationDays)];
+    if (baseRaw === undefined || baseRaw === null || baseRaw === "") {
+      return null;
+    }
+    const basePrice = Number(baseRaw);
+    if (!Number.isFinite(basePrice) || basePrice < 0) return null;
+
+    let price = basePrice;
+    if (Number(row.NonTurk) === 1) price += 5;
+    if (
+      Number(row.CardFee) === 1 &&
+      String(row.PaymentType || "").toLowerCase() === "card"
+    ) {
+      price += 2;
+    }
+    return Math.round(price * 100) / 100;
+  });
+
+/**
  * Resolve the effective pricing of a broker, inheriting from its parent chain.
  *
  * A broker's own rows in `broker_tariffs` always win. When a broker has no
@@ -262,6 +377,184 @@ const effectivePricingFor = (module.exports.effectivePricingFor =
       sourceBrokerId: null,
       sourceBrokerName: null,
       inherited: false,
+    };
+  });
+
+/**
+ * Resolve the SALE pricing of a broker (the price stored on `insurance.Price`
+ * in the database and used to calculate what each broker owes us).
+ *
+ * - For a main broker (not a sub-broker), this is its own tariff table.
+ * - For a sub-broker, its own rows in `broker_tariffs` are display-only prices
+ *   set by the main broker and must NEVER be used as the sale price; instead,
+ *   the sale price is always the main broker's price (resolved up
+ *   `ParentBrokerId`).
+ */
+const salePricingFor = (module.exports.salePricingFor =
+  async function salePricingFor(conn, brokerId) {
+    let broker = null;
+    try {
+      const [[row]] = await conn.query(
+        "SELECT id, Name, ParentBrokerId, IsSubBroker FROM brokers WHERE id = ?",
+        [brokerId]
+      );
+      broker = row || null;
+    } catch {
+      const [[row]] = await conn.query(
+        "SELECT id, Name, ParentBrokerId FROM brokers WHERE id = ?",
+        [brokerId]
+      );
+      broker = row || null;
+    }
+    if (!broker) {
+      return {
+        pricing: {},
+        sourceBrokerId: null,
+        sourceBrokerName: null,
+        inherited: false,
+      };
+    }
+
+    const hasParent =
+      broker.ParentBrokerId !== null &&
+      broker.ParentBrokerId !== undefined &&
+      Number(broker.ParentBrokerId) > 0;
+    const isSub = Boolean(
+      isSubBrokerName(broker.Name) || hasParent || broker.IsSubBroker
+    );
+
+    if (isSub) {
+      if (!hasParent) {
+        return {
+          pricing: {},
+          sourceBrokerId: null,
+          sourceBrokerName: null,
+          inherited: false,
+        };
+      }
+      let parentCursor = Number(broker.ParentBrokerId);
+      let mainBrokerId = parentCursor;
+      const visited = new Set([Number(broker.id)]);
+      while (parentCursor && !visited.has(parentCursor)) {
+        visited.add(parentCursor);
+        mainBrokerId = parentCursor;
+        const [[parentRow]] = await conn.query(
+          "SELECT id, Name, ParentBrokerId FROM brokers WHERE id = ?",
+          [parentCursor]
+        );
+        if (!parentRow) break;
+        const nextParent =
+          parentRow.ParentBrokerId !== null &&
+          parentRow.ParentBrokerId !== undefined &&
+          Number(parentRow.ParentBrokerId) > 0
+            ? Number(parentRow.ParentBrokerId)
+            : null;
+        if (!nextParent) break;
+        parentCursor = nextParent;
+      }
+      const eff = await effectivePricingFor(conn, mainBrokerId);
+      return {
+        pricing: eff.pricing,
+        sourceBrokerId: eff.sourceBrokerId,
+        sourceBrokerName: eff.sourceBrokerName,
+        inherited: true,
+      };
+    }
+
+    return effectivePricingFor(conn, brokerId);
+  });
+
+/**
+ * Compute display-only pricing data for a sub-broker from its own
+ * `broker_tariffs` (set by its main broker). Never uses `insurance.Price` or
+ * `brokers.CashBalance`, ensuring sub-brokers can never see or infer the main
+ * broker's sale prices.
+ */
+const computeSubBrokerDisplayData = (module.exports.computeSubBrokerDisplayData =
+  async function computeSubBrokerDisplayData(conn, brokerId, preloadedPricing) {
+    const subPricing =
+      preloadedPricing || (await loadOwnBrokerTariffs(conn, brokerId));
+
+    let policies = [];
+    try {
+      const [rows] = await conn.query(
+        `SELECT BlancNumber, Duration, Otomobil, PaymentType,
+                NonTurk, CardFee, Annulled, AnnulReason, AnnulFee, CreationDate
+           FROM insurance
+          WHERE BrokerId = ? AND Deleted = 0`,
+        [brokerId]
+      );
+      policies = Array.isArray(rows) ? rows : [];
+    } catch {
+      policies = [];
+    }
+
+    const policyByBlanc = new Map();
+    let netPoliciesImpact = 0;
+    for (const p of policies) {
+      const displayPrice = computePolicyTariffPrice(p, subPricing);
+      const blancKey = String(p.BlancNumber ?? "").trim();
+      if (blancKey) {
+        policyByBlanc.set(blancKey, { row: p, displayPrice });
+      }
+      if (displayPrice !== null) {
+        if (Number(p.Annulled) === 1) {
+          const fee =
+            p.AnnulReason === "broker" ? Number(p.AnnulFee) || 0 : 0;
+          netPoliciesImpact -= fee;
+        } else {
+          netPoliciesImpact -= displayPrice;
+        }
+      }
+    }
+
+    let manualMovementsSum = 0;
+    try {
+      const [movRows] = await conn.query(
+        `SELECT Type, Amount
+           FROM broker_balance_movements
+          WHERE BrokerId = ? AND Deleted = 0
+            AND Type NOT IN ('policy', 'annulment', 'price_change', 'deletion')`,
+        [brokerId]
+      );
+      for (const m of movRows || []) {
+        manualMovementsSum += Number(m.Amount) || 0;
+      }
+    } catch {
+      manualMovementsSum = 0;
+    }
+
+    const displayCashBalance =
+      Math.round((manualMovementsSum + netPoliciesImpact) * 100) / 100;
+
+    function mapMovementAmount(m) {
+      if (!m) return 0;
+      const type = String(m.Type || "").trim();
+      const blancKey = String(m.BlancNumber ?? "").trim();
+      if (type === "policy") {
+        const info = policyByBlanc.get(blancKey);
+        return info && info.displayPrice !== null ? -info.displayPrice : 0;
+      }
+      if (type === "annulment") {
+        const info = policyByBlanc.get(blancKey);
+        if (!info || info.displayPrice === null) return 0;
+        const fee =
+          info.row.AnnulReason === "broker"
+            ? Number(info.row.AnnulFee) || 0
+            : 0;
+        return Math.round((info.displayPrice - fee) * 100) / 100;
+      }
+      if (type === "price_change" || type === "deletion") {
+        return 0;
+      }
+      return Math.round((Number(m.Amount) || 0) * 100) / 100;
+    }
+
+    return {
+      subPricing,
+      policyByBlanc,
+      displayCashBalance,
+      mapMovementAmount,
     };
   });
 
@@ -1225,7 +1518,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   // Build the per-broker bi-weekly rollup: for each two-week period the number
   // of (non-deleted) policies and the net balance movement recorded in the
   // broker balance ledger.
-  async function buildBiweeklyResponse(brokerId = null) {
+  async function buildBiweeklyResponse(brokerId = null, isScopedClient = false) {
     await ensureMovementTable();
     const schedule = getSchedule(new Date());
 
@@ -1249,7 +1542,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     const movWhere = brokerId === null ? "WHERE Deleted = 0" : "WHERE BrokerId = ? AND Deleted = 0";
     const movParams = brokerId === null ? [] : [brokerId];
     const [movementRows] = await DBConnection.query(
-      `SELECT BrokerId, CreatedAt, Amount FROM broker_balance_movements ${movWhere}`,
+      `SELECT BrokerId, CreatedAt, Amount, Type, BlancNumber FROM broker_balance_movements ${movWhere}`,
       movParams
     );
 
@@ -1258,6 +1551,18 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       applyBlancSummary({ ...b }, summaries)
     );
     await attachSubBrokerStatus(DBConnection, brokers);
+
+    const subDisplayByBroker = new Map();
+    if (isScopedClient) {
+      for (const b of brokers) {
+        if (b.IsSubBroker && !b.hidePricing) {
+          subDisplayByBroker.set(
+            b.id,
+            await computeSubBrokerDisplayData(DBConnection, b.id)
+          );
+        }
+      }
+    }
 
     const insuranceByBroker = new Map();
     for (const r of insuranceRows) {
@@ -1273,6 +1578,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     }
 
     const movementByBroker = new Map();
+    const seenPolicyBlancsByBroker = new Map();
     for (const r of movementRows) {
       const key = biweekKey(r.CreatedAt);
       if (!key) continue;
@@ -1280,7 +1586,35 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         movementByBroker.set(r.BrokerId, new Map());
       }
       const buckets = movementByBroker.get(r.BrokerId);
-      buckets.set(key, (buckets.get(key) || 0) + Number(r.Amount || 0));
+      const disp = subDisplayByBroker.get(r.BrokerId);
+      const amt = disp ? disp.mapMovementAmount(r) : Number(r.Amount || 0);
+      buckets.set(key, (buckets.get(key) || 0) + amt);
+      if (disp && String(r.Type || "").trim() === "policy" && r.BlancNumber) {
+        if (!seenPolicyBlancsByBroker.has(r.BrokerId)) {
+          seenPolicyBlancsByBroker.set(r.BrokerId, new Set());
+        }
+        seenPolicyBlancsByBroker
+          .get(r.BrokerId)
+          .add(String(r.BlancNumber).trim());
+      }
+    }
+
+    for (const [bId, disp] of subDisplayByBroker.entries()) {
+      const seen = seenPolicyBlancsByBroker.get(bId) || new Set();
+      for (const [blancKey, info] of disp.policyByBlanc.entries()) {
+        if (seen.has(blancKey) || info.displayPrice === null) continue;
+        const key = biweekKey(info.row.CreationDate);
+        if (!key) continue;
+        if (!movementByBroker.has(bId)) movementByBroker.set(bId, new Map());
+        const buckets = movementByBroker.get(bId);
+        const net =
+          Number(info.row.Annulled) === 1
+            ? -(info.row.AnnulReason === "broker"
+                ? Number(info.row.AnnulFee) || 0
+                : 0)
+            : -info.displayPrice;
+        buckets.set(key, (buckets.get(key) || 0) + net);
+      }
     }
 
     for (const b of brokers) {
@@ -1310,6 +1644,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       if (b.hidePricing) {
         b.CashBalance = null;
         b.overdue = false;
+      } else if (subDisplayByBroker.has(b.id)) {
+        b.CashBalance = subDisplayByBroker.get(b.id).displayCashBalance;
       }
     }
 
@@ -1348,6 +1684,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           if (b.hidePricing) {
             b.CashBalance = null;
             b.overdue = false;
+          } else if (b.IsSubBroker) {
+            const disp = await computeSubBrokerDisplayData(DBConnection, b.id);
+            b.CashBalance = disp.displayCashBalance;
           }
         }
       }
@@ -1367,7 +1706,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   // from this endpoint.
   router.get("/brokers/biweekly", auth, requireBrokerView, async (req, res) => {
     try {
-      res.json(await buildBiweeklyResponse(req.brokerScope));
+      res.json(
+        await buildBiweeklyResponse(req.brokerScope, req.brokerScope !== null)
+      );
     } catch (err) {
       console.error("Broker biweekly failed:", err);
       res.status(500).json({ error: "Failed to fetch broker biweekly data" });
@@ -1501,8 +1842,16 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       }
       const broker = await fetchBroker(res, brokerId);
       if (!broker) return;
-      if (req.brokerScope !== null && broker.hidePricing) {
-        broker.CashBalance = null;
+      if (req.brokerScope !== null) {
+        if (broker.hidePricing) {
+          broker.CashBalance = null;
+        } else if (broker.IsSubBroker) {
+          const disp = await computeSubBrokerDisplayData(
+            DBConnection,
+            broker.id
+          );
+          broker.CashBalance = disp.displayCashBalance;
+        }
       }
       res.json({ broker });
     } catch (err) {
@@ -1527,7 +1876,10 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             .status(403)
             .json({ error: "Forbidden: you can only view your own broker" });
         }
-        const data = await buildBiweeklyResponse(brokerId);
+        const data = await buildBiweeklyResponse(
+          brokerId,
+          req.brokerScope !== null
+        );
         const broker = data.brokers.find((b) => b.id === brokerId);
         if (!broker) {
           return res.status(404).json({ error: "Broker not found" });
@@ -1596,7 +1948,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
         const [policies] = await DBConnection.query(
           `SELECT PolicyNumber, BlancNumber, CarNumber, Price, CurrencyType,
-                  Duration, Branch, PaymentType, CreationDate, StartDate
+                  Duration, Otomobil, NonTurk, CardFee, Branch, PaymentType,
+                  CreationDate, StartDate
              FROM insurance
             WHERE ${conditions.join(" AND ")}
             ORDER BY CreationDate DESC`,
@@ -1605,15 +1958,54 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
         await attachSubBrokerStatus(DBConnection, [broker]);
         const hidePricing = Boolean(broker.hidePricing);
-        const sanitizedPolicies = hidePricing
-          ? policies.map((p) => ({ ...p, Price: null, CurrencyType: null }))
-          : policies;
+        let sanitizedPolicies;
+        let brokerCashBalance = broker.CashBalance;
+
+        if (hidePricing) {
+          sanitizedPolicies = policies.map(
+            ({ Otomobil, NonTurk, CardFee, ...p }) => ({
+              ...p,
+              Price: null,
+              CurrencyType: null,
+            })
+          );
+          brokerCashBalance = null;
+        } else if (broker.IsSubBroker) {
+          // For a sub-broker, the prices in broker_tariffs are display prices
+          // only; when viewed by the sub-broker (or on the policies endpoint),
+          // never expose the DB sale price (main broker's price).
+          const disp = await computeSubBrokerDisplayData(
+            DBConnection,
+            broker.id
+          );
+          brokerCashBalance =
+            req.brokerScope !== null
+              ? disp.displayCashBalance
+              : broker.CashBalance;
+          sanitizedPolicies = policies.map(
+            ({ Otomobil, NonTurk, CardFee, ...p }) => {
+              const displayPrice = computePolicyTariffPrice(
+                { Otomobil, NonTurk, CardFee, ...p },
+                disp.subPricing
+              );
+              return {
+                ...p,
+                Price: displayPrice,
+                CurrencyType: displayPrice === null ? null : p.CurrencyType,
+              };
+            }
+          );
+        } else {
+          sanitizedPolicies = policies.map(
+            ({ Otomobil, NonTurk, CardFee, ...p }) => p
+          );
+        }
 
         res.json({
           broker: {
             id: broker.id,
             Name: broker.Name,
-            CashBalance: hidePricing ? null : broker.CashBalance,
+            CashBalance: brokerCashBalance,
             IsSubBroker: broker.IsSubBroker,
             PricingConfigured: broker.PricingConfigured,
             hidePricing,
@@ -1696,39 +2088,72 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         }
 
         const [policyRows] = await DBConnection.query(
-          `SELECT BrokerId, COUNT(*) AS policyCount, COALESCE(SUM(Price), 0) AS totalPrice
+          `SELECT BrokerId, Duration, Otomobil, PaymentType, NonTurk, CardFee
              FROM insurance
-            WHERE ${conditions.join(" AND ")}
-            GROUP BY BrokerId`,
+            WHERE ${conditions.join(" AND ")}`,
           params
         );
-        const statsByBroker = new Map(
-          policyRows.map((r) => [
-            r.BrokerId,
-            { policyCount: Number(r.policyCount), totalPrice: Number(r.totalPrice) },
-          ])
-        );
+        const policiesByUnderling = new Map();
+        for (const r of policyRows) {
+          if (!policiesByUnderling.has(r.BrokerId)) {
+            policiesByUnderling.set(r.BrokerId, []);
+          }
+          policiesByUnderling.get(r.BrokerId).push(r);
+        }
 
-        const result = underlings.map((u) => {
-          const stats = statsByBroker.get(u.id) || {
-            policyCount: 0,
-            totalPrice: 0,
-          };
-          return {
-            id: u.id,
-            Name: u.Name,
-            CashBalance: u.hidePricing ? null : u.CashBalance,
-            ParentBrokerId: u.ParentBrokerId,
-            IsSubBroker: u.IsSubBroker,
-            PricingConfigured: u.PricingConfigured,
-            hidePricing: u.hidePricing,
-            policyCount: stats.policyCount,
-            totalPrice: u.hidePricing ? null : stats.totalPrice,
-          };
-        });
+        const result = [];
+        let overallTotalBalance = 0;
+        let anyConfigured = false;
+
+        for (const u of underlings) {
+          const uPolicies = policiesByUnderling.get(u.id) || [];
+          const policyCount = uPolicies.length;
+
+          if (u.hidePricing) {
+            result.push({
+              id: u.id,
+              Name: u.Name,
+              CashBalance: null,
+              ParentBrokerId: u.ParentBrokerId,
+              IsSubBroker: u.IsSubBroker,
+              PricingConfigured: u.PricingConfigured,
+              hidePricing: u.hidePricing,
+              policyCount,
+              totalPrice: null,
+              totalBalance: null,
+            });
+          } else {
+            anyConfigured = true;
+            const disp = await computeSubBrokerDisplayData(DBConnection, u.id);
+            let sumDisplayPrice = 0;
+            for (const row of uPolicies) {
+              const dp = computePolicyTariffPrice(row, disp.subPricing);
+              if (dp !== null) sumDisplayPrice += dp;
+            }
+            const totalPrice = Math.round(sumDisplayPrice * 100) / 100;
+            overallTotalBalance += totalPrice;
+            result.push({
+              id: u.id,
+              Name: u.Name,
+              CashBalance: disp.displayCashBalance,
+              ParentBrokerId: u.ParentBrokerId,
+              IsSubBroker: u.IsSubBroker,
+              PricingConfigured: u.PricingConfigured,
+              hidePricing: u.hidePricing,
+              policyCount,
+              totalPrice,
+              totalBalance: totalPrice,
+            });
+          }
+        }
+
+        const totalBalance = anyConfigured
+          ? Math.round(overallTotalBalance * 100) / 100
+          : null;
 
         res.json({
           broker: { id: broker.id, Name: broker.Name },
+          totalBalance,
           underlings: result,
         });
       } catch (err) {
@@ -1803,6 +2228,98 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           until = parseLocalBound(String(req.query.until));
           if (until === null) {
             return res.status(400).json({ error: "Invalid date range" });
+          }
+        }
+
+        if (req.brokerScope !== null) {
+          await attachSubBrokerStatus(DBConnection, [broker]);
+          if (broker.hidePricing) {
+            return res.json({
+              broker: {
+                id: broker.id,
+                Name: broker.Name,
+                CashBalance: null,
+              },
+              since,
+              until,
+              page,
+              pageSize,
+              total: 0,
+              totalPages: 1,
+              balanceAtStart: null,
+              netChange: null,
+              movements: [],
+              includeDeleted: false,
+              deleted: [],
+            });
+          }
+          if (broker.IsSubBroker) {
+            const disp = await computeSubBrokerDisplayData(
+              DBConnection,
+              brokerId
+            );
+            const [allMovs] = await DBConnection.query(
+              `SELECT id, Type, Amount, Reason, Author, BlancNumber, CreatedAt
+                 FROM broker_balance_movements
+                WHERE BrokerId = ?
+                  AND CreatedAt >= ?
+                  AND CreatedAt < ?
+                  AND Deleted = 0
+                ORDER BY CreatedAt DESC, id DESC`,
+              [brokerId, since, until]
+            );
+            const mappedAll = (allMovs || []).map((m) => ({
+              ...m,
+              DisplayAmount: disp.mapMovementAmount(m),
+            }));
+            const totalSub = mappedAll.length;
+            const netChangeSub =
+              Math.round(
+                mappedAll.reduce((s, m) => s + m.DisplayAmount, 0) * 100
+              ) / 100;
+            const currentBalanceSub = disp.displayCashBalance;
+            const balanceAtStartSub =
+              Math.round((currentBalanceSub - netChangeSub) * 100) / 100;
+            const totalPagesSub = Math.max(1, Math.ceil(totalSub / pageSize));
+            const offsetSub = (page - 1) * pageSize;
+
+            let runningAfter = currentBalanceSub;
+            const withAfter = mappedAll.map((m) => {
+              const balAfter = Math.round(runningAfter * 100) / 100;
+              runningAfter -= m.DisplayAmount;
+              return {
+                id: m.id,
+                Type: m.Type,
+                Amount: m.DisplayAmount,
+                Reason: m.Reason,
+                Author: m.Author,
+                BlancNumber: m.BlancNumber,
+                CreatedAt:
+                  m.CreatedAt instanceof Date
+                    ? toLocalDateTime(m.CreatedAt)
+                    : m.CreatedAt,
+                BalanceAfter: balAfter,
+              };
+            });
+
+            return res.json({
+              broker: {
+                id: broker.id,
+                Name: broker.Name,
+                CashBalance: currentBalanceSub,
+              },
+              since,
+              until,
+              page,
+              pageSize,
+              total: totalSub,
+              totalPages: totalPagesSub,
+              balanceAtStart: balanceAtStartSub,
+              netChange: netChangeSub,
+              movements: withAfter.slice(offsetSub, offsetSub + pageSize),
+              includeDeleted: false,
+              deleted: [],
+            });
           }
         }
 
@@ -2525,6 +3042,20 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             } catch {
               // Ignore if broker_tariffs is absent in minimal test mocks.
             }
+            // Ensure the sub-broker's stored DB sale prices and balance reflect
+            // the newly assigned main broker's price list.
+            try {
+              const saleEff = await salePricingFor(conn, brokerId);
+              if (Object.keys(saleEff.pricing).length > 0) {
+                await recalculateBrokerPoliciesForPricing(
+                  conn,
+                  brokerId,
+                  saleEff.pricing
+                );
+              }
+            } catch {
+              // Ignore in minimal test mocks.
+            }
           }
           if (newCashBalance !== null) {
             const delta =
@@ -3000,7 +3531,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
         // Check if broker exists
         const [brokerCheck] = await DBConnection.query(
-          "SELECT id FROM brokers WHERE id = ?",
+          "SELECT id, Name, ParentBrokerId FROM brokers WHERE id = ?",
           [brokerId]
         );
 
@@ -3081,14 +3612,44 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               updatedPricing[vehicleType][duration] = price;
             }
 
-            // Recalculate existing policies and balance movements for this
-            // broker so that once a main broker sets up a sub-broker's price
-            // list, its policies and balance reflect those prices.
-            await recalculateBrokerPoliciesForPricing(
-              conn,
-              brokerId,
-              updatedPricing
-            );
+            // For a sub-broker, the tariffs saved in broker_tariffs are DISPLAY
+            // prices only (for that sub-broker and for the total balance shown
+            // to the main broker). The sale price stored in the DB and used to
+            // calculate what each broker owes us must always be the main
+            // broker's price.
+            await attachSubBrokerStatus(conn, brokerCheck);
+            const isSub = Boolean(brokerCheck[0] && brokerCheck[0].IsSubBroker);
+            if (isSub) {
+              const saleEff = await salePricingFor(conn, brokerId);
+              if (Object.keys(saleEff.pricing).length > 0) {
+                await recalculateBrokerPoliciesForPricing(
+                  conn,
+                  brokerId,
+                  saleEff.pricing
+                );
+              }
+            } else {
+              await recalculateBrokerPoliciesForPricing(
+                conn,
+                brokerId,
+                updatedPricing
+              );
+              try {
+                const [underlings] = await conn.query(
+                  "SELECT id FROM brokers WHERE ParentBrokerId = ?",
+                  [brokerId]
+                );
+                for (const u of underlings || []) {
+                  await recalculateBrokerPoliciesForPricing(
+                    conn,
+                    u.id,
+                    updatedPricing
+                  );
+                }
+              } catch {
+                // Ignore in minimal test mocks.
+              }
+            }
 
             return updatedPricing;
           }

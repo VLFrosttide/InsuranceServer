@@ -15,6 +15,8 @@ const { requireAuth, requireRole } = require("./Auth.js");
 const {
   resolveBrokerByEmail,
   effectivePricingFor,
+  salePricingFor,
+  loadOwnBrokerTariffs,
   attachSubBrokerStatus,
 } = require("./Brokers.js");
 
@@ -103,6 +105,8 @@ module.exports.createTariffsRouter = function createTariffsRouter(
 
       // Sub-brokers must not have prices shown to them initially: only after a
       // main broker is chosen and sets up their price list can they see pricing.
+      // Even after configuration, a sub-broker only ever sees its own display
+      // tariffs and never inherits the main broker's sale prices.
       const [brokerRows] = await DBConnection.query(
         "SELECT id, Name, ParentBrokerId FROM brokers WHERE id = ?",
         [brokerId]
@@ -119,10 +123,19 @@ module.exports.createTariffsRouter = function createTariffsRouter(
             hidePricing: true,
           });
         }
+        if (brokerRows[0].IsSubBroker) {
+          const ownPricing = await loadOwnBrokerTariffs(DBConnection, brokerId);
+          return res.json({
+            brokerName: brokerRows[0].Name,
+            brokerId,
+            pricing: ownPricing,
+            inherited: false,
+            sourceBrokerName: null,
+            hidePricing: false,
+          });
+        }
       }
 
-      // Use effective pricing: a sub-broker (underling) without its own tariffs
-      // inherits the main broker's price for its insurances.
       const eff = await effectivePricingFor(DBConnection, brokerId);
 
       res.json({
@@ -158,9 +171,10 @@ module.exports.createTariffsRouter = function createTariffsRouter(
         if (from.trim()) {
           const broker = await resolveBrokerByEmail(DBConnection, from);
           if (broker) {
-            // Effective pricing with parent inheritance: a sub-broker without
-            // its own tariffs gets its main broker's price.
-            const eff = await effectivePricingFor(DBConnection, broker.id);
+            // Policy sale price (stored in the DB and used to calculate what
+            // each broker owes us): for a sub-broker this is ALWAYS the main
+            // broker's price — never the sub-broker's display tariffs.
+            const eff = await salePricingFor(DBConnection, broker.id);
             if (Object.keys(eff.pricing).length > 0) {
               return res.json({
                 source: "broker",
@@ -209,12 +223,24 @@ module.exports.createTariffsRouter = function createTariffsRouter(
         }
 
         const [[broker]] = await DBConnection.query(
-          "SELECT Name FROM brokers WHERE id = ?",
+          "SELECT id, Name, ParentBrokerId FROM brokers WHERE id = ?",
           [brokerId]
         );
 
         if (!broker) {
           return res.status(404).json({ error: "Broker not found" });
+        }
+
+        await attachSubBrokerStatus(DBConnection, [broker]);
+        if (broker.IsSubBroker) {
+          const saleEff = await salePricingFor(DBConnection, brokerId);
+          return res.json({
+            brokerName: broker.Name,
+            brokerId,
+            pricing: saleEff.pricing,
+            inherited: saleEff.inherited,
+            sourceBrokerName: saleEff.sourceBrokerName,
+          });
         }
 
         const [tariffs] = await DBConnection.query(

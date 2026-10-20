@@ -944,6 +944,7 @@ const UnderlingsList = document.getElementById("UnderlingsList");
 const UnderlingFrom = document.getElementById("UnderlingFrom");
 const UnderlingTo = document.getElementById("UnderlingTo");
 const UnderlingClearBtn = document.getElementById("UnderlingClearBtn");
+const UnderlingsTotalBalance = document.getElementById("UnderlingsTotalBalance");
 const PricingOverlay = document.getElementById("PricingOverlay");
 const PricingTitle = document.getElementById("PricingTitle");
 const PricingMeta = document.getElementById("PricingMeta");
@@ -977,11 +978,15 @@ async function loadUnderlings() {
       return;
     }
     SubBrokersPanel.classList.remove("hidden");
-    renderUnderlings(list);
+    renderUnderlings(list, data.totalBalance);
   } catch (err) {
     if (err.status === 403) {
       SubBrokersPanel.classList.add("hidden");
       return;
+    }
+    if (UnderlingsTotalBalance) {
+      UnderlingsTotalBalance.textContent = "";
+      UnderlingsTotalBalance.classList.add("hidden");
     }
     UnderlingsList.innerHTML = "";
     const li = document.createElement("li");
@@ -992,8 +997,10 @@ async function loadUnderlings() {
   }
 }
 
-function renderUnderlings(list) {
+function renderUnderlings(list, serverTotalBalance) {
   UnderlingsList.innerHTML = "";
+  let sumTotal = 0;
+  let anyVisible = false;
   for (const u of list) {
     const li = document.createElement("li");
     li.className = "underling-item";
@@ -1005,17 +1012,38 @@ function renderUnderlings(list) {
     name.title = t("pricing.title");
     name.addEventListener("click", () => openPricing(u.id, u.Name));
 
+    const hidden = isPricingHidden(u);
+    if (!hidden) {
+      anyVisible = true;
+      sumTotal += Number(u.totalPrice ?? u.totalBalance ?? 0);
+    }
+
     const meta = document.createElement("span");
     meta.className = "underling-meta";
-    meta.textContent = isPricingHidden(u)
+    meta.textContent = hidden
       ? t("underlings.policiesCount", { n: u.policyCount })
       : t("underlings.policiesCount", { n: u.policyCount }) +
         " · " +
-        formatMoney(u.totalPrice);
+        formatMoney(u.totalPrice ?? u.totalBalance ?? 0);
 
     li.appendChild(name);
     li.appendChild(meta);
     UnderlingsList.appendChild(li);
+  }
+
+  if (UnderlingsTotalBalance) {
+    if (!anyVisible) {
+      UnderlingsTotalBalance.textContent = "";
+      UnderlingsTotalBalance.classList.add("hidden");
+    } else {
+      const total =
+        serverTotalBalance !== undefined && serverTotalBalance !== null
+          ? Number(serverTotalBalance)
+          : sumTotal;
+      UnderlingsTotalBalance.classList.remove("hidden");
+      UnderlingsTotalBalance.textContent =
+        t("policies.totalBalance") + ": " + formatMoney(total);
+    }
   }
 }
 

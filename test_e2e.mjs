@@ -83,6 +83,7 @@ function wsAuth(token) {
     ws.on("open", () => ws.send(JSON.stringify({ type: "auth", token })));
     ws.on("message", (data) => {
       const msg = JSON.parse(data.toString());
+      if (msg.type === "presence_update") return;
       clearTimeout(timer);
       ws.close();
       resolve(msg);
@@ -411,14 +412,15 @@ async function main() {
     // not depend on whatever brokers/policies the database already holds.
     const delStamp = Date.now();
     const delEmail = `deltest${delStamp}@broker.example`;
+    const rangeBase = (delStamp % 100000000) * 10 + 1000;
     r = await req(
       "POST",
       "/brokers",
       {
         Name: `DeleteTestBroker${delStamp}`,
         CashBalance: 1000,
-        PolicyRangeStart: 1,
-        PolicyRangeEnd: 10,
+        PolicyRangeStart: rangeBase,
+        PolicyRangeEnd: rangeBase + 9,
         InactivePolicies: 10,
         emails: [delEmail],
       },
@@ -444,7 +446,7 @@ async function main() {
       );
 
     // Broker policy: delete refunds the full price and restores the blanc.
-    const delBrokerBlanc = `DELBRK${delStamp}`;
+    const delBrokerBlanc = String(rangeBase + 1);
     r = await createBrokerPolicy(delBrokerBlanc, 500);
     check("POST broker insurance for delete -> 201", r.status === 201, JSON.stringify(r.data));
     let bBefore = await getDelBroker();
@@ -512,7 +514,7 @@ async function main() {
 
     // Annulment refunds the broker but does NOT restore the blanc; a later
     // deletion restores the blanc without refunding the broker again.
-    const annulBlanc = `DELANN${delStamp}`;
+    const annulBlanc = String(rangeBase + 2);
     r = await createBrokerPolicy(annulBlanc, 200);
     check("POST broker insurance for annul -> 201", r.status === 201, JSON.stringify(r.data));
     bBefore = await getDelBroker();
@@ -563,8 +565,8 @@ async function main() {
       `${JSON.stringify(r.data)} balance ${bBefore.CashBalance} -> ${bAfter.CashBalance}`
     );
 
-    // GET /cardpayments returns the current card balance.
-    r = await req("GET", "/cardpayments", null, workerToken);
+    // GET /cardpayments returns the current card balance (admin only).
+    r = await req("GET", "/cardpayments", null, adminToken);
     check(
       "GET /cardpayments returns card balance",
       r.status === 200 && typeof r.data.cardBalance === "number",
@@ -609,6 +611,206 @@ async function main() {
     // WebSocket invalid token
     const wsBad = await wsAuth("BOGUS");
     check("WebSocket bad token -> auth_error", wsBad.type === "auth_error");
+
+    // -----------------------------------------------------------------
+    // Sub-broker display pricing vs. main broker sale pricing
+    // -----------------------------------------------------------------
+    const sbStamp = Date.now();
+    const mainEmail = `main_${sbStamp}@broker.example`;
+    const subEmail = `sub_${sbStamp}@broker.example`;
+
+    // 1. Create main broker and set its sale tariffs (Auto 30 = 26)
+    r = await req(
+      "POST",
+      "/brokers",
+      { Name: `MAIN_${sbStamp}`, CashBalance: 1000, emails: [mainEmail] },
+      adminToken
+    );
+    const mainBrokerId = r.data?.broker?.id;
+    check("Create main broker for sub-broker test", r.status === 201 && !!mainBrokerId);
+
+    r = await req(
+      "PUT",
+      `/brokers/${mainBrokerId}/pricing`,
+      { pricing: { Auto: { 15: 21, 30: 26, 90: 32 } } },
+      adminToken
+    );
+    check("Set main broker sale pricing", r.status === 200);
+
+    // 2. Create sub-broker mapped to main broker and top up 100 via /increase
+    r = await req(
+      "POST",
+      "/brokers",
+      {
+        Name: `SUB_${sbStamp}`,
+        CashBalance: 0,
+        ParentBrokerId: mainBrokerId,
+        emails: [subEmail],
+      },
+      adminToken
+    );
+    const subBrokerId = r.data?.broker?.id;
+    check(
+      "Create sub-broker with ParentBrokerId",
+      r.status === 201 && !!subBrokerId && r.data?.broker?.hidePricing === true
+    );
+
+    r = await req(
+      "POST",
+      `/brokers/${subBrokerId}/increase`,
+      { amount: 100, reason: "initial top-up", currency: "EUR" },
+      adminToken
+    );
+    check("Top up sub-broker balance by 100", r.status === 200);
+
+    // 3. Set sub-broker display tariffs (Auto 30 = 35, different from main broker's 26)
+    r = await req(
+      "PUT",
+      `/brokers/${subBrokerId}/pricing`,
+      { pricing: { Auto: { 15: 28, 30: 35, 90: 42 } } },
+      adminToken
+    );
+    check("Set sub-broker display pricing", r.status === 200);
+
+    // 4. GET /tariffs/policy-pricing for sub-broker email returns MAIN broker's price (26), NOT 35
+    r = await req(
+      "GET",
+      `/tariffs/policy-pricing?from=${encodeURIComponent(subEmail)}`,
+      null,
+      workerToken
+    );
+    check(
+      "GET /tariffs/policy-pricing for sub-broker returns main broker sale price (26)",
+      r.status === 200 && Number(r.data?.pricing?.Auto?.["30"]) === 26,
+      JSON.stringify(r.data)
+    );
+
+    // 5. Create policy for sub-broker (even if client sends 35, DB sale price must be 26)
+    const sbBlanc = `SB${sbStamp}`;
+    r = await req(
+      "POST",
+      "/worker/insurances",
+      {
+        PolicyNumber: `P-${sbBlanc}`,
+        BlancNumber: sbBlanc,
+        CarNumber: "34SUB123",
+        Duration: "1 месец",
+        Branch: "ГКПП Лесово",
+        Otomobil: "Automobile",
+        Price: "35",
+        CurrencyType: "EUR",
+        EmailFrom: subEmail,
+        PaymentType: "Broker",
+        DisableReturnEmail: true,
+      },
+      workerToken
+    );
+    check("Create policy for sub-broker -> 201", r.status === 201, JSON.stringify(r.data));
+
+    // 6. Verify DB sale price (insurance.Price) is 26 and DB CashBalance owed to us is 100 - 26 = 74
+    r = await req("GET", `/insurances?blancNumber=${sbBlanc}`, null, adminToken);
+    check(
+      "DB insurance.Price for sub-broker is main broker sale price (26)",
+      r.status === 200 && Number(r.data?.insurances?.[0]?.Price) === 26,
+      JSON.stringify(r.data?.insurances?.[0])
+    );
+
+    r = await req("GET", `/brokers/${subBrokerId}`, null, adminToken);
+    check(
+      "DB CashBalance for sub-broker (owed to us) uses main broker price (100 - 26 = 74)",
+      r.status === 200 && Math.abs(Number(r.data?.broker?.CashBalance) - 74) < 0.01,
+      JSON.stringify(r.data?.broker)
+    );
+
+    // 7. Verify underlings endpoint (shown to main broker) uses sub-broker display price (35)
+    r = await req("GET", `/brokers/${mainBrokerId}/underlings`, null, adminToken);
+    const uEntry = (r.data?.underlings || []).find((u) => u.id === subBrokerId);
+    check(
+      "GET /brokers/:id/underlings shows sub-broker display totalPrice (35), totalBalance (35), and display CashBalance (65)",
+      r.status === 200 &&
+        uEntry &&
+        Number(uEntry.totalPrice) === 35 &&
+        Number(uEntry.totalBalance) === 35 &&
+        Math.abs(Number(uEntry.CashBalance) - 65) < 0.01 &&
+        Number(r.data?.totalBalance) === 35,
+      JSON.stringify(r.data)
+    );
+
+    // 8. Verify GET /brokers/:subBrokerId/policies returns display price (35), never sale price (26)
+    r = await req("GET", `/brokers/${subBrokerId}/policies`, null, adminToken);
+    check(
+      "GET /brokers/:subBrokerId/policies returns display price (35), never sale price (26)",
+      r.status === 200 && Number(r.data?.policies?.[0]?.Price) === 35,
+      JSON.stringify(r.data?.policies?.[0])
+    );
+
+    // 9. Register, approve, and log in as the sub-broker (role 3) to verify
+    //    sub-brokers NEVER see the main broker's sale prices (26 / 74)
+    const subUsername = `SUB_${sbStamp}`;
+    await req("POST", "/userreg", { username: subUsername, password: "subpass123" });
+    await req(
+      "POST",
+      `/admin/users/${encodeURIComponent(subUsername)}/approve`,
+      { brokerId: subBrokerId },
+      adminToken
+    );
+    r = await req("POST", "/logme", { username: subUsername, password: "subpass123" });
+    const subToken = tokenFromSetCookie(r.setCookie) || r.data?.token;
+    check("Sub-broker login -> 200", r.status === 200 && !!subToken);
+
+    r = await req("GET", "/tariffs/my-pricing", null, subToken);
+    check(
+      "Sub-broker GET /tariffs/my-pricing returns only display prices (35), never sale price (26)",
+      r.status === 200 && Number(r.data?.pricing?.Auto?.["30"]) === 35,
+      JSON.stringify(r.data)
+    );
+
+    r = await req("GET", `/brokers/${subBrokerId}`, null, subToken);
+    check(
+      "Sub-broker GET /brokers/:id shows display CashBalance (65), never DB sale CashBalance (74)",
+      r.status === 200 && Math.abs(Number(r.data?.broker?.CashBalance) - 65) < 0.01,
+      JSON.stringify(r.data?.broker)
+    );
+
+    r = await req("GET", "/brokers/biweekly", null, subToken);
+    check(
+      "Sub-broker GET /brokers/biweekly shows display CashBalance (65) and movement (65), never 74",
+      r.status === 200 &&
+        Math.abs(Number(r.data?.brokers?.[0]?.CashBalance) - 65) < 0.01 &&
+        Math.abs(Number(r.data?.brokers?.[0]?.periods?.[0]?.balanceMovement) - 65) < 0.01,
+      JSON.stringify(r.data?.brokers?.[0])
+    );
+
+    r = await req("GET", `/brokers/${subBrokerId}/history`, null, subToken);
+    const subPolicyMov = (r.data?.movements || []).find((m) => m.Type === "policy");
+    check(
+      "Sub-broker GET /brokers/:id/history shows display movement (-35) and balance (65), never -26/74",
+      r.status === 200 &&
+        subPolicyMov &&
+        Number(subPolicyMov.Amount) === -35 &&
+        Math.abs(Number(r.data?.broker?.CashBalance) - 65) < 0.01,
+      JSON.stringify(r.data)
+    );
+
+    r = await req("GET", "/client/insurances", null, subToken);
+    check(
+      "Sub-broker GET /client/insurances shows display price (35), never sale price (26)",
+      r.status === 200 && Number(r.data?.insurances?.[0]?.Price) === 35,
+      JSON.stringify(r.data?.insurances?.[0])
+    );
+
+    r = await req("GET", `/brokers/${mainBrokerId}/pricing`, null, subToken);
+    check(
+      "Sub-broker blocked from GET /brokers/:mainBrokerId/pricing -> 403",
+      r.status === 403
+    );
+
+    // Clean up test fixtures
+    await req("POST", `/admin/users/${encodeURIComponent(subUsername)}/delete`, null, adminToken);
+    await req("DELETE", `/insurances/${sbBlanc}`, null, adminToken);
+    await req("DELETE", `/brokers/${subBrokerId}`, null, adminToken);
+    await req("DELETE", `/brokers/${mainBrokerId}`, null, adminToken);
+    if (delBrokerId) await req("DELETE", `/brokers/${delBrokerId}`, null, adminToken);
   } catch (err) {
     failed++;
     console.log("  ERROR " + err.stack || err.message);
