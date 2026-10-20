@@ -12,7 +12,11 @@
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
-const { resolveBrokerByEmail, effectivePricingFor } = require("./Brokers.js");
+const {
+  resolveBrokerByEmail,
+  effectivePricingFor,
+  attachSubBrokerStatus,
+} = require("./Brokers.js");
 
 // Split branch tariff rows into EUR (default) and TRY maps. TRY rows only
 // exist for Auto policies at the Lesovo / Kap Andreevo border crossings.
@@ -97,6 +101,26 @@ module.exports.createTariffsRouter = function createTariffsRouter(
         });
       }
 
+      // Sub-brokers must not have prices shown to them initially: only after a
+      // main broker is chosen and sets up their price list can they see pricing.
+      const [brokerRows] = await DBConnection.query(
+        "SELECT id, Name, ParentBrokerId FROM brokers WHERE id = ?",
+        [brokerId]
+      );
+      if (brokerRows.length > 0) {
+        await attachSubBrokerStatus(DBConnection, brokerRows);
+        if (brokerRows[0].hidePricing) {
+          return res.json({
+            brokerName: brokerRows[0].Name,
+            brokerId,
+            pricing: {},
+            inherited: false,
+            sourceBrokerName: null,
+            hidePricing: true,
+          });
+        }
+      }
+
       // Use effective pricing: a sub-broker (underling) without its own tariffs
       // inherits the main broker's price for its insurances.
       const eff = await effectivePricingFor(DBConnection, brokerId);
@@ -107,6 +131,7 @@ module.exports.createTariffsRouter = function createTariffsRouter(
         pricing: eff.pricing,
         inherited: eff.inherited,
         sourceBrokerName: eff.sourceBrokerName,
+        hidePricing: false,
       });
     } catch (err) {
       console.error("Failed to fetch broker pricing:", err);

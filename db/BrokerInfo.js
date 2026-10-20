@@ -49,11 +49,25 @@ let BalkanTravel = [
 let Kadri = ["ipgrupkadri34@gmail.com"];
 let Ayshe = ["berkheldanismanlik@gmail.com"];
 let Ismayl = ["khrsigorta@gmail.com"];
-let ErcanSever = ["ercansever08@gmail.com"];
-let NecmiErdan = ["necmierdan@gmail.com"];
-let RidwanOzturk = ["ozturkridvan1970@gmail.com"];
-let SengunKale = ["sengunk@gmail.com"];
+let ErcanSever = ["ercansever08@gmail.com"]; // Mark as sub
+let NecmiErdan = ["necmierdan@gmail.com"]; //Mark as sub
+let RidwanOzturk = ["ozturkridvan1970@gmail.com"]; // mark as sub
+let SengunKale = ["sengunk@gmail.com"]; // Mark as sub
 let Kocaeli = ["sergeyangelov66@gmail.com"];
+
+// Brokers marked as sub-brokers above. Initially they have no main broker and
+// no price list configured, so pricing and balance calculations are hidden from
+// them on the website until a main broker is chosen and sets up their pricing.
+const SubBrokers = new Set([
+  "ErcanSever",
+  "NecmiErdan",
+  "RidwanOzturk",
+  "SengunKale",
+]);
+
+function isSubBrokerName(name) {
+  return SubBrokers.has(String(name ?? "").trim());
+}
 let SigortaBulgoc = ["bulgocsigorta@gmail.com"];
 let Svilengrad = ["rossindrella33@abv.bg"];
 let Yakup = ["yamansigorta16@hotmail.com"];
@@ -837,6 +851,10 @@ const BrokerData = {
  * @returns {Promise<number>} number of tariff rows inserted
  */
 async function seedBrokerTariffsIfMissing(db, brokerId, brokerName) {
+  // Sub-brokers do not get their own tariffs seeded from BrokerInfo.js:
+  // their price list must be set up by their main broker after one is chosen.
+  if (isSubBrokerName(brokerName)) return 0;
+
   const brokerPricing = EuroPricing[brokerName];
   if (!brokerPricing) return 0;
 
@@ -930,15 +948,30 @@ async function seedBrokersFromInfo(db) {
 
   // Get existing brokers to avoid duplicates
   const [existingBrokers] = await db.query(
-    "SELECT id, Name FROM brokers WHERE Name IN (?)",
+    "SELECT id, Name, ParentBrokerId FROM brokers WHERE Name IN (?)",
     [Object.keys(BrokerData)]
   );
   const existingBrokerNames = new Set(existingBrokers.map((b) => b.Name));
 
   // Existing brokers keep their data; only fill in tariffs when the database
-  // has none for them yet.
+  // has none for them yet. Sub-brokers without a chosen main broker have any
+  // previously auto-seeded tariffs cleared so prices are not shown to them
+  // before a main broker is chosen and sets up their price list.
   for (const b of existingBrokers) {
-    await seedBrokerTariffsIfMissing(db, b.id, b.Name);
+    if (isSubBrokerName(b.Name)) {
+      try {
+        await db.query("UPDATE brokers SET IsSubBroker = 1 WHERE id = ?", [
+          b.id,
+        ]);
+      } catch {
+        // IsSubBroker column may not exist on older schemas yet.
+      }
+      if (!b.ParentBrokerId) {
+        await db.query("DELETE FROM broker_tariffs WHERE BrokerId = ?", [b.id]);
+      }
+    } else {
+      await seedBrokerTariffsIfMissing(db, b.id, b.Name);
+    }
     await seedBrokerEmailsIfMissing(db, b.id, b.Name);
   }
 
@@ -951,13 +984,25 @@ async function seedBrokersFromInfo(db) {
       continue;
     }
 
+    const isSub = isSubBrokerName(brokerName) ? 1 : 0;
+
     // Insert broker (default policy range and values, can be updated later)
-    const [result] = await db.query(
-      `INSERT INTO brokers
-         (Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
-       VALUES (?, ?, ?, ?, ?)`,
-      [brokerName, 0, 0, 0, 0]
-    );
+    let result;
+    try {
+      [result] = await db.query(
+        `INSERT INTO brokers
+           (Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies, IsSubBroker)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [brokerName, 0, 0, 0, 0, isSub]
+      );
+    } catch {
+      [result] = await db.query(
+        `INSERT INTO brokers
+           (Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
+         VALUES (?, ?, ?, ?, ?)`,
+        [brokerName, 0, 0, 0, 0]
+      );
+    }
 
     const brokerId = result.insertId;
 
@@ -971,7 +1016,7 @@ async function seedBrokersFromInfo(db) {
       );
     }
 
-    // Insert broker tariffs from EuroPricing data
+    // Insert broker tariffs from EuroPricing data (skipped for sub-brokers)
     await seedBrokerTariffsIfMissing(db, brokerId, brokerName);
 
     seedCount++;
@@ -1019,6 +1064,8 @@ module.exports = {
   EuroPricing,
   TryPricing,
   BrokerData,
+  SubBrokers,
+  isSubBrokerName,
   seedBrokersFromInfo,
   seedBrokerTariffsIfMissing,
   seedBranchTariffsIfMissing,

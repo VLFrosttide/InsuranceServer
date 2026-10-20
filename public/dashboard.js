@@ -68,6 +68,19 @@ LogoutBtn.addEventListener("click", () => {
 let brokers = [];
 let selectedId = null;
 let schedule = null;
+let policiesHidePricing = false;
+
+function isPricingHidden(b) {
+  if (!b) return false;
+  if (b.hidePricing !== undefined) return Boolean(b.hidePricing);
+  const isSub = Boolean(b.IsSubBroker || b.isSubBroker);
+  const hasParent =
+    b.ParentBrokerId !== null &&
+    b.ParentBrokerId !== undefined &&
+    Number(b.ParentBrokerId) > 0;
+  const configured = Boolean(b.PricingConfigured ?? b.pricingConfigured);
+  return isSub && !(hasParent && configured);
+}
 
 function renderBrokerList() {
   const q = BrokerSearch.value.trim().toLowerCase();
@@ -95,8 +108,11 @@ function renderBrokerList() {
 
     const sub = document.createElement("span");
     sub.className = "broker-sub";
-    sub.textContent =
-      formatMoney(b.CashBalance) + " · " + t("list.inactive", { n: b.InactivePolicies ?? 0 });
+    sub.textContent = isPricingHidden(b)
+      ? t("list.inactive", { n: b.InactivePolicies ?? 0 })
+      : formatMoney(b.CashBalance) +
+        " · " +
+        t("list.inactive", { n: b.InactivePolicies ?? 0 });
 
     li.appendChild(name);
     li.appendChild(sub);
@@ -107,7 +123,7 @@ function renderBrokerList() {
 
 function renderBanner(b) {
   if (!PaymentBanner) return;
-  if (!schedule) {
+  if (!schedule || isPricingHidden(b)) {
     PaymentBanner.hidden = true;
     return;
   }
@@ -321,6 +337,12 @@ function setPoliciesDateFilter(value) {
 }
 
 function renderPoliciesTotal() {
+  if (policiesHidePricing) {
+    PoliciesTotalBalance.textContent = "";
+    PoliciesTotalBalance.classList.add("hidden");
+    return;
+  }
+  PoliciesTotalBalance.classList.remove("hidden");
   const total = filteredPolicies().reduce((sum, p) => sum + Number(p.Price || 0), 0);
   PoliciesTotalBalance.textContent =
     t("policies.totalBalance") + ": " + formatMoney(total);
@@ -370,6 +392,12 @@ function updatePolicySortHeaders() {
 }
 
 function renderPolicies(data) {
+  const currentBroker = brokers.find((x) => x.id === selectedId);
+  policiesHidePricing = Boolean(
+    (data && data.hidePricing) ||
+      (data && data.broker && isPricingHidden(data.broker)) ||
+      isPricingHidden(currentBroker)
+  );
   policiesData = data.policies || [];
   PoliciesSince.textContent = data.schedule
     ? t("policies.since", { date: formatDate(data.schedule.periodStart) })
@@ -378,6 +406,15 @@ function renderPolicies(data) {
 }
 
 function renderPolicyTable() {
+  const priceTh = document.querySelector(
+    '#PoliciesPanel th[data-i18n="policies.col.price"]'
+  );
+  const currTh = document.querySelector(
+    '#PoliciesPanel th[data-i18n="policies.col.currency"]'
+  );
+  if (priceTh) priceTh.classList.toggle("hidden", policiesHidePricing);
+  if (currTh) currTh.classList.toggle("hidden", policiesHidePricing);
+
   PoliciesRows.innerHTML = "";
   const policies = sortedPolicies();
   for (const p of policies) {
@@ -385,16 +422,25 @@ function renderPolicyTable() {
     row.innerHTML =
       "<td>" + escapeHtml(p.PolicyNumber) + "</td>" +
       "<td>" + escapeHtml(p.BlancNumber) + "</td>" +
-      '<td class="num">' + formatMoney(p.Price) + "</td>" +
-      "<td>" + escapeHtml(p.CurrencyType) + "</td>" +
+      (policiesHidePricing
+        ? ""
+        : '<td class="num">' +
+          formatMoney(p.Price) +
+          "</td>" +
+          "<td>" +
+          escapeHtml(p.CurrencyType) +
+          "</td>") +
       "<td>" + escapeHtml(formatDate(p.CreationDate)) + "</td>";
     PoliciesRows.appendChild(row);
   }
   if (policies.length === 0) {
     const emptyMessage = policiesDate ? t("policies.emptyForDate") : t("policies.empty");
+    const colSpan = policiesHidePricing ? 3 : 5;
     const row = document.createElement("tr");
     row.innerHTML =
-      '<td colspan="5" class="policies-empty">' +
+      '<td colspan="' +
+      colSpan +
+      '" class="policies-empty">' +
       escapeHtml(emptyMessage) +
       "</td>";
     PoliciesRows.appendChild(row);
@@ -438,9 +484,22 @@ async function selectBroker(id) {
   const b = brokers.find((x) => x.id === id);
   if (!b) return;
 
+  const hidePricing = isPricingHidden(b);
+  policiesHidePricing = hidePricing;
+
   DetailName.textContent = b.Name;
-  StatBalance.textContent = formatMoney(b.CashBalance);
+  const statBalanceCard = StatBalance ? StatBalance.closest(".stat") : null;
+  if (statBalanceCard) {
+    statBalanceCard.classList.toggle("hidden", hidePricing);
+  }
+  StatBalance.textContent = hidePricing ? "" : formatMoney(b.CashBalance);
   StatInactive.textContent = b.InactivePolicies ?? 0;
+
+  const movTh = document.querySelector(
+    '#Detail th[data-i18n="table.balanceMovement"]'
+  );
+  if (movTh) movTh.classList.toggle("hidden", hidePricing);
+  if (TotalMovement) TotalMovement.classList.toggle("hidden", hidePricing);
 
   const periods = b.periods || [];
   PeriodRows.innerHTML = "";
@@ -456,16 +515,18 @@ async function selectBroker(id) {
     row.innerHTML =
       "<td>" + escapeHtml(formatDate(p.start)) + " &ndash; " + escapeHtml(formatDate(p.end)) + "</td>" +
       '<td class="num">' + p.policies + "</td>" +
-      '<td class="num ' +
-      (Number(p.balanceMovement) < 0 ? "neg" : "pos") +
-      '">' +
-      formatSignedMoney(p.balanceMovement) +
-      "</td>";
+      (hidePricing
+        ? ""
+        : '<td class="num ' +
+          (Number(p.balanceMovement) < 0 ? "neg" : "pos") +
+          '">' +
+          formatSignedMoney(p.balanceMovement) +
+          "</td>");
     PeriodRows.appendChild(row);
   }
 
   TotalPolicies.textContent = totalPolicies;
-  TotalMovement.textContent = formatSignedMoney(totalMovement);
+  TotalMovement.textContent = hidePricing ? "" : formatSignedMoney(totalMovement);
   StatPolicies.textContent = totalPolicies;
 
   renderBanner(b);
@@ -946,9 +1007,11 @@ function renderUnderlings(list) {
 
     const meta = document.createElement("span");
     meta.className = "underling-meta";
-    meta.textContent =
-      t("underlings.policiesCount", { n: u.policyCount }) +
-      " · " + formatMoney(u.totalPrice);
+    meta.textContent = isPricingHidden(u)
+      ? t("underlings.policiesCount", { n: u.policyCount })
+      : t("underlings.policiesCount", { n: u.policyCount }) +
+        " · " +
+        formatMoney(u.totalPrice);
 
     li.appendChild(name);
     li.appendChild(meta);
@@ -1067,9 +1130,11 @@ PricingSaveBtn.addEventListener("click", async () => {
       body: JSON.stringify({ pricing: collectPricing() }),
     });
     pricingData = data.pricing || {};
+    PricingMeta.textContent = "";
     setMsg(PricingMsg, t("pricing.saved"), false);
     renderPricingGrid();
     if (isBroker) await loadUnderlings();
+    await load();
   } catch (err) {
     setMsg(PricingMsg, err.message || t("pricing.saveFailed"), true);
   }

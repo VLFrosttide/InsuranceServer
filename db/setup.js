@@ -734,6 +734,7 @@ async function runSetup(config = {}) {
        Name VARCHAR(100) NOT NULL,
        CashBalance DECIMAL(15,2) NOT NULL DEFAULT 0,
        CutOff TINYINT(1) NOT NULL DEFAULT 0,
+       IsSubBroker TINYINT(1) NOT NULL DEFAULT 0,
        PolicyRangeStart INT NOT NULL,
        PolicyRangeEnd INT NOT NULL,
        InactivePolicies INT NOT NULL DEFAULT 0,
@@ -900,6 +901,17 @@ async function runSetup(config = {}) {
       "ALTER TABLE brokers ADD COLUMN CutOff TINYINT(1) NOT NULL DEFAULT 0"
     );
     console.log("Added brokers.CutOff column");
+  }
+
+  // Sub-broker flag: marks brokers flagged as sub-brokers in BrokerInfo.js
+  // (or assigned a ParentBrokerId) so they do not see pricing or balance
+  // calculations on the website until a main broker is chosen and sets up
+  // their price list.
+  if (!brokerColNames.has("IsSubBroker")) {
+    await db.query(
+      "ALTER TABLE brokers ADD COLUMN IsSubBroker TINYINT(1) NOT NULL DEFAULT 0"
+    );
+    console.log("Added brokers.IsSubBroker column");
   }
 
   // Seed brokers + their tariffs from BrokerInfo.js. Idempotent: existing
