@@ -13,6 +13,7 @@ const Authorize = require("./Authorize.js");
 const mailStore = require("./mailStore.js");
 const { startWeeklyRefreshReminder } = require("./renewalReminder.js");
 const { notifyEmailRead } = require("../Users/websocket.js");
+const { shouldShowBrokerEmail } = require("./brokerSenders.js");
 
 let MailPhotos = [];
 
@@ -65,11 +66,12 @@ async function processUnreadMessages(gmail, account) {
   const unreadIds = await listUnreadIds(gmail);
 
   // Drop cards whose Gmail message is no longer unread (e.g. someone read it
-  // directly in Gmail). Claimed emails are left alone: a worker has the form
-  // open, and completing/releasing it is handled through the WebSocket flow.
-  // Cancelling (release_email) marks the Gmail message unread again, so a
-  // cancelled email keeps its card.
-  pruneReadEmails(account, new Set(unreadIds), sweepStartedAt);
+  // directly in Gmail) or whose broker has since been cut off / hidden.
+  // Claimed emails are left alone: a worker has the form open, and
+  // completing/releasing it is handled through the WebSocket flow. Cancelling
+  // (release_email) marks the Gmail message unread again, so a cancelled email
+  // keeps its card.
+  await pruneReadEmails(account, new Set(unreadIds), sweepStartedAt);
 
   for (const messageId of unreadIds) {
     // Unread messages stay "unread" in Gmail until a worker completes/ignores
@@ -89,13 +91,26 @@ async function processUnreadMessages(gmail, account) {
 }
 
 // Remove every stored, unclaimed email of `account` that is no longer in the
-// inbox's unread set, and tell connected workers to drop its card. Emails a
-// worker cancelled after this sweep started are skipped: they are being marked
-// unread again and the Gmail list may predate that.
-function pruneReadEmails(account, unreadIdSet, sweepStartedAt) {
+// inbox's unread set (or whose broker is now cut off / disallowed), and tell
+// connected workers to drop its card. Emails a worker cancelled after this
+// sweep started are skipped: they are being marked unread again and the Gmail
+// list may predate that.
+async function pruneReadEmails(account, unreadIdSet, sweepStartedAt) {
   for (const { email, claimed, releasedAt } of mailStore.listByAccount(
     account
   )) {
+    if (!claimed && !(await shouldShowBrokerEmail(email.from))) {
+      mailStore.evict(email.messageId);
+      try {
+        notifyEmailRead(email);
+      } catch (err) {
+        console.error(
+          `Failed to broadcast hidden broker email "${email.messageId}" (${account}):`,
+          err
+        );
+      }
+      continue;
+    }
     if (claimed || unreadIdSet.has(email.messageId)) continue;
     if (releasedAt >= sweepStartedAt) continue;
     mailStore.remove(email.messageId);

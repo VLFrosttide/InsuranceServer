@@ -134,6 +134,15 @@ module.exports.createAccountRouter = function createAccountRouter(DBConnection) 
         [brokerId]
       );
 
+      const [[brokerRow]] = await DBConnection.query(
+        "SELECT CutOff FROM brokers WHERE id = ?",
+        [brokerId]
+      );
+      if (brokerRow && Boolean(brokerRow.CutOff)) {
+        const { evictEmailsForAddresses } = require("../Users/websocket.js");
+        await evictEmailsForAddresses(rows.map((r) => r.Email));
+      }
+
       res.json({
         message: "Emails updated",
         emails: rows.map((r) => r.Email),

@@ -221,10 +221,10 @@ module.exports.ProcessEmail = async function ProcessEmail(
     attachments: [],
   };
 
-  // Only emails from a known broker (database / BrokerInfo.js) are shown to
-  // clients. When the admin has disabled negative-balance broker requests,
-  // emails from brokers whose balance is already negative are hidden too.
-  // Anything else is ignored: never stored, broadcast, or marked read.
+  // Only emails from a known, non-cut-off broker (database / BrokerInfo.js)
+  // are shown to workers. When the admin has disabled negative-balance broker
+  // requests, emails from brokers whose balance is already negative are hidden
+  // too. Anything else is ignored: never stored, broadcast, or marked read.
   if (!(await shouldShowBrokerEmail(emailInfo.from))) {
     return null;
   }

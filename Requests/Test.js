@@ -11,6 +11,7 @@ const path = require("node:path");
 const { requireAuth, requireRole } = require("./Auth.js");
 const mailStore = require("../Mail/mailStore.js");
 const { notifyUnreadEmail } = require("../Users/websocket.js");
+const { isCutOffBrokerSender } = require("../Mail/brokerSenders.js");
 
 const TEST_EMAIL_SUBJECT =
   "1,21- ANET SAHAKOĞLU - 34 PJY 807 - 1MES: 22.09.2026 - BI: 156423";
@@ -99,8 +100,10 @@ module.exports.createTestRouter = function createTestRouter(DBConnection) {
         email.attachments.push(card);
       }
 
-      mailStore.add(email);
-      notifyUnreadEmail(email);
+      if (!(await isCutOffBrokerSender(email.from))) {
+        mailStore.add(email);
+        notifyUnreadEmail(email);
+      }
 
       res.status(201).json({ message: "Test email injected", email });
     } catch (err) {

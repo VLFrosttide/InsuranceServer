@@ -1,6 +1,11 @@
 const { WebSocketServer, WebSocket } = require("ws");
 const mailStore = require("../Mail/mailStore.js");
-const { canSeeEmail } = require("../Mail/branchRouting.js");
+const { canSeeEmail, extractAddress } = require("../Mail/branchRouting.js");
+
+function checkCutOffSender(from) {
+  const { isCutOffBrokerSender } = require("../Mail/brokerSenders.js");
+  return isCutOffBrokerSender(from);
+}
 
 let wss = null;
 let db = null;
@@ -409,6 +414,16 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
  * @param {string} messageId  Gmail message ID.
  */
 async function releaseEmail(email, messageId) {
+  if (await checkCutOffSender(email.from)) {
+    mailStore.evict(messageId);
+    module.exports.notifyEmailRead(email);
+    try {
+      await mailStore.markUnread(email.account, messageId);
+    } catch (err) {
+      console.error("Failed to mark cut-off broker email as unread:", err);
+    }
+    return;
+  }
   mailStore.unclaim(messageId);
   mailStore.touchReleased(messageId);
   broadcast({ type: "email_released", data: email }, email);
@@ -478,9 +493,17 @@ async function handleMessage(ws, data) {
       safeSend(ws, { type: "list_emails", data: [] });
       return;
     }
-    const data = mailStore
+    const candidates = mailStore
       .listAll()
       .filter((email) => canSeeEmail(ws.branch, email));
+    const data = [];
+    for (const email of candidates) {
+      if (await checkCutOffSender(email.from)) {
+        mailStore.evict(email.messageId);
+        continue;
+      }
+      data.push(email);
+    }
     safeSend(ws, { type: "list_emails", data });
   } else if (msg.type === "get_attachment") {
     if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
@@ -489,7 +512,12 @@ async function handleMessage(ws, data) {
     const messageId = msg.messageId || null;
     const id = msg.id || null;
     const email = messageId ? mailStore.get(messageId) : null;
-    if (!email || !id || !canSeeEmail(ws.branch, email)) {
+    if (
+      !email ||
+      !id ||
+      !canSeeEmail(ws.branch, email) ||
+      (await checkCutOffSender(email.from))
+    ) {
       safeSend(ws, {
         type: "get_attachment",
         ok: false,
@@ -549,7 +577,10 @@ async function handleMessage(ws, data) {
       });
       return;
     }
-    if (!canSeeEmail(ws.branch, email)) {
+    if (!canSeeEmail(ws.branch, email) || (await checkCutOffSender(email.from))) {
+      if (await checkCutOffSender(email.from)) {
+        mailStore.evict(messageId);
+      }
       safeSend(ws, {
         type: "claim_email",
         ok: false,
@@ -670,6 +701,50 @@ module.exports.notifyEmailRead = function notifyEmailRead(emailInfo) {
     { type: "email_read", messageId: emailInfo.messageId },
     emailInfo
   );
+};
+
+/**
+ * Evict every stored email whose sender matches one of `addresses` (e.g. when a
+ * broker is cut off) and notify connected workers so their cards disappear
+ * immediately.
+ *
+ * @param {Iterable<string>} addresses
+ */
+module.exports.evictEmailsForAddresses = async function evictEmailsForAddresses(
+  addresses
+) {
+  const targetSet = new Set();
+  for (const addr of addresses || []) {
+    const normalized = extractAddress(addr);
+    if (normalized) targetSet.add(normalized);
+  }
+  if (targetSet.size === 0) return;
+
+  for (const { email } of mailStore.listAllEntries()) {
+    const sender = extractAddress(email.from);
+    if (!sender || !targetSet.has(sender)) continue;
+
+    clearPendingRelease(email.messageId);
+    if (wss) {
+      for (const client of wss.clients) {
+        if (client.claimedEmails) {
+          client.claimedEmails.delete(email.messageId);
+        }
+      }
+    }
+    const evicted = mailStore.evict(email.messageId);
+    module.exports.notifyEmailRead(email);
+    if (evicted && evicted.wasClaimed) {
+      try {
+        await mailStore.markUnread(email.account, email.messageId);
+      } catch (err) {
+        console.error(
+          `Failed to mark evicted email "${email.messageId}" as unread:`,
+          err
+        );
+      }
+    }
+  }
 };
 
 /**

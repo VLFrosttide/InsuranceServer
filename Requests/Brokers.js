@@ -160,16 +160,20 @@ const resolveBrokerByEmail = (module.exports.resolveBrokerByEmail =
     const m = raw.match(/<([^>]+)>/);
     if (m) address = m[1].trim();
     const [rows] = await conn.query(
-      `SELECT be.BrokerId, b.Name
+      `SELECT be.BrokerId, b.Name, b.CutOff
          FROM broker_emails be
          JOIN brokers b ON b.id = be.BrokerId
-        WHERE LOWER(be.Email) = LOWER(?)
+        WHERE LOWER(TRIM(be.Email)) = LOWER(?)
         ORDER BY be.id
         LIMIT 1`,
       [address]
     );
     if (!rows.length) return null;
-    return { id: rows[0].BrokerId, name: rows[0].Name };
+    return {
+      id: rows[0].BrokerId,
+      name: rows[0].Name,
+      cutOff: Boolean(rows[0].CutOff),
+    };
   });
 
 /**
@@ -2533,6 +2537,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       }
 
       const broker = await fetchBroker(res, brokerId);
+      if (!broker) return;
+      if (emails !== null && broker.cutOff) {
+        const { evictEmailsForAddresses } = require("../Users/websocket.js");
+        await evictEmailsForAddresses(broker.emails || []);
+      }
       res.json({ message: "Broker updated", broker });
     } catch (err) {
       console.error("Broker update failed:", err);
@@ -2605,6 +2614,15 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         "UPDATE brokers SET CutOff = ? WHERE id = ?",
         [cutOff ? 1 : 0, brokerId]
       );
+
+      if (cutOff) {
+        const [emailRows] = await DBConnection.query(
+          "SELECT Email FROM broker_emails WHERE BrokerId = ?",
+          [brokerId]
+        );
+        const { evictEmailsForAddresses } = require("../Users/websocket.js");
+        await evictEmailsForAddresses(emailRows.map((r) => r.Email));
+      }
 
       const [[broker]] = await DBConnection.query(
         `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,

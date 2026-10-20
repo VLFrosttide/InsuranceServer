@@ -2,8 +2,9 @@
 
 // Decides whether an incoming email may be shown to clients at all: only
 // emails whose sender is one of the broker addresses we know about are kept,
-// and — when the admin has disabled negative-balance broker requests — emails
-// from brokers whose balance is already negative are hidden as well.
+// emails from brokers that an admin has manually cut off are hidden, and —
+// when the admin has disabled negative-balance broker requests — emails from
+// brokers whose balance is already negative are hidden as well.
 //
 // The database (`broker_emails`, seeded from db/BrokerInfo.js and editable
 // through the broker API) is the source of truth. If the database is not
@@ -64,11 +65,42 @@ async function isKnownBrokerSender(from) {
 }
 
 /**
+ * Whether the "From" header value belongs to a broker that has been cut off.
+ *
+ * @param {string} from  Raw "From" header, e.g. `Name <a@b.com>` or `a@b.com`.
+ * @returns {Promise<boolean>}
+ */
+async function isCutOffBrokerSender(from) {
+  const address = extractAddress(from);
+  if (!address || !db) return false;
+
+  try {
+    const broker = await resolveBrokerByEmail(db, address);
+    if (!broker) return false;
+    if (broker.cutOff) return true;
+
+    const [[row]] = await db.query(
+      "SELECT CutOff FROM brokers WHERE id = ?",
+      [broker.id]
+    );
+    return Boolean(row && row.CutOff);
+  } catch (err) {
+    console.error(
+      "Broker cut-off lookup failed:",
+      err && err.message ? err.message : err
+    );
+    return false;
+  }
+}
+
+/**
  * Whether an incoming email should be shown as a card to workers.
  *
- * Extends {@link isKnownBrokerSender}: when the admin has disabled
- * negative-balance broker requests, an email from a broker whose balance is
- * already negative is hidden too (never stored, broadcast or marked read).
+ * Extends {@link isKnownBrokerSender}: emails from a broker that an admin has
+ * manually cut off (`brokers.CutOff = 1`) are never shown to workers, and —
+ * when the admin has disabled negative-balance broker requests — an email from
+ * a broker whose balance is already negative is hidden too (never stored,
+ * broadcast or marked read).
  * Falls back to the static broker list when the database is unavailable.
  *
  * @param {string} from  Raw "From" header, e.g. `Name <a@b.com>` or `a@b.com`.
@@ -82,12 +114,15 @@ async function shouldShowBrokerEmail(from) {
     try {
       const broker = await resolveBrokerByEmail(db, address);
       if (!broker) return false;
+      if (broker.cutOff) return false;
+
+      const [[row]] = await db.query(
+        "SELECT CashBalance, CutOff FROM brokers WHERE id = ?",
+        [broker.id]
+      );
+      if (row && Boolean(row.CutOff)) return false;
 
       if (!(await getBrokerAllowNegativeBalance(db))) {
-        const [[row]] = await db.query(
-          "SELECT CashBalance FROM brokers WHERE id = ?",
-          [broker.id]
-        );
         if (row && Number(row.CashBalance) < 0) return false;
       }
       return true;
@@ -102,4 +137,9 @@ async function shouldShowBrokerEmail(from) {
   return staticSenders.has(address);
 }
 
-module.exports = { setDb, isKnownBrokerSender, shouldShowBrokerEmail };
+module.exports = {
+  setDb,
+  isKnownBrokerSender,
+  isCutOffBrokerSender,
+  shouldShowBrokerEmail,
+};

@@ -120,6 +120,20 @@ module.exports.listAll = function listAll() {
   return out;
 };
 
+// Every stored email across all inboxes (claimed or not), each paired with
+// whether it is currently claimed by a worker.
+module.exports.listAllEntries = function listAllEntries() {
+  const out = [];
+  for (const [k, email] of activeEmails) {
+    out.push({
+      email,
+      claimed: claimedBy.has(k),
+      releasedAt: releasedAt.get(k) || 0,
+    });
+  }
+  return out;
+};
+
 // Every stored email of one inbox (claimed or not), each paired with whether
 // it is currently claimed by a worker. Used by the poller to drop emails that
 // were read in Gmail outside of this app.
@@ -179,6 +193,21 @@ module.exports.remove = function remove(messageId) {
   if (handled.size > HANDLED_LIMIT) {
     handled.delete(handled.values().next().value);
   }
+};
+
+// Drop an email from the in-memory store without recording it as "handled"
+// (completed/dismissed). Used when a broker is cut off so its pending emails
+// disappear from workers immediately, while still allowing them to be picked
+// up again if the broker is later re-enabled.
+module.exports.evict = function evict(messageId) {
+  const email = findByMessageId(messageId);
+  if (!email) return null;
+  const k = key(email.account, email.messageId);
+  const wasClaimed = claimedBy.has(k);
+  activeEmails.delete(k);
+  claimedBy.delete(k);
+  releasedAt.delete(k);
+  return { email, wasClaimed };
 };
 
 // Whether an email with this Gmail message ID was removed from the store
