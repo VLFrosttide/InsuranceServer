@@ -411,10 +411,32 @@ const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
 
     const priceNum = toDecimal(price) || 0;
 
-    await conn.query(
-      "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
-      [priceNum, brokerId]
-    );
+    if (priceNum !== 0) {
+      await conn.query(
+        "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
+        [priceNum, brokerId]
+      );
+    }
+
+    if (meta && meta.updateExisting && meta.blancNumber) {
+      const [existingMovs] = await conn.query(
+        `SELECT id, Amount FROM broker_balance_movements
+          WHERE BrokerId = ? AND BlancNumber = ? AND Type = 'annulment' AND Deleted = 0
+          ORDER BY id DESC LIMIT 1`,
+        [brokerId, meta.blancNumber]
+      );
+      if (Array.isArray(existingMovs) && existingMovs.length > 0) {
+        const nextAmt =
+          meta.totalRefund !== undefined
+            ? Math.round((toDecimal(meta.totalRefund) || 0) * 100) / 100
+            : Math.round(((Number(existingMovs[0].Amount) || 0) + priceNum) * 100) / 100;
+        await conn.query(
+          "UPDATE broker_balance_movements SET Amount = ? WHERE id = ?",
+          [nextAmt, existingMovs[0].id]
+        );
+        return priceNum;
+      }
+    }
 
     await recordBrokerMovement(conn, brokerId, priceNum, "annulment", meta);
 

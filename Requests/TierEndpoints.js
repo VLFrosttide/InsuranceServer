@@ -1504,7 +1504,33 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           }
         }
 
-        if (sets.length === 0) {
+        // Admins (role 1) can change who is at fault for an already-annulled
+        // insurance. Workers cannot change the fault once the policy has been
+        // annulled, and active (non-annulled) policies must be annulled through
+        // POST /insurances/:blancNumber/annul first.
+        const rawAnnulPayer =
+          b.AnnulReason ?? b.annulReason ?? b.payer ?? b.Payer;
+        let nextAnnulPayer = null;
+        if (rawAnnulPayer !== undefined && rawAnnulPayer !== null) {
+          if (!insurance.Annulled) {
+            return res
+              .status(400)
+              .json({ error: "Insurance is not annulled" });
+          }
+          if (Number(req.user && req.user.role) !== 1) {
+            return res.status(403).json({
+              error: "Only admins can change the fault of an annulled insurance",
+            });
+          }
+          nextAnnulPayer = String(rawAnnulPayer).trim().toLowerCase();
+          if (!ANNUL_PAYERS.includes(nextAnnulPayer)) {
+            return res.status(400).json({
+              error: "payer must be one of 'broker', 'worker' or 'none'",
+            });
+          }
+        }
+
+        if (sets.length === 0 && nextAnnulPayer === null) {
           return res.status(400).json({ error: "Nothing to update" });
         }
 
@@ -1577,6 +1603,68 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const moneyChanged =
           branchChanged || priceChanged || paymentChanged || currencyChanged;
 
+        // If an admin is changing the fault of an annulled insurance, compute
+        // the old and new fees/refunds so the payment channel and (for email
+        // policies) the broker's balance are adjusted by the difference.
+        let annulFaultChange = null;
+        if (nextAnnulPayer !== null) {
+          const oldPayerRaw = String(insurance.AnnulReason ?? "")
+            .trim()
+            .toLowerCase();
+          const hasStoredFee =
+            insurance.AnnulFee !== undefined &&
+            insurance.AnnulFee !== null &&
+            insurance.AnnulFee !== "";
+          const oldPayer = ANNUL_PAYERS.includes(oldPayerRaw)
+            ? oldPayerRaw
+            : hasStoredFee && (toDecimal(insurance.AnnulFee) || 0) > 0
+            ? "worker"
+            : "none";
+          const oldFee = hasStoredFee
+            ? toDecimal(insurance.AnnulFee) || 0
+            : computeAnnulFee(insurance, new Date(), oldPayer).fee;
+
+          const editedStartDate =
+            b.StartDate !== undefined || b.startDate !== undefined
+              ? b.StartDate ?? b.startDate
+              : insurance.StartDate;
+          const oldStartParsed = parseStartDate(insurance.StartDate);
+          const newStartParsed = parseStartDate(editedStartDate);
+          const startDateChanged =
+            (oldStartParsed ? oldStartParsed.getTime() : null) !==
+            (newStartParsed ? newStartParsed.getTime() : null);
+
+          const newFee =
+            nextAnnulPayer === "none"
+              ? 0
+              : oldPayer !== "none" && hasStoredFee && oldFee > 0 && !startDateChanged
+              ? oldFee
+              : computeAnnulFee(
+                  { ...insurance, StartDate: editedStartDate },
+                  new Date(),
+                  nextAnnulPayer
+                ).fee;
+
+          const oldRefund = Math.max(0, Math.round((newPrice - oldFee) * 100) / 100);
+          const newRefund = Math.max(0, Math.round((newPrice - newFee) * 100) / 100);
+          const refundDelta = Math.round((newRefund - oldRefund) * 100) / 100;
+          const oldBrokerRefund = oldPayer === "broker" ? oldRefund : newPrice;
+          const newBrokerRefund = nextAnnulPayer === "broker" ? newRefund : newPrice;
+          const brokerRefundDelta =
+            Math.round((newBrokerRefund - oldBrokerRefund) * 100) / 100;
+
+          annulFaultChange = {
+            refundDelta,
+            newBrokerRefund,
+            brokerRefundDelta,
+          };
+
+          sets.push("AnnulReason = ?");
+          params.push(nextAnnulPayer);
+          sets.push("AnnulFee = ?");
+          params.push(newFee);
+        }
+
         params.push(blancNumber);
         const moveTime = resolveMoveCreatedAt(req.body);
         if (moveTime.error) {
@@ -1639,6 +1727,40 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                   author: req.user.username,
                   blancNumber: insurance.BlancNumber,
                   createdAt: moveTime.createdAt,
+                }
+              );
+            }
+          }
+
+          if (annulFaultChange) {
+            if (annulFaultChange.refundDelta !== 0) {
+              await movePolicyMoney(
+                conn,
+                finalPayment,
+                annulFaultChange.refundDelta > 0 ? "reduce" : "increase",
+                {
+                  branch: newBranch,
+                  username: req.user.username,
+                  amount: Math.round(Math.abs(annulFaultChange.refundDelta) * 100) / 100,
+                  reason: `Annul ${newBlancNumber}`,
+                  currency: newCurrency,
+                },
+                moveTime.createdAt
+              );
+            }
+
+            if (isEmailPolicy && annulFaultChange.brokerRefundDelta !== 0) {
+              await restoreBrokerForAnnulment(
+                conn,
+                insurance.BrokerId,
+                annulFaultChange.brokerRefundDelta,
+                {
+                  reason: `Annul ${newBlancNumber}`,
+                  author: req.user.username,
+                  blancNumber: newBlancNumber,
+                  createdAt: moveTime.createdAt,
+                  updateExisting: true,
+                  totalRefund: annulFaultChange.newBrokerRefund,
                 }
               );
             }
@@ -1730,18 +1852,42 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             .json({ error: "Cannot annul a deleted insurance" });
         }
 
-        if (insurance.Annulled) {
+        const alreadyAnnulled = Boolean(Number(insurance.Annulled));
+        if (alreadyAnnulled && Number(req.user && req.user.role) !== 1) {
           return res.status(400).json({ error: "Insurance already annulled" });
         }
 
         const price = toDecimal(insurance.Price) || 0;
+        const oldPayerRaw = String(insurance.AnnulReason ?? "")
+          .trim()
+          .toLowerCase();
+        const hasStoredFee =
+          insurance.AnnulFee !== undefined &&
+          insurance.AnnulFee !== null &&
+          insurance.AnnulFee !== "";
+        const oldPayer = ANNUL_PAYERS.includes(oldPayerRaw)
+          ? oldPayerRaw
+          : hasStoredFee && (toDecimal(insurance.AnnulFee) || 0) > 0
+          ? "worker"
+          : "none";
+        const oldFee = alreadyAnnulled
+          ? hasStoredFee
+            ? toDecimal(insurance.AnnulFee) || 0
+            : computeAnnulFee(insurance, new Date(), oldPayer).fee
+          : 0;
+
         // No fault: 0. Otherwise 9 when the policy is already in effect (its
         // start date has been reached), 1 when it has not started yet.
-        const { fee, inEffect } = computeAnnulFee(
-          insurance,
-          new Date(),
-          payer
-        );
+        const computed = computeAnnulFee(insurance, new Date(), payer);
+        const inEffect = computed.inEffect;
+        const fee =
+          alreadyAnnulled &&
+          payer !== "none" &&
+          oldPayer !== "none" &&
+          hasStoredFee &&
+          oldFee > 0
+            ? oldFee
+            : computed.fee;
         const refund = Math.max(0, Math.round((price - fee) * 100) / 100);
 
         const moveTime = resolveMoveCreatedAt(req.body);
@@ -1750,36 +1896,77 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
 
         await DBConnection.withTransaction(async (conn) => {
-          // The refund leaves through the channel the policy was paid through.
-          // An email policy was paid from the broker's balance, so its refund
-          // comes out of the Broker channel and never reduces current cash -
-          // the drawer never received that money in the first place.
-          if (refund > 0) {
-            await movePolicyMoney(conn, effectivePayment(insurance), "reduce", {
-              branch: insurance.Branch,
-              username: req.user.username,
-              amount: refund,
-              reason: `Annul ${blancNumber}`,
-              currency: insurance.CurrencyType,
-            }, moveTime.createdAt);
-          }
-
-          if (isBrokerLinked(insurance)) {
-            // The broker gets the full price back unless the broker itself is
-            // at fault, in which case the annulment fee is kept back and only
-            // the partial refund (price - fee) returns to the broker's balance.
-            const brokerRefund = payer === "broker" ? refund : price;
-            await restoreBrokerForAnnulment(
-              conn,
-              insurance.BrokerId,
-              brokerRefund,
-              {
-                reason: `Annul ${blancNumber}`,
-                author: req.user.username,
-                blancNumber,
-                createdAt: moveTime.createdAt,
+          if (alreadyAnnulled) {
+            const oldRefund = Math.max(0, Math.round((price - oldFee) * 100) / 100);
+            const refundDelta = Math.round((refund - oldRefund) * 100) / 100;
+            if (refundDelta !== 0) {
+              await movePolicyMoney(
+                conn,
+                effectivePayment(insurance),
+                refundDelta > 0 ? "reduce" : "increase",
+                {
+                  branch: insurance.Branch,
+                  username: req.user.username,
+                  amount: Math.round(Math.abs(refundDelta) * 100) / 100,
+                  reason: `Annul ${blancNumber}`,
+                  currency: insurance.CurrencyType,
+                },
+                moveTime.createdAt
+              );
+            }
+            if (isBrokerLinked(insurance)) {
+              const oldBrokerRefund = oldPayer === "broker" ? oldRefund : price;
+              const newBrokerRefund = payer === "broker" ? refund : price;
+              const brokerRefundDelta =
+                Math.round((newBrokerRefund - oldBrokerRefund) * 100) / 100;
+              if (brokerRefundDelta !== 0) {
+                await restoreBrokerForAnnulment(
+                  conn,
+                  insurance.BrokerId,
+                  brokerRefundDelta,
+                  {
+                    reason: `Annul ${blancNumber}`,
+                    author: req.user.username,
+                    blancNumber,
+                    createdAt: moveTime.createdAt,
+                    updateExisting: true,
+                    totalRefund: newBrokerRefund,
+                  }
+                );
               }
-            );
+            }
+          } else {
+            // The refund leaves through the channel the policy was paid through.
+            // An email policy was paid from the broker's balance, so its refund
+            // comes out of the Broker channel and never reduces current cash -
+            // the drawer never received that money in the first place.
+            if (refund > 0) {
+              await movePolicyMoney(conn, effectivePayment(insurance), "reduce", {
+                branch: insurance.Branch,
+                username: req.user.username,
+                amount: refund,
+                reason: `Annul ${blancNumber}`,
+                currency: insurance.CurrencyType,
+              }, moveTime.createdAt);
+            }
+
+            if (isBrokerLinked(insurance)) {
+              // The broker gets the full price back unless the broker itself is
+              // at fault, in which case the annulment fee is kept back and only
+              // the partial refund (price - fee) returns to the broker's balance.
+              const brokerRefund = payer === "broker" ? refund : price;
+              await restoreBrokerForAnnulment(
+                conn,
+                insurance.BrokerId,
+                brokerRefund,
+                {
+                  reason: `Annul ${blancNumber}`,
+                  author: req.user.username,
+                  blancNumber,
+                  createdAt: moveTime.createdAt,
+                }
+              );
+            }
           }
 
           await conn.query(
@@ -1795,7 +1982,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           [blancNumber]
         );
         res.json({
-          message: "Insurance annulled",
+          message: alreadyAnnulled
+            ? "Insurance annulment updated"
+            : "Insurance annulled",
           refund,
           fee,
           payer,

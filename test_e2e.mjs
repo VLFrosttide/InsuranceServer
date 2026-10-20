@@ -516,14 +516,41 @@ async function main() {
     r = await createBrokerPolicy(annulBlanc, 200);
     check("POST broker insurance for annul -> 201", r.status === 201, JSON.stringify(r.data));
     bBefore = await getDelBroker();
-    r = await req("POST", `/insurances/${annulBlanc}/annul`, { reason: "none" }, adminToken);
+    r = await req("POST", `/insurances/${annulBlanc}/annul`, { reason: "broker" }, workerToken);
     bAfter = await getDelBroker();
     check(
-      "Annul refunds broker but keeps blanc used",
+      "Annul with broker fault refunds price - fee to broker",
       r.status === 200 &&
-        Math.abs(Number(bAfter.CashBalance) - Number(bBefore.CashBalance) - 200) < 0.01 &&
+        Math.abs(
+          Number(bAfter.CashBalance) -
+            Number(bBefore.CashBalance) -
+            (200 - Number(r.data.fee || 0))
+        ) < 0.01 &&
         Number(bAfter.InactivePolicies) === Number(bBefore.InactivePolicies),
       `${JSON.stringify(r.data)} inactive ${bBefore.InactivePolicies} -> ${bAfter.InactivePolicies}`
+    );
+
+    // Worker cannot change fault of an already-annulled insurance.
+    r = await req("PATCH", `/insurances/${annulBlanc}`, { AnnulReason: "none" }, workerToken);
+    check(
+      "Worker blocked from changing annulled insurance fault -> 403",
+      r.status === 403,
+      JSON.stringify(r.data)
+    );
+
+    // Admin can change fault of an already-annulled insurance to "none",
+    // refunding the kept fee to the broker.
+    const keptFee = Number((await req("GET", `/insurances?blancNumber=${annulBlanc}`, null, adminToken)).data.insurances[0].AnnulFee || 0);
+    bBefore = await getDelBroker();
+    r = await req("PATCH", `/insurances/${annulBlanc}`, { AnnulReason: "none" }, adminToken);
+    bAfter = await getDelBroker();
+    check(
+      "Admin changing annulled insurance fault to none refunds kept fee to broker",
+      r.status === 200 &&
+        r.data.insurance.AnnulReason === "none" &&
+        Number(r.data.insurance.AnnulFee) === 0 &&
+        Math.abs(Number(bAfter.CashBalance) - Number(bBefore.CashBalance) - keptFee) < 0.01,
+      `${JSON.stringify(r.data)} balance ${bBefore.CashBalance} -> ${bAfter.CashBalance}`
     );
     bBefore = bAfter;
     r = await req("DELETE", `/insurances/${annulBlanc}`, null, adminToken);
