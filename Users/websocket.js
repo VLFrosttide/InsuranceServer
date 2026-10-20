@@ -9,9 +9,22 @@ let db = null;
 const EMAIL_UPDATE_ROLE = "2";
 
 // How long a dropped connection's claimed emails stay reserved before they are
-// returned to the pool (and marked unread), giving the worker a moment to
-// reconnect or the next page time to claim the email itself.
-const RELEASE_GRACE_MS = Number(process.env.EMAIL_RELEASE_GRACE_MS) || 3000;
+// returned to the pool (and marked unread), giving the worker time to
+// reconnect or the next page time to claim the email on a slow/unstable link.
+const RELEASE_GRACE_MS = Number(process.env.EMAIL_RELEASE_GRACE_MS) || 15000;
+
+// Pending release timers keyed by messageId so re-claiming (or a second drop)
+// cancels/resets any earlier timer instead of releasing prematurely.
+const pendingReleaseTimers = new Map();
+
+function clearPendingRelease(messageId) {
+  if (!messageId) return;
+  const timer = pendingReleaseTimers.get(messageId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingReleaseTimers.delete(messageId);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Worker presence board.
@@ -32,10 +45,23 @@ const PRESENCE_ROLE = "2";
 const PRESENCE_VIEWER_ROLES = new Set(["1", "2"]);
 
 // After the last connection of a worker closes, wait this long before declaring
-// them offline. This absorbs the quick socket swap when the client navigates
-// dashboard -> form -> dashboard, so the board does not flicker.
+// them offline. This absorbs the socket swap when the client navigates
+// dashboard -> form -> dashboard or reconnects over a slow link, so the board
+// does not flicker.
 const PRESENCE_OFFLINE_GRACE_MS =
-  Number(process.env.PRESENCE_OFFLINE_GRACE_MS) || 1500;
+  Number(process.env.PRESENCE_OFFLINE_GRACE_MS) || 8000;
+
+// Pending offline timers keyed by username.
+const pendingPresenceTimers = new Map();
+
+function clearPendingPresenceOffline(username) {
+  if (!username) return;
+  const timer = pendingPresenceTimers.get(username);
+  if (timer) {
+    clearTimeout(timer);
+    pendingPresenceTimers.delete(username);
+  }
+}
 
 // Valid statuses a worker may report.
 const PRESENCE_STATUSES = new Set(["online", "working", "afk"]);
@@ -85,6 +111,7 @@ function broadcastPresence() {
 }
 
 function ensureWorkerOnline(username) {
+  clearPendingPresenceOffline(username);
   if (presence.has(username)) return;
   presence.set(username, { username, status: "online", updatedAt: Date.now() });
   broadcastPresence();
@@ -92,6 +119,7 @@ function ensureWorkerOnline(username) {
 
 function setWorkerPresence(ws, status) {
   if (!ws.username || String(ws.role) !== PRESENCE_ROLE) return;
+  clearPendingPresenceOffline(ws.username);
   const normalized = PRESENCE_STATUSES.has(status) ? status : "online";
   const existing = presence.get(ws.username);
   if (existing && existing.status === normalized) {
@@ -108,8 +136,22 @@ function setWorkerPresence(ws, status) {
 }
 
 function removeWorkerPresence(username) {
+  clearPendingPresenceOffline(username);
   if (!username || isWorkerConnected(username)) return;
   if (presence.delete(username)) broadcastPresence();
+}
+
+function safeSend(ws, payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try {
+    const message =
+      typeof payload === "string" ? payload : JSON.stringify(payload);
+    ws.send(message);
+    return true;
+  } catch (err) {
+    console.error("Failed to send WebSocket message:", err);
+    return false;
+  }
 }
 
 // Whether any currently open connection holds the claim on this email.
@@ -178,9 +220,21 @@ async function restoreEmail(messageId) {
  */
 module.exports.initWsServer = function initWsServer(server, DBConnection) {
   db = DBConnection;
-  wss = new WebSocketServer({ noServer: true });
+  wss = new WebSocketServer({
+    noServer: true,
+    perMessageDeflate: {
+      threshold: 1024,
+    },
+  });
 
   server.on("upgrade", (req, socket, head) => {
+    socket.on("error", (err) => {
+      console.warn(
+        "WebSocket upgrade socket error:",
+        err && err.message ? err.message : err
+      );
+    });
+
     let pathname = "/";
     try {
       pathname = new URL(req.url, "ws://localhost").pathname;
@@ -219,16 +273,29 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
     ws.role = null;
     ws.branch = "";
     ws.isAlive = true;
+    ws.lastBufferedAmount = 0;
+    ws.stalledTicks = 0;
     // Email cards claimed through this specific connection. Used to release
     // them if the worker client drops (power loss / network failure) so other
     // workers can pick them up again.
     ws.claimedEmails = new Set();
 
+    ws.on("error", (err) => {
+      console.warn(
+        "WebSocket client error:",
+        err && err.message ? err.message : err
+      );
+    });
+
     ws.on("pong", () => {
       ws.isAlive = true;
+      ws.stalledTicks = 0;
     });
 
     ws.on("message", (data) => {
+      // Any incoming frame proves the client connection is alive.
+      ws.isAlive = true;
+      ws.stalledTicks = 0;
       handleMessage(ws, data).catch((err) => {
         console.error("WebSocket message handling failed:", err);
       });
@@ -250,40 +317,70 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
       const claimed = Array.from(ws.claimedEmails);
       ws.claimedEmails.clear();
       if (claimed.length > 0) {
-        setTimeout(() => {
-          for (const messageId of claimed) {
+        for (const messageId of claimed) {
+          clearPendingRelease(messageId);
+          const timer = setTimeout(() => {
+            pendingReleaseTimers.delete(messageId);
             const email = mailStore.get(messageId);
-            if (!email) continue;
+            if (!email) return;
             // Only release if this user still holds the claim and has not
             // re-claimed it on a newer connection in the meantime. The card may
             // also have been released/completed and claimed by someone else.
-            if (mailStore.getClaimer(messageId) !== username) continue;
-            if (isHeldByOpenConnection(messageId)) continue;
+            if (mailStore.getClaimer(messageId) !== username) return;
+            if (isHeldByOpenConnection(messageId)) return;
             releaseEmail(email, messageId).catch((err) => {
               console.error("Failed to release email of closed connection:", err);
             });
-          }
-        }, RELEASE_GRACE_MS);
+          }, RELEASE_GRACE_MS);
+          if (typeof timer.unref === "function") timer.unref();
+          pendingReleaseTimers.set(messageId, timer);
+        }
       }
 
       // Remove the worker from the presence board once no other authenticated
       // connection remains (see PRESENCE_OFFLINE_GRACE_MS).
       if (username && String(ws.role) === PRESENCE_ROLE) {
-        setTimeout(() => removeWorkerPresence(username), PRESENCE_OFFLINE_GRACE_MS);
+        clearPendingPresenceOffline(username);
+        const timer = setTimeout(
+          () => removeWorkerPresence(username),
+          PRESENCE_OFFLINE_GRACE_MS
+        );
+        if (typeof timer.unref === "function") timer.unref();
+        pendingPresenceTimers.set(username, timer);
       }
     });
   });
 
   // Heartbeat to drop dead connections from Electron clients.
-  setInterval(() => {
+  const heartbeatTimer = setInterval(() => {
     for (const client of wss.clients) {
       try {
         if (client.isAlive === false) {
+          // When a large payload (e.g. a multi-MB attachment) is still queued
+          // in the outgoing socket buffer over a slow link, the server's ping
+          // frame sits behind it and cannot reach the client yet. As long as
+          // the buffer is draining (or has only been full for a few ticks),
+          // keep the connection alive instead of killing the transfer.
+          const buffered = client.bufferedAmount || 0;
+          if (buffered > 0) {
+            const draining =
+              client.lastBufferedAmount === 0 ||
+              buffered < client.lastBufferedAmount;
+            client.lastBufferedAmount = buffered;
+            client.stalledTicks = draining ? 0 : (client.stalledTicks || 0) + 1;
+            if (client.stalledTicks <= 3) {
+              continue;
+            }
+          }
           client.terminate();
           continue;
         }
+        client.lastBufferedAmount = client.bufferedAmount || 0;
+        client.stalledTicks = 0;
         client.isAlive = false;
-        client.ping();
+        if (client.readyState === WebSocket.OPEN) {
+          client.ping();
+        }
       } catch (err) {
         console.error("WebSocket heartbeat failed:", err);
         try {
@@ -294,6 +391,7 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
       }
     }
   }, 30000);
+  if (typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
 
   return wss;
 };
@@ -351,35 +449,39 @@ async function handleMessage(ws, data) {
         if (String(ws.role) === PRESENCE_ROLE) {
           ensureWorkerOnline(username);
         }
-        ws.send(JSON.stringify({ type: "auth_ok", username }));
+        safeSend(ws, { type: "auth_ok", username });
       } else {
-        ws.send(
-          JSON.stringify({
-            type: "auth_error",
-            error: "Invalid or expired token",
-          })
-        );
+        safeSend(ws, {
+          type: "auth_error",
+          error: "Invalid or expired token",
+        });
       }
     } catch (err) {
       console.error("WebSocket auth error:", err);
-      ws.send(JSON.stringify({ type: "auth_error", error: "Auth failed" }));
+      // Database/transient error: close the socket so the client reconnects
+      // with backoff instead of treating its token as invalid and logging out.
+      try {
+        ws.close(1013, "Try again later");
+      } catch {
+        // ignore
+      }
     }
   } else if (msg.type === "ping") {
-    ws.send(JSON.stringify({ type: "pong" }));
+    safeSend(ws, { type: "pong", ts: msg.ts });
   } else if (msg.type === "presence") {
     setWorkerPresence(ws, msg.status);
   } else if (msg.type === "list_presence") {
     if (!ws.username) return;
-    ws.send(JSON.stringify({ type: "presence_update", data: onlineWorkers() }));
+    safeSend(ws, { type: "presence_update", data: onlineWorkers() });
   } else if (msg.type === "list_emails") {
     if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
-      ws.send(JSON.stringify({ type: "list_emails", data: [] }));
+      safeSend(ws, { type: "list_emails", data: [] });
       return;
     }
     const data = mailStore
       .listAll()
       .filter((email) => canSeeEmail(ws.branch, email));
-    ws.send(JSON.stringify({ type: "list_emails", data }));
+    safeSend(ws, { type: "list_emails", data });
   } else if (msg.type === "get_attachment") {
     if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
       return;
@@ -388,9 +490,12 @@ async function handleMessage(ws, data) {
     const id = msg.id || null;
     const email = messageId ? mailStore.get(messageId) : null;
     if (!email || !id || !canSeeEmail(ws.branch, email)) {
-      ws.send(
-        JSON.stringify({ type: "get_attachment", ok: false, id, error: "Not found" })
-      );
+      safeSend(ws, {
+        type: "get_attachment",
+        ok: false,
+        id,
+        error: "Not found",
+      });
       return;
     }
     try {
@@ -400,17 +505,23 @@ async function handleMessage(ws, data) {
       const { getAttachment } = require("../Mail/ProcessEmail.js");
       const result = await getAttachment(email, id);
       if (!result) {
-        ws.send(
-          JSON.stringify({ type: "get_attachment", ok: false, id, error: "Not found" })
-        );
+        safeSend(ws, {
+          type: "get_attachment",
+          ok: false,
+          id,
+          error: "Not found",
+        });
         return;
       }
-      ws.send(JSON.stringify({ type: "get_attachment", ok: true, ...result }));
+      safeSend(ws, { type: "get_attachment", ok: true, ...result });
     } catch (err) {
       console.error("Failed to fetch attachment:", err);
-      ws.send(
-        JSON.stringify({ type: "get_attachment", ok: false, id, error: "Fetch failed" })
-      );
+      safeSend(ws, {
+        type: "get_attachment",
+        ok: false,
+        id,
+        error: "Fetch failed",
+      });
     }
   } else if (msg.type === "claim_email") {
     if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
@@ -430,29 +541,26 @@ async function handleMessage(ws, data) {
       }
     }
     if (!email) {
-      ws.send(
-        JSON.stringify({
-          type: "claim_email",
-          ok: false,
-          messageId,
-          error: "Not found",
-        })
-      );
+      safeSend(ws, {
+        type: "claim_email",
+        ok: false,
+        messageId,
+        error: "Not found",
+      });
       return;
     }
     if (!canSeeEmail(ws.branch, email)) {
-      ws.send(
-        JSON.stringify({
-          type: "claim_email",
-          ok: false,
-          messageId,
-          error: "Not found",
-        })
-      );
+      safeSend(ws, {
+        type: "claim_email",
+        ok: false,
+        messageId,
+        error: "Not found",
+      });
       return;
     }
     const ok = mailStore.claim(messageId, ws.username);
     if (ok) {
+      clearPendingRelease(messageId);
       // The claim now belongs to this connection only. This matters after a
       // reconnect: the server may notice the old, dead connection only later
       // (heartbeat), and its close handler must not release the email the
@@ -465,7 +573,7 @@ async function handleMessage(ws, data) {
       ws.claimedEmails.add(messageId);
       broadcast({ type: "email_claimed", messageId }, email);
     }
-    ws.send(JSON.stringify({ type: "claim_email", ok, messageId }));
+    safeSend(ws, { type: "claim_email", ok, messageId });
     if (ok) {
       // Opened (or re-opened after a reconnect) by a worker: mark it read.
       try {
@@ -479,6 +587,7 @@ async function handleMessage(ws, data) {
       return;
     }
     const messageId = msg.messageId || null;
+    clearPendingRelease(messageId);
     const releasable = messageId ? mailStore.get(messageId) : null;
     if (releasable && !canSeeEmail(ws.branch, releasable)) return;
     const claimer = mailStore.getClaimer(messageId);
@@ -498,6 +607,7 @@ async function handleMessage(ws, data) {
       return;
     }
     const messageId = msg.messageId || null;
+    clearPendingRelease(messageId);
     const email = messageId ? mailStore.get(messageId) : null;
     if (!email) return;
     if (!canSeeEmail(ws.branch, email)) return;
@@ -519,6 +629,7 @@ async function handleMessage(ws, data) {
       return;
     }
     const messageId = msg.messageId || null;
+    clearPendingRelease(messageId);
     const email = messageId ? mailStore.get(messageId) : null;
     if (!email) return;
     if (!canSeeEmail(ws.branch, email)) return;

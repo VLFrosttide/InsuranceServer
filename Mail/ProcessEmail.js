@@ -116,28 +116,41 @@ module.exports.getAttachment = async function getAttachment(email, id) {
 
   let data = src.data || null;
   if (!data) {
-    const gmail = mailStore.getGmail(email.account);
-    if (!gmail) {
-      throw new Error(`No Gmail client for account "${email.account}"`);
+    if (!src.inflight) {
+      src.inflight = (async () => {
+        const gmail = mailStore.getGmail(email.account);
+        if (!gmail) {
+          throw new Error(`No Gmail client for account "${email.account}"`);
+        }
+        if (src.inlineData) {
+          return decodeBase64Url(src.inlineData);
+        }
+        if (src.attachmentId) {
+          const res = await gmail.users.messages.attachments.get({
+            userId: "me",
+            messageId: email.messageId,
+            id: src.attachmentId,
+          });
+          return decodeBase64Url(res.data.data);
+        }
+        return null;
+      })();
     }
-    if (src.inlineData) {
-      data = decodeBase64Url(src.inlineData);
-    } else if (src.attachmentId) {
-      const res = await gmail.users.messages.attachments.get({
-        userId: "me",
-        messageId: email.messageId,
-        id: src.attachmentId,
-      });
-      data = decodeBase64Url(res.data.data);
-    } else {
-      return null;
+    try {
+      data = await src.inflight;
+      if (data) src.data = data; // cache so each attachment is downloaded at most once
+    } finally {
+      src.inflight = null;
     }
-    src.data = data; // cache so each attachment is downloaded at most once
+    if (!data) return null;
   }
 
   let base64 = null;
   if (data.length <= INLINE_ATTACHMENT_LIMIT) {
-    base64 = data.toString("base64");
+    if (!src.base64) {
+      src.base64 = data.toString("base64");
+    }
+    base64 = src.base64;
   }
 
   return {
