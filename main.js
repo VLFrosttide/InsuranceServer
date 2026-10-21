@@ -98,6 +98,20 @@ function pushRing(items, item, limit) {
   if (items.length > limit) items.shift();
 }
 
+// Resolve the client's real IP address. The API sits behind a CDN/reverse
+// proxy (Hostinger), so the originating address arrives in `X-Forwarded-For`
+// (left-most value = client). Fall back to the raw socket address for direct
+// connections (e.g. local development on 127.0.0.1).
+function clientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  const first = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  if (first) {
+    const ip = String(first).split(",")[0].trim();
+    if (ip) return ip;
+  }
+  return (req.socket && req.socket.remoteAddress) || null;
+}
+
 // Never let a transient error (a rejected promise or an uncaught exception)
 // take the whole process down during a network/DB blip. Log and keep serving.
 process.on("unhandledRejection", (reason) => {
@@ -197,19 +211,26 @@ async function start() {
       const durationMs = Math.round(
         Number(process.hrtime.bigint() - started) / 1e6
       );
+      // `req.user` is attached by the auth middleware before the response
+      // finishes, so it is populated here for authenticated routes.
+      const user = req.user && req.user.username ? req.user.username : null;
       const entry = {
         at: new Date().toISOString(),
         method: req.method,
         path: req.originalUrl || req.url,
         status: res.statusCode,
         durationMs,
+        ip: clientIp(req),
+        user,
       };
       pushRing(recentRequests, entry, RECENT_REQUESTS_LIMIT);
       if (res.statusCode >= 400) {
         pushRing(recentFailures, entry, RECENT_FAILURES_LIMIT);
       }
       console.log(
-        `[request] ${entry.method} ${entry.path} -> ${entry.status} (${entry.durationMs}ms)`
+        `[request] ${entry.method} ${entry.path} -> ${entry.status} ` +
+          `(${entry.durationMs}ms) ip=${entry.ip}` +
+          (entry.user ? ` user=${entry.user}` : "")
       );
     });
     next();
