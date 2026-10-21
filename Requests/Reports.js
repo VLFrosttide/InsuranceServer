@@ -1,7 +1,8 @@
 "use strict";
-// Payment report for the InsuranceWebsite dashboard.
+// Payment and cash-inflow reports for the InsuranceWebsite dashboard.
 //
 //   GET /reports/payments?from=YYYY-MM-DD&to=YYYY-MM-DD
+//   GET /reports/cash-inflow?from=YYYY-MM-DD&to=YYYY-MM-DD
 //
 // Returns the walk-in payments collected at the two border crossings
 // (Kapitan Andreevo and Lesovo), split by cash vs. card, plus the total
@@ -139,6 +140,68 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
     } catch (err) {
       console.error("Reports payments lookup failed:", err);
       res.status(500).json({ error: "Failed to fetch payment report" });
+    }
+  });
+
+  // GET /reports/cash-inflow — per-broker cash inflow (positive, ≥ €200).
+  //
+  // "Cash inflow" is money actually received from a broker: a positive
+  // "increase" movement on that broker's balance ledger (recorded when an admin
+  // books a payment from the broker). Refunds ("annulment"/"deletion") and
+  // balance corrections ("adjust"/"price_change") are not cash inflow, so they
+  // are excluded. Only brokers whose total inflow in the period is at least
+  // €200 are returned, ordered highest first.
+  router.get("/reports/cash-inflow", auth, requireReportRole, async (req, res) => {
+    try {
+      const fromRaw = req.query.from ? String(req.query.from).trim() : "";
+      const toRaw = req.query.to ? String(req.query.to).trim() : "";
+
+      if (!fromRaw || !toRaw) {
+        return res
+          .status(400)
+          .json({ error: "from and to are required (YYYY-MM-DD)" });
+      }
+      if (!DATE_RE.test(fromRaw) || !DATE_RE.test(toRaw)) {
+        return res
+          .status(400)
+          .json({ error: "from/to must be in YYYY-MM-DD format" });
+      }
+      if (fromRaw > toRaw) {
+        return res.status(400).json({ error: "from must be on or before to" });
+      }
+
+      // Inclusive [from, to] range on the client's local day. Broker balance
+      // movements are stored with the client's local wall-clock time, so this
+      // matches the balance-history endpoint's day boundaries.
+      const fromParam = fromRaw + " 00:00:00";
+      const toParam = addOneDay(toRaw) + " 00:00:00";
+
+      const [rows] = await DBConnection.query(
+        `SELECT m.BrokerId AS brokerId,
+                b.Name AS brokerName,
+                ROUND(SUM(m.Amount), 2) AS amount
+           FROM broker_balance_movements m
+           JOIN brokers b ON b.id = m.BrokerId
+          WHERE m.Type = 'increase'
+            AND m.Amount > 0
+            AND m.Deleted = 0
+            AND m.CreatedAt >= ? AND m.CreatedAt < ?
+          GROUP BY m.BrokerId, b.Name
+         HAVING amount >= 200
+          ORDER BY amount DESC`,
+        [fromParam, toParam]
+      );
+
+      res.json({
+        brokers: (rows || []).map((r) => ({
+          brokerId: r.brokerId,
+          brokerName: r.brokerName,
+          amount: round2(Number(r.amount) || 0),
+        })),
+      });
+    } catch (err) {
+      console.error("Reports cash inflow lookup failed:", err);
+      res.status(500).json({ error: "Failed to fetch cash inflow report" });
     }
   });
 

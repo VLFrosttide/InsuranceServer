@@ -453,9 +453,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     }
   });
 
-  // PATCH /admin/users/:username — link/unlink a login account to a broker
-  // (BrokerId) and/or change its Status. Used so a client (role 3) account can
-  // be turned into a broker login that only sees its own broker data.
+  // PATCH /admin/users/:username — update an account's broker link (BrokerId),
+  // status, role and/or balance. Admins use this from the Users panel's edit
+  // dialog. Role changes follow the same rules as /promote: an admin's role
+  // cannot be changed and no account can be set to admin.
   router.patch("/admin/users/:username", auth, requireRole(1), async (req, res) => {
     try {
       const username = String(req.params.username || "").trim();
@@ -464,12 +465,13 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       }
 
       const [rows] = await DBConnection.query(
-        "SELECT Username FROM users WHERE Username = ?",
+        "SELECT Username, Role FROM users WHERE Username = ?",
         [username]
       );
       if (rows.length === 0) {
         return res.status(404).json({ error: "User not found" });
       }
+      const existingRole = String(rows[0].Role);
 
       const b = req.body || {};
       const sets = [];
@@ -506,6 +508,33 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
         sets.push("Status = ?");
         params.push(status);
+      }
+
+      if (b.role !== undefined || b.Role !== undefined) {
+        const rawRole = b.role !== undefined ? b.role : b.Role;
+        const role = Number(rawRole);
+        if (!Number.isInteger(role) || ![1, 2, 3].includes(role)) {
+          return res.status(400).json({ error: "role must be 1, 2 or 3" });
+        }
+        if (existingRole === "1" || role === 1) {
+          return res.status(403).json({
+            error: "Forbidden: cannot change the role of an admin",
+          });
+        }
+        sets.push("Role = ?");
+        params.push(role);
+      }
+
+      if (b.balance !== undefined || b.Balance !== undefined) {
+        const rawBalance = b.balance !== undefined ? b.balance : b.Balance;
+        const balance = Number(rawBalance);
+        if (!Number.isFinite(balance) || balance < 0) {
+          return res
+            .status(400)
+            .json({ error: "balance must be a non-negative number" });
+        }
+        sets.push("Balance = ?");
+        params.push(balance);
       }
 
       if (sets.length === 0) {
@@ -616,65 +645,6 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       res.status(500).json({ error: "Failed to fetch insurances" });
     }
   });
-
-  router.patch(
-    "/admin/users/:username",
-    auth,
-    requireRole(1),
-    async (req, res) => {
-      try {
-        const { username } = req.params;
-        const { role, balance } = req.body;
-
-        const [existing] = await DBConnection.query(
-          "SELECT Username FROM users WHERE Username = ?",
-          [username]
-        );
-        if (existing.length === 0) {
-          return res.status(404).json({ error: "User not found" });
-        }
-
-        const sets = [];
-        const params = [];
-        if (role !== undefined) {
-          const r = Number(role);
-          if (![1, 2, 3].includes(r)) {
-            return res.status(400).json({ error: "role must be 1, 2 or 3" });
-          }
-          sets.push("Role = ?");
-          params.push(r);
-        }
-        if (balance !== undefined) {
-          const b = Number(balance);
-          if (!Number.isFinite(b) || b < 0) {
-            return res
-              .status(400)
-              .json({ error: "balance must be a non-negative number" });
-          }
-          sets.push("Balance = ?");
-          params.push(b);
-        }
-        if (sets.length === 0) {
-          return res.status(400).json({ error: "Nothing to update" });
-        }
-
-        params.push(username);
-        await DBConnection.query(
-          `UPDATE users SET ${sets.join(", ")} WHERE Username = ?`,
-          params
-        );
-
-        const [rows] = await DBConnection.query(
-          "SELECT Username, Role, Balance FROM users WHERE Username = ?",
-          [username]
-        );
-        res.json({ message: "User updated", user: rows[0] });
-      } catch (err) {
-        console.error("Admin user update failed:", err);
-        res.status(500).json({ error: "Failed to update user" });
-      }
-    }
-  );
 
   // Admin worker account management: suspend, delete, and promote.
   //
