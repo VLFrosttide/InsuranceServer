@@ -916,17 +916,18 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       }
       const paymentType = isEmailPolicy ? "Broker" : requestedPayment;
 
-      // Optional surcharges (already included in Price). The card fee is only
-      // valid for card payments. The non-Turk tax only applies to walk-ins:
-      // an email policy carrying it is rejected (its price would include a +5
-      // the broker must not be charged for).
+      // Optional surcharges. The non-Turk tax (+5, already included in Price)
+      // only applies to walk-ins: an email policy carrying it is rejected (its
+      // price would include a +5 the broker must not be charged for). The +2
+      // card tax goes to the bank and is visual-only during creation, so it is
+      // never stored on the policy or in any balance.
       const nonTurk = toFlag(b.NonTurk ?? b.nonTurk);
       if (isEmailPolicy && nonTurk) {
         return res.status(400).json({
           error: "The non-Turk tax only applies to walk-in policies",
         });
       }
-      const cardFee = paymentType === "Card" && toFlag(b.CardFee ?? b.cardFee);
+      const cardFee = false;
 
       // Optional return-email handling. When the form was opened from an
       // unread email, the client sends the original Gmail message ID plus any
@@ -1506,7 +1507,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             else if (column === "NonTurk") v = toFlag(value) ? 1 : 0;
             else if (column === "CurrencyType") v = normalizePolicyCurrency(value);
             else if (column === "CardFee") {
-              v = finalPayment === "Card" && toFlag(value) ? 1 : 0;
+              // The +2 card tax goes to the bank and is visual-only during
+              // creation; it is never stored on the policy.
+              v = 0;
               cardFeeHandled = true;
             } else v = value;
             sets.push(`${column} = ?`);
@@ -1514,8 +1517,8 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           }
         }
 
-        // Any payment other than Card clears a previously stored card fee flag.
-        if (!cardFeeHandled && finalPayment !== "Card" && insurance.CardFee) {
+        // Clear any legacy stored card fee flag.
+        if (!cardFeeHandled && insurance.CardFee) {
           sets.push("CardFee = ?");
           params.push(0);
         }

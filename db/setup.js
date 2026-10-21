@@ -727,6 +727,37 @@ async function runSetup(config = {}) {
   // Split the old global card balance into per-branch balances (one-time).
   await seedBranchCardBalances(db);
 
+  // One-time cleanup: the +2 card tax goes to the bank and is visual-only
+  // during policy creation. Strip any previously stored +2 card fee from
+  // existing policies' prices and card balances, and clear their CardFee flag
+  // so this runs at most once per row.
+  const [legacyCardFees] = await db.query(
+    `SELECT Branch, COALESCE(CurrencyType, 'EUR') AS Currency,
+            COUNT(*) AS ActiveCardCount
+       FROM insurance
+      WHERE CardFee = 1 AND PaymentType = 'Card' AND Deleted = 0 AND Annulled = 0
+      GROUP BY Branch, COALESCE(CurrencyType, 'EUR')`
+  );
+  for (const row of legacyCardFees || []) {
+    const deduction = Number(row.ActiveCardCount) * 2;
+    if (deduction > 0) {
+      await db.query(
+        "UPDATE branch_card_balance SET CardBalance = CardBalance - ? WHERE Branch = ?",
+        [deduction, row.Branch || ""]
+      );
+      await db.query(
+        "UPDATE total_cash SET CardPart = CardPart - ? WHERE id = 1 AND Branch = ? AND Currency = ?",
+        [deduction, row.Branch || "", row.Currency || "EUR"]
+      );
+    }
+  }
+  await db.query(
+    `UPDATE insurance
+        SET Price = CAST(GREATEST(0, ROUND(CAST(Price AS DECIMAL(15,2)) - 2, 2)) AS CHAR),
+            CardFee = 0
+      WHERE CardFee = 1`
+  );
+
   // 4b) Create brokers + broker_emails tables.
   await db.query(`
      CREATE TABLE IF NOT EXISTS brokers (

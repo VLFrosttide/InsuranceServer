@@ -255,10 +255,11 @@ const mapPolicyDurationDays = (module.exports.mapPolicyDurationDays =
   });
 
 /**
- * Compute a policy's price strictly from a tariff `pricing` map (plus stored
- * NonTurk / CardFee flags). Returns `null` when the vehicle type or duration is
- * missing from `pricing` — never falls back to `row.Price` so a sub-broker can
- * never see the stored sale price.
+ * Compute a policy's price strictly from a tariff `pricing` map (plus the
+ * stored NonTurk flag). The +2 card tax goes to the bank and is visual-only
+ * during creation, so it is never included here. Returns `null` when the
+ * vehicle type or duration is missing from `pricing` — never falls back to
+ * `row.Price` so a sub-broker can never see the stored sale price.
  *
  * @param {object} row
  * @param {object} pricing
@@ -282,12 +283,6 @@ const computePolicyTariffPrice = (module.exports.computePolicyTariffPrice =
 
     let price = basePrice;
     if (Number(row.NonTurk) === 1) price += 5;
-    if (
-      Number(row.CardFee) === 1 &&
-      String(row.PaymentType || "").toLowerCase() === "card"
-    ) {
-      price += 2;
-    }
     return Math.round(price * 100) / 100;
   });
 
@@ -1420,12 +1415,6 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
         let newPrice = basePrice;
         if (Number(row.NonTurk) === 1) newPrice += 5;
-        if (
-          Number(row.CardFee) === 1 &&
-          String(row.PaymentType || "").toLowerCase() === "card"
-        ) {
-          newPrice += 2;
-        }
         newPrice = Math.round(newPrice * 100) / 100;
         const oldPrice = Math.round((Number(row.Price) || 0) * 100) / 100;
         if (newPrice === oldPrice) continue;
