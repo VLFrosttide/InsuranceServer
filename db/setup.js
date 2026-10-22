@@ -448,6 +448,29 @@ async function runSetup(config = {}) {
   `);
   await db.query("INSERT IGNORE INTO gmail_token_reminder (id) VALUES (1)");
 
+  // Durable retry queue for reply emails that fail to send through the Gmail
+  // API. Failed replies are stored here and retried in the background with
+  // exponential backoff (see Mail/emailOutbox.js), surviving server restarts.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS email_outbox (
+      id INT NOT NULL AUTO_INCREMENT,
+      MessageId VARCHAR(255) NOT NULL,
+      Account VARCHAR(45) NOT NULL DEFAULT '',
+      Recipient VARCHAR(255) NOT NULL DEFAULT '',
+      Subject VARCHAR(500) NOT NULL DEFAULT '',
+      Attachments LONGTEXT NULL,
+      BodyText MEDIUMTEXT NULL,
+      Status ENUM('pending','failed','sent') NOT NULL DEFAULT 'pending',
+      Attempts INT NOT NULL DEFAULT 0,
+      NextAttemptAt DATETIME NOT NULL,
+      LastError VARCHAR(500) NULL,
+      CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UpdatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_email_outbox_due (Status, NextAttemptAt)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  `);
+
   // The legacy `tasks` table was only a demo work-item store; it is no longer
   // required by the server, so drop it on existing databases.
   await db.query("DROP TABLE IF EXISTS tasks");

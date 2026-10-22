@@ -480,12 +480,75 @@ body {
   margin: 12px 0 0;
 }
 
+.report-cashinflow {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.report-subtitle {
+  margin: 0 0 12px;
+  font-size: 14px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.cashinflow-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+
+.cashinflow-card {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--success);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.cashinflow-card.cashinflow-total {
+  background: rgba(56, 189, 248, 0.12);
+  border-color: rgba(56, 189, 248, 0.45);
+  border-left-color: var(--accent);
+}
+
+.cashinflow-name {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.3;
+  word-break: break-word;
+}
+
+.cashinflow-amount {
+  font-size: 20px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--success);
+  word-break: break-word;
+}
+
+.cashinflow-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 /* ------------------------------------------------------------------ */
 /* Responsive                                                         */
 /* ------------------------------------------------------------------ */
 
 @media (max-width: 1000px) {
   .report-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+
+  .cashinflow-grid {
     grid-template-columns: repeat(3, 1fr);
   }
 }
@@ -506,6 +569,10 @@ body {
 
 @media (max-width: 640px) {
   .report-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .cashinflow-grid {
     grid-template-columns: repeat(2, 1fr);
   }
 
@@ -574,6 +641,10 @@ body {
 
 @media (max-width: 400px) {
   .report-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .cashinflow-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -823,6 +894,22 @@ body {
   color: var(--muted);
   text-align: center;
   padding: 18px 0;
+}
+
+tr.annulled td {
+  color: var(--muted);
+}
+
+.annulled-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(244, 63, 94, 0.14);
+  color: #f43f5e;
+  font-size: 11px;
+  font-weight: 600;
+  vertical-align: middle;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1120,6 +1207,16 @@ button,
 .underling-meta {
   font-size: 13px;
   color: var(--muted);
+  white-space: nowrap;
+}
+
+.underling-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.underling-export {
   white-space: nowrap;
 }
 

@@ -810,3 +810,35 @@ module.exports.sendToUser = function sendToUser(username, payload) {
 
   return delivered;
 };
+
+/**
+ * Notify admins and workers that a reply email could not be sent (either it was
+ * queued for retry or it gave up after retries), so a human knows the broker
+ * never received their reply and can follow up.
+ *
+ * @param {Object} info  { messageId, recipient, subject, attempts, status, error, at }
+ * @returns {number} Number of clients the notification was delivered to.
+ */
+module.exports.notifyEmailSendFailed = function notifyEmailSendFailed(info) {
+  if (!wss) return 0;
+
+  const message = JSON.stringify({ type: "email_send_failed", data: info });
+  let delivered = 0;
+
+  for (const client of wss.clients) {
+    if (
+      client.readyState === WebSocket.OPEN &&
+      client.username &&
+      (String(client.role) === "1" || String(client.role) === "2")
+    ) {
+      try {
+        client.send(message);
+        delivered++;
+      } catch (err) {
+        console.error("Failed to broadcast email send failure:", err);
+      }
+    }
+  }
+
+  return delivered;
+};

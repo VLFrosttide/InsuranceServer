@@ -1160,6 +1160,18 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     return res.status(403).json({ error: "Forbidden" });
   };
 
+  // Returns true when `viewerBrokerId` is the direct parent of
+  // `childBrokerId`. Used so a main broker can fetch the policies of its own
+  // sub-brokers (for the per-sub-broker Excel export).
+  async function isDirectUnderling(viewerBrokerId, childBrokerId) {
+    if (!viewerBrokerId || !childBrokerId) return false;
+    const [[child]] = await DBConnection.query(
+      "SELECT id FROM brokers WHERE id = ? AND ParentBrokerId = ?",
+      [childBrokerId, viewerBrokerId]
+    );
+    return Boolean(child);
+  }
+
   // InactivePolicies / PolicyRange* are no longer selected: inactive blancs
   // are calculated from the blanc batches (see applyBlancSummary).
   const BROKER_COLUMNS = "id, Name, CashBalance, ParentBrokerId, CutOff";
@@ -1894,9 +1906,17 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           return res.status(400).json({ error: "Invalid broker id" });
         }
         if (req.brokerScope !== null && req.brokerScope !== brokerId) {
-          return res
-            .status(403)
-            .json({ error: "Forbidden: you can only view your own broker" });
+          // A main broker may also view the policies of its direct sub-brokers
+          // (used by the per-sub-broker Excel export button).
+          const canViewUnderling = await isDirectUnderling(
+            req.brokerScope,
+            brokerId
+          );
+          if (!canViewUnderling) {
+            return res
+              .status(403)
+              .json({ error: "Forbidden: you can only view your own broker" });
+          }
         }
         const [[broker]] = await DBConnection.query(
           `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
@@ -1938,7 +1958,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         const [policies] = await DBConnection.query(
           `SELECT PolicyNumber, BlancNumber, CarNumber, Price, CurrencyType,
                   Duration, Otomobil, NonTurk, CardFee, Branch, PaymentType,
-                  CreationDate, StartDate
+                  CreationDate, StartDate, Annulled
              FROM insurance
             WHERE ${conditions.join(" AND ")}
             ORDER BY CreationDate DESC`,

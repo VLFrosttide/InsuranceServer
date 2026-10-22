@@ -59,6 +59,12 @@
             </div>
         </div>
         <p id="ReportMsg" class="msg report-msg" role="alert" aria-live="polite"></p>
+
+        <div class="report-cashinflow">
+            <h3 class="report-subtitle" data-i18n="report.cashInflow.title">Cash inflow report</h3>
+            <p id="CashInflowMsg" class="msg report-msg" role="alert" aria-live="polite"></p>
+            <div id="CashInflowGrid" class="cashinflow-grid"></div>
+        </div>
     </section>
 
     <main class="layout">
@@ -126,11 +132,13 @@
                         <div class="policies-controls">
                             <label class="history-filter-label" for="PoliciesDate" data-i18n="policies.date">Date</label>
                             <input id="PoliciesDate" type="text" class="date-input" readonly autocomplete="off"
-                                   data-i18n-placeholder="policies.date.placeholder" placeholder="dd/mm/yyyy" />
+                                   data-i18n-placeholder="policies.date.placeholder" placeholder="dd - mm - yy" />
                             <button id="PoliciesDateClear" type="button" class="date-clear hidden"
                                     data-i18n="policies.date.clear">Clear</button>
                             <input id="PoliciesDatePicker" type="date" class="date-picker-native" tabindex="-1" aria-hidden="true" />
                             <span id="PoliciesTotalBalance" class="policies-total"></span>
+                            <button id="PoliciesExportBtn" type="button" class="btn-ghost btn-small"
+                                    data-i18n="policies.export">Export Excel</button>
                         </div>
                     </div>
                     <div class="table-wrap">

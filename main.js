@@ -453,6 +453,12 @@ async function start() {
     require("./Mail/renewalReminder.js").setDb(DBConnection);
     startGmailPolling();
 
+    // Durable email retry queue: replies that fail to send through the Gmail
+    // API are persisted here and retried in the background with backoff (and
+    // across restarts) instead of being silently lost.
+    require("./Mail/emailOutbox.js").setDb(DBConnection);
+    require("./Mail/emailOutbox.js").start();
+
     console.log(`Server listening on http://${HOST}:${PORT}`);
   } catch (err) {
     console.error(

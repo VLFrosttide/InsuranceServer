@@ -43,6 +43,7 @@ const InactivePoliciesCount = document.getElementById("InactivePoliciesCount");
 const PoliciesDate = document.getElementById("PoliciesDate");
 const PoliciesDatePicker = document.getElementById("PoliciesDatePicker");
 const PoliciesDateClear = document.getElementById("PoliciesDateClear");
+const PoliciesExportBtn = document.getElementById("PoliciesExportBtn");
 const PoliciesTotalBalance = document.getElementById("PoliciesTotalBalance");
 const Report = document.getElementById("Report");
 const ReportFrom = document.getElementById("ReportFrom");
@@ -54,6 +55,8 @@ const ReportLesovoCash = document.getElementById("ReportLesovoCash");
 const ReportLesovoCard = document.getElementById("ReportLesovoCard");
 const ReportTotal = document.getElementById("ReportTotal");
 const ReportMsg = document.getElementById("ReportMsg");
+const CashInflowGrid = document.getElementById("CashInflowGrid");
+const CashInflowMsg = document.getElementById("CashInflowMsg");
 
 // The report is a company-wide aggregate, so broker accounts never see it.
 // Hide immediately (before any async load) to avoid a flash of empty report.
@@ -290,8 +293,156 @@ async function loadReport() {
   ReportTotal.textContent = formatMoney(total);
 }
 
+// --- Cash inflow report (per-broker inflows) ---------------------------------
+
+// Pull a broker name from a set of candidate field names on an entry.
+function pickCashInflowName(item) {
+  if (!item) return "";
+  if (typeof item === "string") return item.trim();
+  for (const key of [
+    "brokerName",
+    "BrokerName",
+    "name",
+    "Name",
+    "broker",
+    "Broker",
+  ]) {
+    const v = item[key];
+    if (v !== undefined && v !== null && String(v).trim() !== "") {
+      return String(v).trim();
+    }
+  }
+  return "";
+}
+
+// Accept a bare array, or a wrapper object such as
+// { brokers: [...] }, { items: [...] }, { entries: [...] },
+// { cashInflow: [...] }, { cashInflows: [...] } or { inflows: [...] }.
+function normalizeCashInflow(data) {
+  let list = [];
+  if (Array.isArray(data)) {
+    list = data;
+  } else if (data && typeof data === "object") {
+    list =
+      data.brokers ||
+      data.items ||
+      data.entries ||
+      data.cashInflow ||
+      data.cashInflows ||
+      data.inflows ||
+      data.data ||
+      [];
+  }
+  if (!Array.isArray(list)) list = [];
+
+  const rows = [];
+  for (const item of list) {
+    const name = pickCashInflowName(item);
+    const amount =
+      pickPaymentValue(item, [
+        "amount",
+        "Amount",
+        "cashInflow",
+        "CashInflow",
+        "inflow",
+        "Inflow",
+        "total",
+        "Total",
+        "value",
+        "Value",
+      ]) ?? 0;
+    // Only positive inflows of at least €200 qualify.
+    if (Number.isFinite(amount) && amount >= 200) {
+      rows.push({
+        name: name || t("report.cashInflow.unknownBroker"),
+        amount,
+      });
+    }
+  }
+  rows.sort((a, b) => b.amount - a.amount);
+  return rows;
+}
+
+// Build a single cash-inflow card. `isTotal` marks the combined sum card.
+function buildCashInflowCard(name, amount, isTotal) {
+  const card = document.createElement("div");
+  card.className = "cashinflow-card" + (isTotal ? " cashinflow-total" : "");
+
+  const nameEl = document.createElement("span");
+  nameEl.className = "cashinflow-name";
+  nameEl.textContent = name;
+
+  const amountEl = document.createElement("span");
+  amountEl.className = "cashinflow-amount";
+  amountEl.textContent = formatMoney(amount);
+
+  card.appendChild(nameEl);
+  card.appendChild(amountEl);
+  return card;
+}
+
+async function loadCashInflow() {
+  if (!CashInflowGrid) return;
+
+  // Company-wide aggregate — only meaningful for admins/workers.
+  if (isBroker) {
+    CashInflowGrid.innerHTML = "";
+    CashInflowMsg.textContent = "";
+    CashInflowMsg.className = "msg report-msg";
+    return;
+  }
+
+  if (!ReportFrom.value || !ReportTo.value) {
+    const r = defaultReportRange();
+    if (!ReportFrom.value) ReportFrom.value = r.from;
+    if (!ReportTo.value) ReportTo.value = r.to;
+  }
+
+  const from = ReportFrom.value.trim();
+  const to = ReportTo.value.trim();
+  const qs = [];
+  if (from) qs.push("from=" + encodeURIComponent(from));
+  if (to) qs.push("to=" + encodeURIComponent(to));
+
+  CashInflowGrid.innerHTML = "";
+  CashInflowMsg.textContent = "";
+  CashInflowMsg.className = "msg report-msg";
+
+  let rows = [];
+  try {
+    const data = await api(
+      "/reports/cash-inflow" + (qs.length ? "?" + qs.join("&") : "")
+    );
+    rows = normalizeCashInflow(data);
+  } catch (err) {
+    CashInflowMsg.textContent = err.message || t("report.cashInflow.loadFailed");
+    CashInflowMsg.className = "msg report-msg error";
+    return;
+  }
+
+  if (rows.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "cashinflow-empty";
+    empty.textContent = t("report.cashInflow.empty");
+    CashInflowGrid.appendChild(empty);
+    return;
+  }
+
+  // One combined card summing every broker inflow into a single total.
+  const total = rows.reduce((sum, row) => sum + row.amount, 0);
+  CashInflowGrid.appendChild(
+    buildCashInflowCard(t("report.cashInflow.total"), total, true)
+  );
+
+  for (const row of rows) {
+    CashInflowGrid.appendChild(buildCashInflowCard(row.name, row.amount, false));
+  }
+}
+
 ReportFrom.addEventListener("change", loadReport);
 ReportTo.addEventListener("change", loadReport);
+ReportFrom.addEventListener("change", loadCashInflow);
+ReportTo.addEventListener("change", loadCashInflow);
 
 // Local calendar day of a policy's creation date, as "YYYY-MM-DD".
 function policyDay(p) {
@@ -304,22 +455,10 @@ function filteredPolicies() {
   return policiesData.filter((p) => policyDay(p) === policiesDate);
 }
 
-const DATE_LOCALES = { en: "en-GB", bg: "bg-BG", tr: "tr-TR" };
-
-// Format a YYYY-MM-DD filter value into the language-appropriate short date.
+// Format a YYYY-MM-DD filter value into the short numeric date (DD - MM - YY).
 function formatPoliciesDateValue(value) {
   if (!value) return "";
-  const d = toDate(value);
-  if (!d) return String(value);
-  try {
-    return new Intl.DateTimeFormat(DATE_LOCALES[getLang()] || "en-GB", {
-      day: "2-digit",
-      month: "2-digit",
-      year: "numeric",
-    }).format(d);
-  } catch {
-    return formatDate(d);
-  }
+  return formatDate(value);
 }
 
 // Keep the visible text field and its clear button in sync with `policiesDate`.
@@ -379,6 +518,64 @@ function sortedPolicies() {
   return arr;
 }
 
+// --- Policy field accessors (tolerant of different API field names) ----------
+
+function policyCarNumber(p) {
+  if (!p) return "";
+  for (const key of [
+    "CarNumber", "CarRegNumber", "CarRegistrationNumber",
+    "VehicleNumber", "VehicleRegNumber", "VehicleRegistrationNumber",
+    "RegistrationNumber", "RegNumber", "Registration",
+    "LicensePlate", "PlateNumber", "Plate", "NumberPlate",
+    "CarNo", "RegistrationNo", "RegNo", "RegPlate",
+  ]) {
+    const v = p[key];
+    if (v !== undefined && v !== null && String(v).trim() !== "") {
+      return String(v).trim();
+    }
+  }
+  return "";
+}
+
+function policyDuration(p) {
+  if (!p) return "";
+  for (const key of [
+    "Duration", "InsuranceDuration", "DurationMonths", "Months",
+    "InsuranceMonths", "Period", "InsurancePeriod", "Term",
+    "InsuranceTerm", "ValidityMonths", "DurationInMonths",
+  ]) {
+    const v = p[key];
+    if (v !== undefined && v !== null && String(v).trim() !== "") {
+      return String(v).trim();
+    }
+  }
+  return "";
+}
+
+function isPolicyAnnulled(p) {
+  if (!p) return false;
+  for (const key of [
+    "IsAnnulled", "isAnnulled", "Annulled", "annulled",
+    "IsCanceled", "isCanceled", "IsCancelled", "isCancelled",
+    "Canceled", "Cancelled",
+  ]) {
+    const v = p[key];
+    if (v === undefined || v === null || v === "" || v === false) continue;
+    const s = String(v).toLowerCase();
+    if (s === "false" || s === "0" || s === "no") continue;
+    return true;
+  }
+  const status = String(p.Status ?? p.status ?? "").toLowerCase();
+  return (
+    status === "annulled" ||
+    status === "canceled" ||
+    status === "cancelled" ||
+    status === "annulment" ||
+    status === "iptal" ||
+    status === "anulirana"
+  );
+}
+
 function updatePolicySortHeaders() {
   document.querySelectorAll("#PoliciesPanel th[data-sort]").forEach((th) => {
     const active = th.getAttribute("data-sort") === policySort.key;
@@ -418,9 +615,18 @@ function renderPolicyTable() {
   PoliciesRows.innerHTML = "";
   const policies = sortedPolicies();
   for (const p of policies) {
+    const annulled = isPolicyAnnulled(p);
     const row = document.createElement("tr");
+    if (annulled) row.classList.add("annulled");
     row.innerHTML =
-      "<td>" + escapeHtml(p.PolicyNumber) + "</td>" +
+      "<td>" +
+      escapeHtml(p.PolicyNumber) +
+      (annulled
+        ? '<span class="annulled-badge">' +
+          escapeHtml(t("policies.annulled")) +
+          "</span>"
+        : "") +
+      "</td>" +
       "<td>" + escapeHtml(p.BlancNumber) + "</td>" +
       (policiesHidePricing
         ? ""
@@ -476,6 +682,111 @@ PoliciesDatePicker.addEventListener("change", () => {
 });
 
 PoliciesDateClear.addEventListener("click", () => setPoliciesDateFilter(""));
+
+// Build an Excel (HTML table) document for a list of policies. Returns the
+// full HTML string. `hidePricing` mirrors the on-screen pricing visibility.
+function buildPoliciesExcel(policies, hidePricing) {
+  const textCell = (v) =>
+    '<td style=\'mso-number-format:"@";\'>' + escapeHtml(v) + "</td>";
+
+  const headers = [
+    t("policies.col.policy"),
+    t("policies.col.blanc"),
+    t("policies.col.carNumber"),
+    t("policies.col.duration"),
+  ];
+  if (!hidePricing) {
+    headers.push(t("policies.col.price"), t("policies.col.currency"));
+  }
+  headers.push(t("policies.col.created"), t("policies.col.status"));
+
+  const headerHtml = headers
+    .map((h) => '<th style="font-weight:bold;">' + escapeHtml(h) + "</th>")
+    .join("");
+
+  const bodyHtml = policies
+    .map((p) => {
+      const annulled = isPolicyAnnulled(p);
+      let cells =
+        textCell(p.PolicyNumber) +
+        textCell(p.BlancNumber) +
+        textCell(policyCarNumber(p)) +
+        textCell(policyDuration(p));
+      if (!hidePricing) {
+        cells +=
+          '<td style=\'mso-number-format:"0.00";\'>' +
+          Number(p.Price || 0) +
+          "</td>" +
+          textCell(p.CurrencyType);
+      }
+      cells +=
+        textCell(formatDate(p.CreationDate)) +
+        textCell(annulled ? t("policies.annulled") : "");
+      return (
+        "<tr" +
+        (annulled ? ' style="color:#9ca3af;"' : "") +
+        ">" +
+        cells +
+        "</tr>"
+      );
+    })
+    .join("");
+
+  let totalHtml = "";
+  if (!hidePricing) {
+    const total = policies.reduce((sum, p) => sum + Number(p.Price || 0), 0);
+    totalHtml =
+      "<tr style='font-weight:bold;'>" +
+      '<td colspan="4">' + escapeHtml(t("policies.totalSum")) + "</td>" +
+      '<td style=\'mso-number-format:"0.00";\'>' + total + "</td>" +
+      "<td></td><td></td><td></td>" +
+      "</tr>";
+  }
+
+  return (
+    '<html xmlns:o="urn:schemas-microsoft-com:office:office" ' +
+    'xmlns:x="urn:schemas-microsoft-com:office:excel" ' +
+    'xmlns="http://www.w3.org/TR/REC-html40">' +
+    '<head><meta charset="UTF-8">' +
+    "<!--[if gte mso 9]><xml>" +
+    "<x:ExcelWorkbook><x:ExcelWorksheets><x:ExcelWorksheet>" +
+    "<x:Name>Policies</x:Name>" +
+    "<x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions>" +
+    "</x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook>" +
+    "</xml><![endif]-->" +
+    "</head><body><table>" +
+    "<tr>" +
+    headerHtml +
+    "</tr>" +
+    bodyHtml +
+    totalHtml +
+    "</table></body></html>"
+  );
+}
+
+function downloadExcel(html, filename) {
+  const blob = new Blob([html], { type: "application/vnd.ms-excel" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Download the currently visible "Policies since last payment" rows as an
+// Excel file. Uses Excel's HTML table format so the export works without any
+// third-party library, and forces text cells so leading zeros are preserved.
+function exportPoliciesExcel() {
+  downloadExcel(
+    buildPoliciesExcel(sortedPolicies(), policiesHidePricing),
+    "policies-since-last-payment.xls"
+  );
+}
+
+PoliciesExportBtn.addEventListener("click", exportPoliciesExcel);
 
 async function selectBroker(id) {
   selectedId = id;
@@ -634,6 +945,7 @@ async function load() {
     schedule = data.schedule || null;
     renderBrokerList();
     loadReport();
+    loadCashInflow();
     if (brokers.length > 0) await selectBroker(brokers[0].id);
   } catch (err) {
     if (err.status === 401 || err.status === 403) {
@@ -997,6 +1309,42 @@ async function loadUnderlings() {
   }
 }
 
+function underlingExcelName(name) {
+  return String(name || "sub-broker")
+    .replace(/[\\/:*?"<>|]+/g, "")
+    .trim()
+    .replace(/\s+/g, "-");
+}
+
+async function exportUnderlingExcel(u, btn) {
+  const original = btn ? btn.textContent : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "…";
+  }
+  try {
+    const data = await api(
+      "/brokers/" + u.id + "/policies" + underlingDateParams()
+    );
+    const policies = data.policies || [];
+    const hidePricing =
+      data.hidePricing !== undefined
+        ? Boolean(data.hidePricing)
+        : isPricingHidden(u);
+    downloadExcel(
+      buildPoliciesExcel(policies, hidePricing),
+      "policies-" + (underlingExcelName(u.Name) || u.id) + ".xls"
+    );
+  } catch (err) {
+    alert(err.message || t("policies.loadFailed"));
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  }
+}
+
 function renderUnderlings(list, serverTotalBalance) {
   UnderlingsList.innerHTML = "";
   let sumTotal = 0;
@@ -1026,8 +1374,22 @@ function renderUnderlings(list, serverTotalBalance) {
         " · " +
         formatMoney(u.totalPrice ?? u.totalBalance ?? 0);
 
+    const exportBtn = document.createElement("button");
+    exportBtn.type = "button";
+    exportBtn.className = "btn-ghost btn-small underling-export";
+    exportBtn.textContent = t("policies.export");
+    exportBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      exportUnderlingExcel(u, exportBtn);
+    });
+
+    const actions = document.createElement("div");
+    actions.className = "underling-actions";
+    actions.appendChild(meta);
+    actions.appendChild(exportBtn);
+
     li.appendChild(name);
-    li.appendChild(meta);
+    li.appendChild(actions);
     UnderlingsList.appendChild(li);
   }
 

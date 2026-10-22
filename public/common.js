@@ -212,7 +212,7 @@ function formatDate(v) {
   const d = toDate(v);
   if (!d) return String(v || "");
   const p = (n) => String(n).padStart(2, "0");
-  return p(d.getDate()) + "-" + p(d.getMonth() + 1) + "-" + String(d.getFullYear()).slice(-2);
+  return p(d.getDate()) + " - " + p(d.getMonth() + 1) + " - " + String(d.getFullYear()).slice(-2);
 }
 
 const MONTH_NAMES = {
