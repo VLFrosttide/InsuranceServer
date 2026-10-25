@@ -1477,8 +1477,8 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             else if (column === "NonTurk") v = toFlag(value) ? 1 : 0;
             else if (column === "CurrencyType") v = normalizePolicyCurrency(value);
             else if (column === "CardFee") {
-              // The +2 card tax goes to the bank and is visual-only during
-              // creation; it is never stored on the policy.
+              // The +2 card tax goes to the bank and is visual-only; it is
+              // never stored on the policy or in any balance.
               v = 0;
               cardFeeHandled = true;
             } else v = value;
@@ -1561,20 +1561,23 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           }
         }
 
-        // Admins (role 1) can change who is at fault for an already-annulled
-        // insurance. Workers cannot change the fault once the policy has been
-        // annulled, and active (non-annulled) policies must be annulled through
-        // POST /insurances/:blancNumber/annul first.
+        // Admins (role 1) can change who is at fault and the fee for an
+        // already-annulled insurance. Workers cannot change the fault or fee
+        // once the policy has been annulled, and active (non-annulled) policies
+        // must be annulled through POST /insurances/:blancNumber/annul first.
+        const isAdmin = Number(req.user && req.user.role) === 1;
         const rawAnnulPayer =
           b.AnnulReason ?? b.annulReason ?? b.payer ?? b.Payer;
+        const rawAnnulFee = b.AnnulFee ?? b.annulFee ?? b.fee ?? b.Fee;
         let nextAnnulPayer = null;
+        let nextAnnulFee = null;
         if (rawAnnulPayer !== undefined && rawAnnulPayer !== null) {
           if (!insurance.Annulled) {
             return res
               .status(400)
               .json({ error: "Insurance is not annulled" });
           }
-          if (Number(req.user && req.user.role) !== 1) {
+          if (!isAdmin) {
             return res.status(403).json({
               error: "Only admins can change the fault of an annulled insurance",
             });
@@ -1586,8 +1589,38 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             });
           }
         }
+        if (
+          rawAnnulFee !== undefined &&
+          rawAnnulFee !== null &&
+          rawAnnulFee !== ""
+        ) {
+          if (!insurance.Annulled) {
+            return res
+              .status(400)
+              .json({ error: "Insurance is not annulled" });
+          }
+          if (!isAdmin) {
+            return res.status(403).json({
+              error: "Only admins can change the fee of an annulled insurance",
+            });
+          }
+          nextAnnulFee = toDecimal(rawAnnulFee);
+          if (
+            nextAnnulFee === null ||
+            !Number.isFinite(nextAnnulFee) ||
+            nextAnnulFee < 0
+          ) {
+            return res
+              .status(400)
+              .json({ error: "fee must be a non-negative number" });
+          }
+        }
 
-        if (sets.length === 0 && nextAnnulPayer === null) {
+        if (
+          sets.length === 0 &&
+          nextAnnulPayer === null &&
+          nextAnnulFee === null
+        ) {
           return res.status(400).json({ error: "Nothing to update" });
         }
 
@@ -1660,11 +1693,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const moneyChanged =
           branchChanged || priceChanged || paymentChanged || currencyChanged;
 
-        // If an admin is changing the fault of an annulled insurance, compute
-        // the old and new fees/refunds so the payment channel and (for email
-        // policies) the broker's balance are adjusted by the difference.
+        // If an admin is changing the fault or the fee of an annulled insurance,
+        // compute the old and new fees/refunds so the payment channel and (for
+        // email policies) the broker's balance are adjusted by the difference.
         let annulFaultChange = null;
-        if (nextAnnulPayer !== null) {
+        if (nextAnnulPayer !== null || nextAnnulFee !== null) {
           const oldPayerRaw = String(insurance.AnnulReason ?? "")
             .trim()
             .toLowerCase();
@@ -1681,6 +1714,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             ? toDecimal(insurance.AnnulFee) || 0
             : computeAnnulFee(insurance, new Date(), oldPayer).fee;
 
+          // When only the fee is changed the payer stays as it was.
+          const effectivePayer =
+            nextAnnulPayer !== null ? nextAnnulPayer : oldPayer;
+
           const editedStartDate =
             b.StartDate !== undefined || b.startDate !== undefined
               ? b.StartDate ?? b.startDate
@@ -1691,22 +1728,36 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             (oldStartParsed ? oldStartParsed.getTime() : null) !==
             (newStartParsed ? newStartParsed.getTime() : null);
 
-          const newFee =
-            nextAnnulPayer === "none"
-              ? 0
-              : oldPayer !== "none" && hasStoredFee && oldFee > 0 && !startDateChanged
-              ? oldFee
-              : computeAnnulFee(
-                  { ...insurance, StartDate: editedStartDate },
-                  new Date(),
-                  nextAnnulPayer
-                ).fee;
+          // No fault is always free. An admin's manual fee wins when given;
+          // otherwise a fault change keeps the stored fee (unless the start
+          // date moved, which re-decides it), and a fresh fee is computed when
+          // there is nothing sensible to keep.
+          let newFee;
+          if (effectivePayer === "none") {
+            newFee = 0;
+          } else if (nextAnnulFee !== null) {
+            newFee = nextAnnulFee;
+          } else if (
+            nextAnnulPayer !== null &&
+            oldPayer !== "none" &&
+            hasStoredFee &&
+            oldFee > 0 &&
+            !startDateChanged
+          ) {
+            newFee = oldFee;
+          } else {
+            newFee = computeAnnulFee(
+              { ...insurance, StartDate: editedStartDate },
+              new Date(),
+              effectivePayer
+            ).fee;
+          }
 
           const oldRefund = Math.max(0, Math.round((newPrice - oldFee) * 100) / 100);
           const newRefund = Math.max(0, Math.round((newPrice - newFee) * 100) / 100);
           const refundDelta = Math.round((newRefund - oldRefund) * 100) / 100;
           const oldBrokerRefund = oldPayer === "broker" ? oldRefund : newPrice;
-          const newBrokerRefund = nextAnnulPayer === "broker" ? newRefund : newPrice;
+          const newBrokerRefund = effectivePayer === "broker" ? newRefund : newPrice;
           const brokerRefundDelta =
             Math.round((newBrokerRefund - oldBrokerRefund) * 100) / 100;
 
@@ -1717,7 +1768,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           };
 
           sets.push("AnnulReason = ?");
-          params.push(nextAnnulPayer);
+          params.push(effectivePayer);
           sets.push("AnnulFee = ?");
           params.push(newFee);
         }
@@ -1857,14 +1908,14 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     }
   );
 
-  // POST /insurances/:blancNumber/annul  { payer: "broker"|"worker"|"none" }
+  // POST /insurances/:blancNumber/annul  { payer: "broker"|"worker"|"none", fee? }
   // Annuls a policy: refunds its price minus the annulment fee, through the
   // channel it was originally paid through (current cash, card balance, or the
   // Broker channel for email policies), and reverses its effect on the linked
   // broker's balance, if any. The caller chooses WHO pays the fee (or "none"
-  // for no fault, which is free); the fee itself (1 or 9, see computeAnnulFee)
-  // is decided here from the policy's start date and is never taken from the
-  // request. A broker-linked policy gets the full price back unless the broker
+  // for no fault, which is free); the fee itself is 1 or 9 by the start date
+  // (see computeAnnulFee), but an admin (role 1) may override it with a manual
+  // fee. A broker-linked policy gets the full price back unless the broker
   // is the one at fault, in which case only the price minus the fee (the
   // partial refund) is returned to the broker's balance. A policy can only be
   // annulled once. Admins (role 1) and workers (role 2) can annul any policy.
@@ -1933,18 +1984,50 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             : computeAnnulFee(insurance, new Date(), oldPayer).fee
           : 0;
 
+        // Admins may type the fee by hand; everyone else gets the computed fee
+        // (1 before the start date, 9 once it is in effect). A "none" payer
+        // (no fault) is always free, so a manual fee is ignored for it.
+        const isAdmin = Number(req.user && req.user.role) === 1;
+        const manualFeeRaw = req.body?.fee ?? req.body?.AnnulFee ?? req.body?.Fee;
+        let manualFee = null;
+        if (
+          isAdmin &&
+          manualFeeRaw !== undefined &&
+          manualFeeRaw !== null &&
+          manualFeeRaw !== ""
+        ) {
+          manualFee = toDecimal(manualFeeRaw);
+          if (
+            manualFee === null ||
+            !Number.isFinite(manualFee) ||
+            manualFee < 0
+          ) {
+            return res
+              .status(400)
+              .json({ error: "fee must be a non-negative number" });
+          }
+        }
+
         // No fault: 0. Otherwise 9 when the policy is already in effect (its
-        // start date has been reached), 1 when it has not started yet.
+        // start date has been reached), 1 when it has not started yet - unless
+        // an admin overrode the fee by hand.
         const computed = computeAnnulFee(insurance, new Date(), payer);
         const inEffect = computed.inEffect;
-        const fee =
+        let fee;
+        if (payer === "none") {
+          fee = 0;
+        } else if (manualFee !== null) {
+          fee = manualFee;
+        } else if (
           alreadyAnnulled &&
-          payer !== "none" &&
           oldPayer !== "none" &&
           hasStoredFee &&
           oldFee > 0
-            ? oldFee
-            : computed.fee;
+        ) {
+          fee = oldFee;
+        } else {
+          fee = computed.fee;
+        }
         const refund = Math.max(0, Math.round((price - fee) * 100) / 100);
 
         const moveTime = resolveMoveCreatedAt(req.body);
