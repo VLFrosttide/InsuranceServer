@@ -803,6 +803,14 @@ body {
   border-color: var(--accent);
 }
 
+/* Calendar glyph on native date inputs: recolor it white (borrowed from the
+   Insurance client) so it is visible on the dark field and reads as clickable.
+   The whole field opens the picker (see dashboard.js openDatePicker). */
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(1);
+  cursor: pointer;
+}
+
 .date-clear {
   padding: 5px 10px;
   border: 1px solid var(--border);
@@ -1214,10 +1222,78 @@ button,
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
 }
 
 .underling-export {
   white-space: nowrap;
+}
+
+.balance-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 12px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.balance-chip .balance-label {
+  color: var(--muted);
+}
+
+.balance-chip .balance-value {
+  font-weight: 700;
+}
+
+.balance-chip.show {
+  color: var(--accent);
+  border-color: rgba(56, 189, 248, 0.4);
+  background: rgba(56, 189, 248, 0.12);
+}
+
+.balance-chip.main {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.4);
+  background: rgba(251, 191, 36, 0.12);
+}
+
+.balance-chip.profit {
+  color: var(--success);
+  border-color: rgba(74, 222, 128, 0.4);
+  background: rgba(74, 222, 128, 0.12);
+}
+
+.balance-chip.profit.negative {
+  color: var(--danger);
+  border-color: rgba(248, 113, 113, 0.4);
+  background: rgba(248, 113, 113, 0.12);
+}
+
+.underling-totals {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.underling-totals-head {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 8px;
+}
+
+.underling-totals-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .pricing-table input.pricing-input {

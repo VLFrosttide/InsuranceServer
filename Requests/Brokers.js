@@ -2110,8 +2110,34 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           policiesByUnderling.get(r.BrokerId).push(r);
         }
 
+        // The main broker's own policies in the same window, so the totals can
+        // include the main broker's own insurances (not just the underlings').
+        const ownConditions = ["BrokerId = ?", "Deleted = 0"];
+        const ownParams = [brokerId];
+        if (fromParam) {
+          ownConditions.push("CreationDate >= ?");
+          ownParams.push(`${fromParam} 00:00:00`);
+        }
+        if (toParam) {
+          ownConditions.push("CreationDate < ?");
+          ownParams.push(`${toParam} 23:59:59`);
+        }
+        const [ownPolicyRows] = await DBConnection.query(
+          `SELECT BrokerId, Duration, Otomobil, PaymentType, NonTurk, CardFee
+             FROM insurance
+            WHERE ${ownConditions.join(" AND ")}`,
+          ownParams
+        );
+
+        // The main broker's own price list is the "main broker price" every
+        // underling insurance is actually sold at. For the main broker's own
+        // insurances the shown and sale prices are identical (its own tariff).
+        const mainPricingRes = await effectivePricingFor(DBConnection, brokerId);
+        const mainPricing = mainPricingRes.pricing || {};
+
         const result = [];
-        let overallTotalBalance = 0;
+        let underlingsShowOnly = 0;
+        let underlingsMainPrice = 0;
         let anyConfigured = false;
 
         for (const u of underlings) {
@@ -2130,17 +2156,26 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               policyCount,
               totalPrice: null,
               totalBalance: null,
+              showOnlyTotal: null,
+              mainPriceTotal: null,
+              profit: null,
             });
           } else {
             anyConfigured = true;
             const disp = await computeSubBrokerDisplayData(DBConnection, u.id);
             let sumDisplayPrice = 0;
+            let sumMainPrice = 0;
             for (const row of uPolicies) {
-              const dp = computePolicyTariffPrice(row, disp.subPricing);
-              if (dp !== null) sumDisplayPrice += dp;
+              const shown = computePolicyTariffPrice(row, disp.subPricing);
+              if (shown !== null) sumDisplayPrice += shown;
+              const sold = computePolicyTariffPrice(row, mainPricing);
+              if (sold !== null) sumMainPrice += sold;
             }
             const totalPrice = Math.round(sumDisplayPrice * 100) / 100;
-            overallTotalBalance += totalPrice;
+            const mainPriceTotal = Math.round(sumMainPrice * 100) / 100;
+            const profit = Math.round((totalPrice - mainPriceTotal) * 100) / 100;
+            underlingsShowOnly += totalPrice;
+            underlingsMainPrice += mainPriceTotal;
             result.push({
               id: u.id,
               Name: u.Name,
@@ -2152,17 +2187,35 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               policyCount,
               totalPrice,
               totalBalance: totalPrice,
+              showOnlyTotal: totalPrice,
+              mainPriceTotal,
+              profit,
             });
           }
         }
 
+        // Main broker's own insurances: shown == sale == its own tariff price.
+        let ownTotal = 0;
+        for (const row of ownPolicyRows) {
+          const p = computePolicyTariffPrice(row, mainPricing);
+          if (p !== null) ownTotal += p;
+        }
+        ownTotal = Math.round(ownTotal * 100) / 100;
+
+        const totals = {
+          showOnly: Math.round((underlingsShowOnly + ownTotal) * 100) / 100,
+          mainPrice: Math.round((underlingsMainPrice + ownTotal) * 100) / 100,
+          profit: Math.round((underlingsShowOnly - underlingsMainPrice) * 100) / 100,
+        };
+
         const totalBalance = anyConfigured
-          ? Math.round(overallTotalBalance * 100) / 100
+          ? Math.round(underlingsShowOnly * 100) / 100
           : null;
 
         res.json({
           broker: { id: broker.id, Name: broker.Name },
           totalBalance,
+          totals,
           underlings: result,
         });
       } catch (err) {

@@ -1256,7 +1256,10 @@ const UnderlingsList = document.getElementById("UnderlingsList");
 const UnderlingFrom = document.getElementById("UnderlingFrom");
 const UnderlingTo = document.getElementById("UnderlingTo");
 const UnderlingClearBtn = document.getElementById("UnderlingClearBtn");
-const UnderlingsTotalBalance = document.getElementById("UnderlingsTotalBalance");
+const UnderlingsTotals = document.getElementById("UnderlingsTotals");
+const TotalsShowOnly = document.getElementById("TotalsShowOnly");
+const TotalsMainPrice = document.getElementById("TotalsMainPrice");
+const TotalsProfit = document.getElementById("TotalsProfit");
 const PricingOverlay = document.getElementById("PricingOverlay");
 const PricingTitle = document.getElementById("PricingTitle");
 const PricingMeta = document.getElementById("PricingMeta");
@@ -1290,15 +1293,14 @@ async function loadUnderlings() {
       return;
     }
     SubBrokersPanel.classList.remove("hidden");
-    renderUnderlings(list, data.totalBalance);
+    renderUnderlings(list, data);
   } catch (err) {
     if (err.status === 403) {
       SubBrokersPanel.classList.add("hidden");
       return;
     }
-    if (UnderlingsTotalBalance) {
-      UnderlingsTotalBalance.textContent = "";
-      UnderlingsTotalBalance.classList.add("hidden");
+    if (UnderlingsTotals) {
+      UnderlingsTotals.classList.add("hidden");
     }
     UnderlingsList.innerHTML = "";
     const li = document.createElement("li");
@@ -1345,9 +1347,22 @@ async function exportUnderlingExcel(u, btn) {
   }
 }
 
-function renderUnderlings(list, serverTotalBalance) {
+function buildBalanceChip(label, value, cls) {
+  const chip = document.createElement("span");
+  chip.className = "balance-chip " + cls;
+  const lab = document.createElement("span");
+  lab.className = "balance-label";
+  lab.textContent = label;
+  const val = document.createElement("span");
+  val.className = "balance-value";
+  val.textContent = value;
+  chip.appendChild(lab);
+  chip.appendChild(val);
+  return chip;
+}
+
+function renderUnderlings(list, data) {
   UnderlingsList.innerHTML = "";
-  let sumTotal = 0;
   let anyVisible = false;
   for (const u of list) {
     const li = document.createElement("li");
@@ -1361,18 +1376,11 @@ function renderUnderlings(list, serverTotalBalance) {
     name.addEventListener("click", () => openPricing(u.id, u.Name));
 
     const hidden = isPricingHidden(u);
-    if (!hidden) {
-      anyVisible = true;
-      sumTotal += Number(u.totalPrice ?? u.totalBalance ?? 0);
-    }
+    if (!hidden) anyVisible = true;
 
     const meta = document.createElement("span");
     meta.className = "underling-meta";
-    meta.textContent = hidden
-      ? t("underlings.policiesCount", { n: u.policyCount })
-      : t("underlings.policiesCount", { n: u.policyCount }) +
-        " · " +
-        formatMoney(u.totalPrice ?? u.totalBalance ?? 0);
+    meta.textContent = t("underlings.policiesCount", { n: u.policyCount });
 
     const exportBtn = document.createElement("button");
     exportBtn.type = "button";
@@ -1386,6 +1394,29 @@ function renderUnderlings(list, serverTotalBalance) {
     const actions = document.createElement("div");
     actions.className = "underling-actions";
     actions.appendChild(meta);
+
+    if (!hidden) {
+      const showOnly = Number(u.showOnlyTotal ?? u.totalPrice ?? u.totalBalance ?? 0);
+      const mainPrice = Number(u.mainPriceTotal ?? 0);
+      const profit =
+        u.profit !== undefined && u.profit !== null
+          ? Number(u.profit)
+          : showOnly - mainPrice;
+      actions.appendChild(
+        buildBalanceChip(t("underlings.showOnly"), formatMoney(showOnly), "show")
+      );
+      actions.appendChild(
+        buildBalanceChip(t("underlings.mainPrice"), formatMoney(mainPrice), "main")
+      );
+      actions.appendChild(
+        buildBalanceChip(
+          t("underlings.profit"),
+          formatSignedMoney(profit),
+          "profit" + (profit < 0 ? " negative" : "")
+        )
+      );
+    }
+
     actions.appendChild(exportBtn);
 
     li.appendChild(name);
@@ -1393,20 +1424,28 @@ function renderUnderlings(list, serverTotalBalance) {
     UnderlingsList.appendChild(li);
   }
 
-  if (UnderlingsTotalBalance) {
-    if (!anyVisible) {
-      UnderlingsTotalBalance.textContent = "";
-      UnderlingsTotalBalance.classList.add("hidden");
-    } else {
-      const total =
-        serverTotalBalance !== undefined && serverTotalBalance !== null
-          ? Number(serverTotalBalance)
-          : sumTotal;
-      UnderlingsTotalBalance.classList.remove("hidden");
-      UnderlingsTotalBalance.textContent =
-        t("policies.totalBalance") + ": " + formatMoney(total);
-    }
+  renderUnderlingsTotals(data, anyVisible);
+}
+
+function renderUnderlingsTotals(data, anyVisible) {
+  if (!UnderlingsTotals) return;
+  const totals = data && data.totals;
+  if (!anyVisible || !totals) {
+    UnderlingsTotals.classList.add("hidden");
+    return;
   }
+  UnderlingsTotals.classList.remove("hidden");
+  const showOnly = Number(totals.showOnly ?? 0);
+  const mainPrice = Number(totals.mainPrice ?? 0);
+  const profit =
+    totals.profit !== undefined && totals.profit !== null
+      ? Number(totals.profit)
+      : showOnly - mainPrice;
+  TotalsShowOnly.textContent = formatMoney(showOnly);
+  TotalsMainPrice.textContent = formatMoney(mainPrice);
+  TotalsProfit.textContent = formatSignedMoney(profit);
+  const profitChip = TotalsProfit.closest(".balance-chip");
+  if (profitChip) profitChip.classList.toggle("negative", profit < 0);
 }
 
 UnderlingFrom.addEventListener("change", loadUnderlings);
@@ -1415,6 +1454,26 @@ UnderlingClearBtn.addEventListener("click", () => {
   UnderlingFrom.value = "";
   UnderlingTo.value = "";
   loadUnderlings();
+});
+
+// Open a date input's calendar from anywhere inside the field (not only the
+// small calendar glyph on the right). showPicker() is preferred; when it is
+// unavailable the field is focused so the user can type a date.
+function openDatePicker(input) {
+  if (!input) return;
+  try {
+    if (typeof input.showPicker === "function") input.showPicker();
+    else input.focus();
+  } catch {
+    input.focus();
+  }
+}
+
+// Wire every visible native date input (report + sub-broker filters); the
+// hidden PoliciesDatePicker keeps its own showPicker() wiring.
+document.querySelectorAll('input[type="date"]').forEach((input) => {
+  if (input.classList.contains("date-picker-native")) return;
+  input.addEventListener("click", () => openDatePicker(input));
 });
 
 // --- Per-broker pricing modal ---------------------------------------------

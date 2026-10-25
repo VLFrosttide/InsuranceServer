@@ -186,10 +186,26 @@
                         <label for="UnderlingTo" data-i18n="underlings.to">To</label>
                         <input id="UnderlingTo" type="date" class="date-input" />
                         <button id="UnderlingClearBtn" type="button" class="btn-ghost" data-i18n="policies.date.clear">Clear</button>
-                        <span id="UnderlingsTotalBalance" class="policies-total hidden"></span>
                     </div>
                 </div>
                 <ul id="UnderlingsList" class="underling-list"></ul>
+                <div id="UnderlingsTotals" class="underling-totals hidden">
+                    <div class="underling-totals-head" data-i18n="underlings.totals.title">Totals (incl. own insurances)</div>
+                    <div class="underling-totals-body">
+                        <span class="balance-chip show">
+                            <span class="balance-label" data-i18n="underlings.showOnly">Show-only</span>
+                            <span id="TotalsShowOnly" class="balance-value">—</span>
+                        </span>
+                        <span class="balance-chip main">
+                            <span class="balance-label" data-i18n="underlings.mainPrice">Main price</span>
+                            <span id="TotalsMainPrice" class="balance-value">—</span>
+                        </span>
+                        <span class="balance-chip profit">
+                            <span class="balance-label" data-i18n="underlings.profit">Profit</span>
+                            <span id="TotalsProfit" class="balance-value">—</span>
+                        </span>
+                    </div>
+                </div>
             </div>
         </section>
     </main>
