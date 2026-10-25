@@ -198,13 +198,28 @@ function escapeHtml(s) {
 function toDate(v) {
   if (!v) return null;
   if (v instanceof Date) return v;
-  const s = String(v);
-  // Date-only strings ("YYYY-MM-DD") are parsed as UTC by `new Date`,
-  // which can shift the day in some timezones; parse them as local instead.
-  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  const d = m
-    ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
-    : new Date(s);
+  const s = String(v).trim();
+  // Date-only strings ("YYYY-MM-DD") are parsed as UTC by `new Date`, which
+  // can shift the day in some timezones. DATETIME strings (the client's local
+  // wall-clock, e.g. "YYYY-MM-DD HH:MM:SS", with a space or "T" separator and
+  // an optional trailing timezone) must also be parsed from their explicit
+  // Y/M/D components, otherwise a trailing "Z" or the browser's own timezone
+  // would shift the calendar day. Build the date from the matched components.
+  const m = s.match(
+    /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/
+  );
+  if (m) {
+    const d = new Date(
+      Number(m[1]),
+      Number(m[2]) - 1,
+      Number(m[3]),
+      Number(m[4]) || 0,
+      Number(m[5]) || 0,
+      Number(m[6]) || 0
+    );
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  const d = new Date(s);
   return Number.isNaN(d.getTime()) ? null : d;
 }
 

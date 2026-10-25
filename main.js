@@ -141,6 +141,12 @@ const DB_CONFIG = {
   database: process.env.DB_NAME || "insurancedb",
   port: Number(process.env.DB_PORT) || 5500,
   connectTimeout: 5000,
+  // Return DATE/DATETIME/TIMESTAMP columns as the exact stored strings instead
+  // of JavaScript Date objects. DATETIME values such as insurance.CreationDate
+  // hold the CLIENT's local wall-clock, so re-interpreting them through the
+  // server or browser timezone shifts the calendar day around midnight. Strings
+  // make the client -> DB -> website round-trip lossless.
+  dateStrings: true,
 };
 
 function startGmailPolling() {
