@@ -419,10 +419,10 @@ async function start() {
   initWsServer(httpServer, DBConnection);
 
   try {
-    // Ensure the schema and seed/test data exist BEFORE the pool is verified.
-    // `runSetup` creates the database when it is missing, so running it first
-    // lets a brand-new (deployed) database be created and seeded. It is also
-    // idempotent, so it is safe to call on every start. Any seed failure is
+    // Ensure the schema exists BEFORE the pool is verified. `runSetup` creates
+    // the database when it is missing, so running it first lets a brand-new
+    // (deployed) database be created and its schema brought up to date. It is
+    // also idempotent, so it is safe to call on every start. Any failure is
     // non-fatal here: the code below still attempts the pool connection so the
     // server can report a degraded /health instead of crashing.
     try {
@@ -433,11 +433,11 @@ async function start() {
         database: DB_CONFIG.database,
         port: DB_CONFIG.port,
       });
-      console.log("Database schema and test data are ready.");
-    } catch (seedErr) {
+      console.log("Database schema is ready.");
+    } catch (setupErr) {
       console.warn(
-        "Database auto-seed skipped:",
-        seedErr && seedErr.message ? seedErr.message : seedErr
+        "Database setup skipped:",
+        setupErr && setupErr.message ? setupErr.message : setupErr
       );
     }
 

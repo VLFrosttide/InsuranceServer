@@ -646,6 +646,206 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     }
   });
 
+  // POST /admin/insurances — create an insurance from the admin panel.
+  // Like POST /worker/insurances, but:
+  //   - admin-only (role 1);
+  //   - the creation date can be back-dated (an "older date"), so a policy that
+  //     was actually sold earlier can be entered after the fact. The insurance
+  //     row and its broker-balance movement are both stamped with that date;
+  //   - the broker is chosen explicitly via BrokerId (instead of being resolved
+  //     from an email sender), and that broker's balance is charged. With no
+  //     BrokerId the policy is a normal walk-in (cash or card);
+  //   - no return email / attachments are involved.
+  router.post("/admin/insurances", auth, requireRole(1), async (req, res) => {
+    try {
+      const b = req.body || {};
+      const policyNumber = b.PolicyNumber ?? b.policyNumber ?? "";
+      const blancNumber = b.BlancNumber ?? b.blancNumber ?? "";
+      const carNumber = b.CarNumber ?? b.carNumber ?? "";
+      let price = String(b.Price ?? b.price ?? "");
+      const currencyType = normalizePolicyCurrency(
+        b.CurrencyType ?? b.currencyType ?? ""
+      );
+      const duration = parseDurationDays(b.Duration ?? b.duration ?? 0);
+      const branch = b.Branch ?? b.branch ?? "";
+      const otomobil = b.Otomobil ?? b.otomobil ?? "";
+      const currencyError = validatePolicyCurrency(branch, otomobil, currencyType);
+      if (currencyError) {
+        return res.status(400).json({ error: currencyError });
+      }
+
+      // Optional explicit broker assignment. When set, the policy is paid from
+      // that broker's balance (PaymentType = "Broker"); otherwise it is a
+      // walk-in paid in cash or by card.
+      const brokerIdRaw = b.BrokerId ?? b.brokerId ?? null;
+      let brokerId = null;
+      if (
+        brokerIdRaw !== null &&
+        brokerIdRaw !== undefined &&
+        String(brokerIdRaw).trim() !== ""
+      ) {
+        brokerId = Number(brokerIdRaw);
+        if (!Number.isInteger(brokerId) || brokerId <= 0) {
+          return res
+            .status(400)
+            .json({ error: "BrokerId must be a positive integer or null" });
+        }
+      }
+
+      const requestedPayment = resolvePaymentType(
+        b.Cash ?? b.cash ?? b.PaymentType ?? b.paymentType
+      );
+      const paymentType = brokerId !== null ? "Broker" : requestedPayment;
+
+      // The non-Turk tax (+5, already included in Price) only applies to
+      // walk-ins: a broker-balance policy carrying it is rejected.
+      const nonTurk = toFlag(b.NonTurk ?? b.nonTurk);
+      if (brokerId !== null && nonTurk) {
+        return res.status(400).json({
+          error: "The non-Turk tax only applies to walk-in policies",
+        });
+      }
+      const cardFee = false;
+
+      if (!String(blancNumber).trim()) {
+        return res.status(400).json({ error: "BlancNumber is required" });
+      }
+      if (!String(carNumber).trim()) {
+        return res.status(400).json({ error: "CarNumber is required" });
+      }
+      if (!String(policyNumber).trim()) {
+        return res.status(400).json({ error: "PolicyNumber is required" });
+      }
+
+      // The creation time is the admin's local wall-clock time; it may be an
+      // older date when entering a policy that was sold earlier.
+      const sentCreationDate = b.CreationDate ?? b.creationDate;
+      let creationDate;
+      if (
+        sentCreationDate !== undefined &&
+        sentCreationDate !== null &&
+        sentCreationDate !== ""
+      ) {
+        creationDate = parseClientDateTime(sentCreationDate);
+        if (!creationDate) {
+          return res.status(400).json({
+            error: "CreationDate must be in YYYY-MM-DD HH:MM:SS format",
+          });
+        }
+      } else {
+        creationDate = clientLocalDateTime(b.TzOffset ?? b.tzOffset ?? null);
+      }
+
+      let startDate = b.StartDate ?? b.startDate ?? null;
+      if (startDate === "") startDate = null;
+
+      // Resolve the assigned broker and, when the client did not send a price,
+      // compute it from the broker's tariffs (mirrors email-policy creation,
+      // including the sub-broker main-broker sale price).
+      let brokerName = String(branch);
+      if (brokerId !== null) {
+        const [[broker]] = await DBConnection.query(
+          "SELECT id, Name, ParentBrokerId FROM brokers WHERE id = ?",
+          [brokerId]
+        );
+        if (!broker) {
+          return res.status(404).json({ error: "Broker not found" });
+        }
+        brokerName = broker.Name;
+
+        if (toDecimal(price) === null) {
+          try {
+            await attachSubBrokerStatus(DBConnection, [broker]);
+            const saleEff = await salePricingFor(DBConnection, brokerId);
+            const mainTariffPrice = computePolicyTariffPrice(
+              {
+                Otomobil: otomobil,
+                Duration: duration,
+                NonTurk: 0,
+                CardFee: 0,
+                PaymentType: "Broker",
+              },
+              saleEff.pricing
+            );
+            if (mainTariffPrice !== null) price = String(mainTariffPrice);
+          } catch {
+            // Ignore in minimal test mocks.
+          }
+        }
+      }
+
+      const priceDecimal = toDecimal(price);
+
+      await DBConnection.withTransaction(async (conn) => {
+        await conn.query(
+          `INSERT INTO insurance
+              (Author, CreationDate, PolicyNumber, BlancNumber, CarNumber, Price,
+               CurrencyType, Duration, Broker, Branch, Otomobil, PaymentType,
+               StartDate, BrokerId, NonTurk, CardFee)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            req.user.username,
+            creationDate,
+            policyNumber,
+            blancNumber,
+            String(carNumber).trim(),
+            price,
+            currencyType,
+            duration,
+            brokerName,
+            branch,
+            otomobil,
+            paymentType,
+            startDate,
+            brokerId,
+            nonTurk ? 1 : 0,
+            cardFee ? 1 : 0,
+          ]
+        );
+
+        if (priceDecimal !== null && priceDecimal > 0) {
+          await movePolicyMoney(
+            conn,
+            paymentType,
+            "increase",
+            {
+              branch,
+              username: req.user.username,
+              amount: priceDecimal,
+              reason: blancNumber,
+              currency: currencyType,
+            },
+            creationDate
+          );
+        }
+
+        if (brokerId !== null) {
+          await decreaseBrokerForInsurance(conn, brokerId, price, {
+            reason: blancNumber,
+            author: req.user.username,
+            blancNumber,
+            createdAt: creationDate,
+          });
+        }
+      });
+
+      res.status(201).json({
+        message: "Insurance created",
+        blancNumber,
+        author: req.user.username,
+      });
+    } catch (err) {
+      if (err?.code === "ER_DUP_ENTRY") {
+        return res
+          .status(409)
+          .json({ error: "Insurance with this BlancNumber already exists" });
+      }
+      console.error("Admin insurance create failed:", err);
+      res.status(500).json({ error: "Failed to create insurance" });
+    }
+  });
+
+
   // Admin worker account management: suspend, delete, and promote.
   //
   // - suspend: set users.Status = 'suspended' (blocked immediately by the auth

@@ -1,6 +1,6 @@
 "use strict";
-// Idempotent database setup + seed for InsuranceServer.
-// Creates the schema the server code expects and seeds demo accounts.
+// Idempotent database setup for InsuranceServer.
+// Creates/upgrades the schema the server code expects.
 //
 // Run from the repo root:
 //   node --env-file=.env db/setup.js
@@ -8,17 +8,7 @@
 // Requires .env to contain DB_PASSWORD (MySQL root password).
 
 const mysql = require("mysql2/promise");
-const Bcrypt = require("bcryptjs");
-const { seedBrokersFromInfo } = require("./BrokerInfo.js");
 
-/**
- * Run the idempotent schema creation + test-data seed.
- *
- * @param {{host?: string, port?: number|string, user?: string,
- *          password?: string, database?: string}} [config]
- *   Optional connection overrides. Falls back to env vars / sensible local
- *   defaults so the script still runs standalone (`npm run db:setup`).
- */
 /**
  * One-time split of the old global card balance into per-branch balances
  * (same statements as migrations/009_branch_card_balance.sql). Runs only
@@ -63,59 +53,13 @@ async function seedBranchCardBalances(db) {
 }
 
 /**
- * Seed the demo accounts (admin, worker, client and a broker login linked to
- * the "Ahmed" broker). Idempotent: existing usernames are never overwritten,
- * so real accounts are left untouched.
+ * Run the idempotent schema creation/upgrades (no test-data seeding).
  *
- * @param {import("mysql2/promise").Connection} db
+ * @param {{host?: string, port?: number|string, user?: string,
+ *          password?: string, database?: string}} [config]
+ *   Optional connection overrides. Falls back to env vars / sensible local
+ *   defaults so the script still runs standalone (`npm run db:setup`).
  */
-async function seedDemoAccounts(db) {
-  const demoAccounts = [
-    { username: "admin", password: "AdminPass123", role: 1 },
-    { username: "worker", password: "WorkerPass123", role: 2 },
-    { username: "client", password: "ClientPass123", role: 3 },
-    { username: "broker", password: "BrokerPass123", role: 3, brokerName: "Ahmed" },
-  ];
-
-  let seeded = 0;
-  for (const d of demoAccounts) {
-    const [existing] = await db.query(
-      "SELECT Username FROM users WHERE Username = ?",
-      [d.username]
-    );
-    if (existing.length > 0) continue;
-
-    let brokerId = null;
-    if (d.brokerName) {
-      const [named] = await db.query(
-        "SELECT id FROM brokers WHERE Name = ? ORDER BY id LIMIT 1",
-        [d.brokerName]
-      );
-      if (named.length > 0) {
-        brokerId = named[0].id;
-      } else {
-        const [anyBroker] = await db.query(
-          "SELECT id FROM brokers ORDER BY id LIMIT 1"
-        );
-        if (anyBroker.length > 0) brokerId = anyBroker[0].id;
-      }
-    }
-
-    const hash = await Bcrypt.hash(d.password, 12);
-    await db.query(
-      "INSERT INTO users (Username, Password, Role, Balance, BrokerId) VALUES (?, ?, ?, 0, ?)",
-      [d.username, hash, d.role, brokerId]
-    );
-    seeded++;
-  }
-
-  if (seeded > 0) {
-    console.log(
-      `Seeded ${seeded} demo account(s) (admin, worker, client, broker)`
-    );
-  }
-}
-
 async function runSetup(config = {}) {
   const DB_NAME = config.database || process.env.DB_NAME || "insurancedb";
   const host = config.host || process.env.DB_HOST || "localhost";
@@ -967,18 +911,6 @@ async function runSetup(config = {}) {
     );
     console.log("Added brokers.IsSubBroker column");
   }
-
-  // Seed brokers + their tariffs from BrokerInfo.js. Idempotent: existing
-  // brokers/tariffs are never overwritten.
-  try {
-    await seedBrokersFromInfo(db);
-  } catch (err) {
-    console.warn("Broker seed from BrokerInfo.js failed:", err.message || err);
-  }
-
-  // Seed demo logins (including the broker test account) after brokers exist,
-  // so the broker account can be linked to the "Ahmed" broker.
-  await seedDemoAccounts(db);
 
   // Soft-delete support on the broker balance ledger: a deleted movement is
   // flagged (Deleted/DeletedAt/DeletedBy) and never physically removed, so an
