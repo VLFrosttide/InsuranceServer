@@ -1762,64 +1762,91 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
 
         // Admins (role 1) can change who is at fault and the fee for an
-        // already-annulled insurance. Workers cannot change the fault or fee
+        // already-annulled insurance, and can also un-annul (restore) it so it
+        // stands as a normal policy again. Workers cannot change the fault or fee
         // once the policy has been annulled, and active (non-annulled) policies
         // must be annulled through POST /insurances/:blancNumber/annul first.
         const isAdmin = Number(req.user && req.user.role) === 1;
+        // Annulled arrives as a checkbox: unticking it (false/0) means "remove
+        // the annulment". A truthy value is only meaningful on a policy that is
+        // already annulled, where it is simply a no-op.
+        const rawAnnulled = b.Annulled ?? b.annulled;
+        let unannul = false;
+        if (rawAnnulled !== undefined && rawAnnulled !== null) {
+          if (!toFlag(insurance.Annulled)) {
+            return res
+              .status(400)
+              .json({ error: "Insurance is not annulled" });
+          }
+          if (!toFlag(rawAnnulled)) {
+            if (!isAdmin) {
+              return res.status(403).json({
+                error: "Only admins can restore an annulled insurance",
+              });
+            }
+            unannul = true;
+          }
+        }
         const rawAnnulPayer =
           b.AnnulReason ?? b.annulReason ?? b.payer ?? b.Payer;
         const rawAnnulFee = b.AnnulFee ?? b.annulFee ?? b.fee ?? b.Fee;
         let nextAnnulPayer = null;
         let nextAnnulFee = null;
-        if (rawAnnulPayer !== undefined && rawAnnulPayer !== null) {
-          if (!insurance.Annulled) {
-            return res
-              .status(400)
-              .json({ error: "Insurance is not annulled" });
+        // Un-annulling takes precedence over a fault/fee tweak in the same save:
+        // the form still submits the fault dropdown, but it is irrelevant once
+        // the annulment is being removed.
+        if (!unannul) {
+          if (rawAnnulPayer !== undefined && rawAnnulPayer !== null) {
+            if (!insurance.Annulled) {
+              return res
+                .status(400)
+                .json({ error: "Insurance is not annulled" });
+            }
+            if (!isAdmin) {
+              return res.status(403).json({
+                error: "Only admins can change the fault of an annulled insurance",
+              });
+            }
+            nextAnnulPayer = String(rawAnnulPayer).trim().toLowerCase();
+            if (!ANNUL_PAYERS.includes(nextAnnulPayer)) {
+              return res.status(400).json({
+                error: "payer must be one of 'broker', 'worker' or 'none'",
+              });
+            }
           }
-          if (!isAdmin) {
-            return res.status(403).json({
-              error: "Only admins can change the fault of an annulled insurance",
-            });
-          }
-          nextAnnulPayer = String(rawAnnulPayer).trim().toLowerCase();
-          if (!ANNUL_PAYERS.includes(nextAnnulPayer)) {
-            return res.status(400).json({
-              error: "payer must be one of 'broker', 'worker' or 'none'",
-            });
-          }
-        }
-        if (
-          rawAnnulFee !== undefined &&
-          rawAnnulFee !== null &&
-          rawAnnulFee !== ""
-        ) {
-          if (!insurance.Annulled) {
-            return res
-              .status(400)
-              .json({ error: "Insurance is not annulled" });
-          }
-          if (!isAdmin) {
-            return res.status(403).json({
-              error: "Only admins can change the fee of an annulled insurance",
-            });
-          }
-          nextAnnulFee = toDecimal(rawAnnulFee);
           if (
-            nextAnnulFee === null ||
-            !Number.isFinite(nextAnnulFee) ||
-            nextAnnulFee < 0
+            rawAnnulFee !== undefined &&
+            rawAnnulFee !== null &&
+            rawAnnulFee !== ""
           ) {
-            return res
-              .status(400)
-              .json({ error: "fee must be a non-negative number" });
+            if (!insurance.Annulled) {
+              return res
+                .status(400)
+                .json({ error: "Insurance is not annulled" });
+            }
+            if (!isAdmin) {
+              return res.status(403).json({
+                error: "Only admins can change the fee of an annulled insurance",
+              });
+            }
+            nextAnnulFee = toDecimal(rawAnnulFee);
+            if (
+              nextAnnulFee === null ||
+              !Number.isFinite(nextAnnulFee) ||
+              nextAnnulFee < 0
+            ) {
+              return res
+                .status(400)
+                .json({ error: "fee must be a non-negative number" });
+            }
           }
         }
 
         if (
           sets.length === 0 &&
           nextAnnulPayer === null &&
-          nextAnnulFee === null
+          nextAnnulFee === null &&
+          !unannul
         ) {
           return res.status(400).json({ error: "Nothing to update" });
         }
@@ -1973,6 +2000,45 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           params.push(newFee);
         }
 
+        // Un-annulling reverses the annulment's money effect: the refund the
+        // annulment paid out goes back into the channel the policy was paid
+        // through, and a broker-linked policy is charged again for what the
+        // annulment had returned to it. The kept fee folds back into the price,
+        // so the policy contributes its full price once more.
+        let unannulPlan = null;
+        if (unannul) {
+          const oldPayerRaw = String(insurance.AnnulReason ?? "")
+            .trim()
+            .toLowerCase();
+          const hasStoredFee =
+            insurance.AnnulFee !== undefined &&
+            insurance.AnnulFee !== null &&
+            insurance.AnnulFee !== "";
+          const oldPayer = ANNUL_PAYERS.includes(oldPayerRaw)
+            ? oldPayerRaw
+            : hasStoredFee && (toDecimal(insurance.AnnulFee) || 0) > 0
+            ? "worker"
+            : "none";
+          const oldFee = hasStoredFee
+            ? toDecimal(insurance.AnnulFee) || 0
+            : computeAnnulFee(insurance, new Date(), oldPayer).fee;
+          const refund =
+            Math.max(0, Math.round((oldPrice - oldFee) * 100) / 100);
+          const brokerRefund = oldPayer === "broker" ? refund : oldPrice;
+          unannulPlan = { refund, brokerRefund };
+
+          sets.push("Annulled = ?");
+          params.push(0);
+          sets.push("AnnulReason = ?");
+          params.push(null);
+          sets.push("AnnulFee = ?");
+          params.push(null);
+          sets.push("AnnulDate = ?");
+          params.push(null);
+          sets.push("AnnulBy = ?");
+          params.push(null);
+        }
+
         params.push(blancNumber);
         const moveTime = resolveMoveCreatedAt(req.body);
         if (moveTime.error) {
@@ -2069,6 +2135,37 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                   createdAt: moveTime.createdAt,
                   updateExisting: true,
                   totalRefund: annulFaultChange.newBrokerRefund,
+                }
+              );
+            }
+          }
+
+          if (unannulPlan) {
+            if (unannulPlan.refund > 0) {
+              await movePolicyMoney(
+                conn,
+                effectivePayment(insurance),
+                "increase",
+                {
+                  branch: insurance.Branch,
+                  username: req.user.username,
+                  amount: unannulPlan.refund,
+                  reason: `Restore ${newBlancNumber}`,
+                  currency: insurance.CurrencyType,
+                },
+                moveTime.createdAt
+              );
+            }
+            if (isBrokerLinked(insurance) && unannulPlan.brokerRefund > 0) {
+              await decreaseBrokerForInsurance(
+                conn,
+                insurance.BrokerId,
+                unannulPlan.brokerRefund,
+                {
+                  reason: `Restore ${newBlancNumber}`,
+                  author: req.user.username,
+                  blancNumber: newBlancNumber,
+                  createdAt: moveTime.createdAt,
                 }
               );
             }
