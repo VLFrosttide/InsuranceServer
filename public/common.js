@@ -178,9 +178,9 @@ async function api(path, options = {}) {
 }
 
 function formatMoney(n) {
-  return Number(n || 0).toLocaleString(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+  // Whole numbers only — the site works with full amounts, no decimals.
+  return Math.round(Number(n || 0)).toLocaleString(undefined, {
+    maximumFractionDigits: 0,
   });
 }
 

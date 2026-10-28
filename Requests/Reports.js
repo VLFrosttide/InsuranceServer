@@ -28,6 +28,7 @@ const LESOVO_QUERY = "lesovo";
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 const round2 = (n) => Math.round(n * 100) / 100;
+const round0 = (n) => Math.round(Number(n) || 0);
 
 // Add one day to a "YYYY-MM-DD" string, returning a "YYYY-MM-DD" string.
 function addOneDay(dateStr) {
@@ -143,14 +144,19 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
     }
   });
 
-  // GET /reports/cash-inflow — per-broker cash inflow (positive, ≥ €200).
+  // GET /reports/cash-inflow — per-broker cash-flow summary for a date range.
   //
-  // "Cash inflow" is money actually received from a broker: a positive
-  // "increase" movement on that broker's balance ledger (recorded when an admin
-  // books a payment from the broker). Refunds ("annulment"/"deletion") and
-  // balance corrections ("adjust"/"price_change") are not cash inflow, so they
-  // are excluded. Only brokers whose total inflow in the period is at least
-  // €200 are returned, ordered highest first.
+  // Returns, for every broker with activity in the range (or a balance carried
+  // into it), four whole-number figures:
+  //   totalOwed      — net value of the insurances the broker made in the period
+  //                    (full price while active, the annul fee once annulled,
+  //                    nothing once deleted).
+  //   amount         — cash actually received from the broker ("increase"
+  //                    movements on the balance ledger).
+  //   weeklyBalance  — totalOwed - amount (this cycle only, no leftover).
+  //   leftover       — the balance carried over from previous cycles, expressed
+  //                    as "owed": positive when the broker still owes, negative
+  //                    when they overpaid.
   router.get("/reports/cash-inflow", auth, requireReportRole, async (req, res) => {
     try {
       const fromRaw = req.query.from ? String(req.query.from).trim() : "";
@@ -170,35 +176,93 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
         return res.status(400).json({ error: "from must be on or before to" });
       }
 
-      // Inclusive [from, to] range on the client's local day. Broker balance
-      // movements are stored with the client's local wall-clock time, so this
-      // matches the balance-history endpoint's day boundaries.
+      // Movements are keyed on the client's local wall-clock time; insurances
+      // are keyed on their creation date (matching /reports/payments).
       const fromParam = fromRaw + " 00:00:00";
       const toParam = addOneDay(toRaw) + " 00:00:00";
+      const fromDay = fromRaw;
+      const toDay = addOneDay(toRaw);
 
-      const [rows] = await DBConnection.query(
-        `SELECT m.BrokerId AS brokerId,
-                b.Name AS brokerName,
-                ROUND(SUM(m.Amount), 2) AS amount
-           FROM broker_balance_movements m
-           JOIN brokers b ON b.id = m.BrokerId
-          WHERE m.Type = 'increase'
-            AND m.Amount > 0
-            AND m.Deleted = 0
-            AND m.CreatedAt >= ? AND m.CreatedAt < ?
-          GROUP BY m.BrokerId, b.Name
-         HAVING amount >= 200
-          ORDER BY amount DESC`,
+      // 1) Cash inflow: money received from the broker within the period.
+      const [inflowRows] = await DBConnection.query(
+        `SELECT BrokerId AS brokerId, ROUND(SUM(Amount), 2) AS amount
+           FROM broker_balance_movements
+          WHERE Type = 'increase' AND Amount > 0 AND Deleted = 0
+            AND CreatedAt >= ? AND CreatedAt < ?
+          GROUP BY BrokerId`,
         [fromParam, toParam]
       );
 
-      res.json({
-        brokers: (rows || []).map((r) => ({
+      // 2) Total owed: net value of broker insurances created within the period.
+      const [owedRows] = await DBConnection.query(
+        `SELECT BrokerId AS brokerId,
+                ROUND(SUM(CASE
+                  WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2))
+                  ELSE COALESCE(AnnulFee, 0)
+                END), 2) AS totalOwed
+           FROM insurance
+          WHERE BrokerId IS NOT NULL AND Deleted = 0
+            AND CreationDate >= ? AND CreationDate < ?
+          GROUP BY BrokerId`,
+        [fromDay, toDay]
+      );
+
+      // 3) Leftover: the ledger balance before the period start. The ledger is
+      //    signed (negative = owes), so negate it to express "owed" (positive =
+      //    still owes).
+      const [leftoverRows] = await DBConnection.query(
+        `SELECT BrokerId AS brokerId, ROUND(SUM(Amount), 2) AS balanceBefore
+           FROM broker_balance_movements
+          WHERE Deleted = 0 AND CreatedAt < ?
+          GROUP BY BrokerId`,
+        [fromParam]
+      );
+
+      // Merge the three aggregates per broker.
+      const byId = new Map();
+      const ensure = (id) => {
+        if (!byId.has(id)) {
+          byId.set(id, { brokerId: id, totalOwed: 0, amount: 0, leftover: 0 });
+        }
+        return byId.get(id);
+      };
+      for (const r of inflowRows) ensure(r.brokerId).amount = Number(r.amount) || 0;
+      for (const r of owedRows) ensure(r.brokerId).totalOwed = Number(r.totalOwed) || 0;
+      for (const r of leftoverRows) {
+        ensure(r.brokerId).leftover = -(Number(r.balanceBefore) || 0);
+      }
+
+      // Only brokers with something to show (owed, paid, or carried over).
+      const merged = [...byId.values()].filter(
+        (r) => r.totalOwed !== 0 || r.amount !== 0 || r.leftover !== 0
+      );
+
+      // Resolve broker names.
+      const [nameRows] = await DBConnection.query("SELECT id, Name FROM brokers");
+      const nameById = new Map((nameRows || []).map((b) => [b.id, b.Name]));
+
+      const brokers = merged.map((r) => {
+        const totalOwed = round0(r.totalOwed);
+        const amount = round0(r.amount);
+        const leftover = round0(r.leftover);
+        return {
           brokerId: r.brokerId,
-          brokerName: r.brokerName,
-          amount: round2(Number(r.amount) || 0),
-        })),
+          brokerName: nameById.get(r.brokerId) || null,
+          totalOwed,
+          amount,
+          leftover,
+          weeklyBalance: totalOwed - amount,
+        };
       });
+
+      // Most-indebted first.
+      brokers.sort(
+        (a, b) =>
+          b.leftover + b.weeklyBalance - (a.leftover + a.weeklyBalance) ||
+          b.totalOwed - a.totalOwed
+      );
+
+      res.json({ brokers });
     } catch (err) {
       console.error("Reports cash inflow lookup failed:", err);
       res.status(500).json({ error: "Failed to fetch cash inflow report" });

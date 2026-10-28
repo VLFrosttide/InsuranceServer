@@ -338,7 +338,7 @@ function normalizeCashInflow(data) {
   const rows = [];
   for (const item of list) {
     const name = pickCashInflowName(item);
-    const amount =
+    const cashInflow =
       pickPaymentValue(item, [
         "amount",
         "Amount",
@@ -346,38 +346,144 @@ function normalizeCashInflow(data) {
         "CashInflow",
         "inflow",
         "Inflow",
-        "total",
-        "Total",
+        "paid",
+        "Paid",
         "value",
         "Value",
       ]) ?? 0;
-    // Only positive inflows of at least €200 qualify.
-    if (Number.isFinite(amount) && amount >= 200) {
-      rows.push({
-        name: name || t("report.cashInflow.unknownBroker"),
-        amount,
-      });
-    }
+
+    // Total owed = the sum of every insurance made by this broker within the
+    // requested window. The server reports it under one of several names.
+    const totalOwed =
+      pickPaymentValue(item, [
+        "totalOwed",
+        "TotalOwed",
+        "owed",
+        "Owed",
+        "insuranceTotal",
+        "InsuranceTotal",
+        "insurances",
+        "Insurances",
+        "policiesTotal",
+        "PoliciesTotal",
+        "insuranceSum",
+        "InsuranceSum",
+        "debt",
+        "Debt",
+      ]) ?? 0;
+
+    // Leftover balance carried over from previous cycles (opening balance).
+    const leftover =
+      pickPaymentValue(item, [
+        "leftover",
+        "Leftover",
+        "leftoverBalance",
+        "LeftoverBalance",
+        "previousBalance",
+        "PreviousBalance",
+        "openingBalance",
+        "OpeningBalance",
+        "carriedBalance",
+        "CarriedBalance",
+        "broughtForward",
+        "BroughtForward",
+        "carryOver",
+        "CarryOver",
+      ]) ?? 0;
+
+    // Weekly balance is this cycle only: owed minus inflow, excluding any
+    // leftover carried over from earlier cycles.
+    const weeklyBalance = totalOwed - cashInflow;
+    // Total amount the broker currently owes: what was carried over from
+    // previous cycles plus this cycle's net (owed minus paid).
+    const totalDue = leftover + weeklyBalance;
+
+    // Keep rows that have meaningful data: any owed/leftover amount, or a
+    // cash inflow of at least €200 (the previous inclusion rule).
+    const significant =
+      Math.abs(totalOwed) >= 1 || Math.abs(leftover) >= 1 || cashInflow >= 200;
+    if (!significant) continue;
+
+    rows.push({
+      name: name || t("report.cashInflow.unknownBroker"),
+      cashInflow,
+      totalOwed,
+      weeklyBalance,
+      leftover,
+      totalDue,
+    });
   }
-  rows.sort((a, b) => b.amount - a.amount);
+
+  // Most-indebted brokers first.
+  rows.sort((a, b) => b.totalDue - a.totalDue || b.totalOwed - a.totalOwed);
   return rows;
 }
 
-// Build a single cash-inflow card. `isTotal` marks the combined sum card.
-function buildCashInflowCard(name, amount, isTotal) {
+// Interpolate a heat colour from green (lowest owed) to red (highest owed).
+function owedHeat(value, min, max) {
+  const t = max === min ? 0.5 : (value - min) / (max - min);
+  const hue = Math.round(140 * (1 - t)); // 140 (green) -> 0 (red)
+  return {
+    color: "hsl(" + hue + ", 70%, 45%)",
+    tint: "hsla(" + hue + ", 70%, 45%, 0.16)",
+  };
+}
+
+// Build a single cash-inflow card. `isTotal` marks the all-brokers sum card.
+function buildCashInflowCard(row, isTotal, heat) {
   const card = document.createElement("div");
   card.className = "cashinflow-card" + (isTotal ? " cashinflow-total" : "");
 
   const nameEl = document.createElement("span");
   nameEl.className = "cashinflow-name";
-  nameEl.textContent = name;
+  nameEl.textContent = row.name;
 
-  const amountEl = document.createElement("span");
-  amountEl.className = "cashinflow-amount";
-  amountEl.textContent = formatMoney(amount);
+  const stats = document.createElement("div");
+  stats.className = "cashinflow-stats";
+
+  const addStat = (label, value, cls, color) => {
+    const item = document.createElement("div");
+    item.className = "cashinflow-stat";
+
+    const labelEl = document.createElement("span");
+    labelEl.className = "cashinflow-stat-label";
+    labelEl.textContent = label;
+
+    const valueEl = document.createElement("span");
+    valueEl.className = "cashinflow-stat-value" + (cls ? " " + cls : "");
+    valueEl.textContent = formatMoney(value);
+    if (color) valueEl.style.color = color;
+
+    item.appendChild(labelEl);
+    item.appendChild(valueEl);
+    stats.appendChild(item);
+  };
+
+  addStat(
+    t("report.cashInflow.totalOwed"),
+    row.totalOwed,
+    "",
+    isTotal ? "var(--accent)" : heat.color
+  );
+  addStat(t("report.cashInflow.cashInflow"), row.cashInflow, "cashinflow-inflow", "");
+  addStat(
+    t("report.cashInflow.weeklyBalance"),
+    row.weeklyBalance,
+    row.weeklyBalance > 0 ? "cashinflow-weekly-pos" : "cashinflow-weekly-neg",
+    ""
+  );
+  addStat(t("report.cashInflow.leftover"), row.leftover, "cashinflow-leftover", "");
 
   card.appendChild(nameEl);
-  card.appendChild(amountEl);
+  card.appendChild(stats);
+
+  // Colour-code the card itself by how much this broker owes.
+  if (!isTotal && heat) {
+    card.style.borderLeftColor = heat.color;
+    card.style.background =
+      "linear-gradient(90deg, " + heat.tint + ", transparent 55%)";
+  }
+
   return card;
 }
 
@@ -428,14 +534,39 @@ async function loadCashInflow() {
     return;
   }
 
-  // One combined card summing every broker inflow into a single total.
-  const total = rows.reduce((sum, row) => sum + row.amount, 0);
-  CashInflowGrid.appendChild(
-    buildCashInflowCard(t("report.cashInflow.total"), total, true)
+  // Heat range across brokers so the gradient always spans least -> most owed.
+  let minOwed = Infinity;
+  let maxOwed = -Infinity;
+  for (const row of rows) {
+    if (row.totalDue < minOwed) minOwed = row.totalDue;
+    if (row.totalDue > maxOwed) maxOwed = row.totalDue;
+  }
+  if (!Number.isFinite(minOwed)) minOwed = 0;
+  if (!Number.isFinite(maxOwed)) maxOwed = 0;
+
+  // One combined card summing every broker into an all-brokers total.
+  const totals = rows.reduce(
+    (acc, row) => {
+      acc.totalOwed += row.totalOwed;
+      acc.cashInflow += row.cashInflow;
+      acc.weeklyBalance += row.weeklyBalance;
+      acc.leftover += row.leftover;
+      return acc;
+    },
+    {
+      name: t("report.cashInflow.allBrokers"),
+      totalOwed: 0,
+      cashInflow: 0,
+      weeklyBalance: 0,
+      leftover: 0,
+    }
   );
+  CashInflowGrid.appendChild(buildCashInflowCard(totals, true, null));
 
   for (const row of rows) {
-    CashInflowGrid.appendChild(buildCashInflowCard(row.name, row.amount, false));
+    CashInflowGrid.appendChild(
+      buildCashInflowCard(row, false, owedHeat(row.totalDue, minOwed, maxOwed))
+    );
   }
 }
 
@@ -714,8 +845,8 @@ function buildPoliciesExcel(policies, hidePricing) {
         textCell(policyDuration(p));
       if (!hidePricing) {
         cells +=
-          '<td style=\'mso-number-format:"0.00";\'>' +
-          Number(p.Price || 0) +
+          '<td style=\'mso-number-format:"0";\'>' +
+          Math.round(Number(p.Price || 0)) +
           "</td>" +
           textCell(p.CurrencyType);
       }
@@ -738,7 +869,7 @@ function buildPoliciesExcel(policies, hidePricing) {
     totalHtml =
       "<tr style='font-weight:bold;'>" +
       '<td colspan="4">' + escapeHtml(t("policies.totalSum")) + "</td>" +
-      '<td style=\'mso-number-format:"0.00";\'>' + total + "</td>" +
+      '<td style=\'mso-number-format:"0";\'>' + Math.round(total) + "</td>" +
       "<td></td><td></td><td></td>" +
       "</tr>";
   }
@@ -1519,12 +1650,12 @@ function renderPricingGrid() {
       const input = document.createElement("input");
       input.type = "number";
       input.min = "0";
-      input.step = "0.01";
+      input.step = "1";
       input.className = "pricing-input";
       input.dataset.type = typeName;
       input.dataset.duration = String(d);
       const val = pricing[typeName] && pricing[typeName][String(d)];
-      if (val !== undefined && val !== null && val !== "") input.value = val;
+      if (val !== undefined && val !== null && val !== "") input.value = Math.round(Number(val));
       td.appendChild(input);
       tr.appendChild(td);
     }
