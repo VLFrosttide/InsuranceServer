@@ -730,6 +730,7 @@ async function runSetup(config = {}) {
      CREATE TABLE IF NOT EXISTS brokers (
        id INT NOT NULL AUTO_INCREMENT,
        Name VARCHAR(100) NOT NULL,
+       Code VARCHAR(50) NULL,
        CashBalance DECIMAL(15,2) NOT NULL DEFAULT 0,
        CutOff TINYINT(1) NOT NULL DEFAULT 0,
        IsSubBroker TINYINT(1) NOT NULL DEFAULT 0,
@@ -910,6 +911,25 @@ async function runSetup(config = {}) {
       "ALTER TABLE brokers ADD COLUMN IsSubBroker TINYINT(1) NOT NULL DEFAULT 0"
     );
     console.log("Added brokers.IsSubBroker column");
+  }
+
+  // Human-readable broker ID (e.g. "4.2") shown in the client and in Excel
+  // exports. Backfilled from BrokerInfo.BrokerCodes below.
+  if (!brokerColNames.has("Code")) {
+    await db.query("ALTER TABLE brokers ADD COLUMN Code VARCHAR(50) NULL");
+    console.log("Added brokers.Code column");
+  }
+
+  // Backfill the broker IDs for the brokers listed in BrokerInfo.BrokerCodes.
+  // Only fills missing/empty codes, so an ID entered by an admin is kept.
+  {
+    const { BrokerCodes } = require("./BrokerInfo.js");
+    for (const [name, code] of Object.entries(BrokerCodes)) {
+      await db.query(
+        "UPDATE brokers SET Code = ? WHERE Name = ? AND (Code IS NULL OR Code = '')",
+        [code, name]
+      );
+    }
   }
 
   // Soft-delete support on the broker balance ledger: a deleted movement is

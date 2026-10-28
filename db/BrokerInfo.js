@@ -841,6 +841,48 @@ const BrokerData = {
   KapAndreevo: [],
 };
 
+// Human-readable broker IDs (e.g. "4.2") shown in the client and in Excel
+// exports. Keyed by the broker's Name (the BrokerData key), so the same map
+// seeds new brokers and backfills existing ones.
+const BrokerCodes = {
+  Ahmed: "1.2",
+  Yuksel: "1.3",
+  Burhan: "1.5",
+  Zeytinburnu: "1.6",
+  MecnunBursa: "1.7",
+  Kamuran: "1.9",
+  Beysim: "1.11",
+  Gursel: "1.12",
+  Nevin: "1.13",
+  Izet: "1.14",
+  Nejat: "1.15",
+  AhmetSemsek: "1.16",
+  Sunay: "1.17",
+  Erol: "1.18",
+  Mustafa: "1.19",
+  Semat: "1.21",
+  Azzis: "1.22",
+  Sabit: "1.23",
+  Huseyin: "1.25",
+  BalkanTravel: "1.26",
+  Kadri: "1.27",
+  Ayshe: "1.28",
+  Ismayl: "1.29",
+  ErcanSever: "2.21",
+  NecmiErdan: "2.23",
+  RidwanOzturk: "2.24",
+  SengunKale: "2.26",
+  Kocaeli: "3.2",
+  SigortaBulgoc: "3.4",
+  Svilengrad: "3.5",
+  Yakup: "3.9",
+  Sevgin: "4.1",
+  Barutcu: "4.3",
+  Varna: "3.6",
+  Lesovo: "4.2",
+  KapAndreevo: "2.1",
+};
+
 /**
  * Seed the tariffs of one broker from the EuroPricing table above, but only when
  * the database holds no tariffs for that broker yet (never overwrites data).
@@ -991,16 +1033,16 @@ async function seedBrokersFromInfo(db) {
     try {
       [result] = await db.query(
         `INSERT INTO brokers
-           (Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies, IsSubBroker)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [brokerName, 0, 0, 0, 0, isSub]
+           (Name, Code, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies, IsSubBroker)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [brokerName, BrokerCodes[brokerName] || null, 0, 0, 0, 0, isSub]
       );
     } catch {
       [result] = await db.query(
         `INSERT INTO brokers
-           (Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
-         VALUES (?, ?, ?, ?, ?)`,
-        [brokerName, 0, 0, 0, 0]
+           (Name, Code, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [brokerName, BrokerCodes[brokerName] || null, 0, 0, 0, 0]
       );
     }
 
@@ -1064,6 +1106,7 @@ module.exports = {
   EuroPricing,
   TryPricing,
   BrokerData,
+  BrokerCodes,
   SubBrokers,
   isSubBrokerName,
   seedBrokersFromInfo,

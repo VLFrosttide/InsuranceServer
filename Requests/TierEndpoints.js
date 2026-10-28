@@ -1561,6 +1561,31 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         params
       );
 
+      // Attach each broker's human-readable ID (e.g. "4.2") so the client can
+      // show it in the table and in the Excel export. Walk-in policies have no
+      // BrokerId and therefore no broker code.
+      const brokerIds = Array.from(
+        new Set(
+          rows
+            .map((r) => Number(r.BrokerId))
+            .filter((id) => Number.isFinite(id) && id > 0)
+        )
+      );
+      if (brokerIds.length > 0) {
+        const [brokerRows] = await DBConnection.query(
+          `SELECT id, Code FROM brokers WHERE id IN (${brokerIds
+            .map(() => "?")
+            .join(", ")})`,
+          brokerIds
+        );
+        const codeById = new Map(
+          brokerRows.map((b) => [Number(b.id), b.Code || ""])
+        );
+        for (const row of rows) {
+          row.BrokerCode = codeById.get(Number(row.BrokerId)) || "";
+        }
+      }
+
       // Broker filtering runs here (not in SQL) so the name match can be
       // script-insensitive: a Latin query such as "Lesovo" still finds the
       // walk-in policies whose Broker column holds the Cyrillic branch name.

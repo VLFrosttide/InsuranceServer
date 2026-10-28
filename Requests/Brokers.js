@@ -1174,7 +1174,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
   // InactivePolicies / PolicyRange* are no longer selected: inactive blancs
   // are calculated from the blanc batches (see applyBlancSummary).
-  const BROKER_COLUMNS = "id, Name, CashBalance, ParentBrokerId, CutOff";
+  const BROKER_COLUMNS = "id, Name, Code, CashBalance, ParentBrokerId, CutOff";
 
   // The batches table is created on first use (and by db/setup.js), so the
   // server also works on a database that has not been set up again yet.
@@ -1755,6 +1755,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         const header = [
           "id",
           "Name",
+          "Code",
           "CashBalance",
           "BlancBatches",
           "BlancTotal",
@@ -1770,6 +1771,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             [
               b.id,
               esc(b.Name),
+              esc(b.Code),
               b.CashBalance,
               esc(
                 b.batches
@@ -2906,6 +2908,10 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         return res.status(400).json({ error: "Name is required" });
       }
 
+      // Optional human-readable broker ID (e.g. "4.2"); empty becomes NULL.
+      const code =
+        String(req.body?.Code ?? req.body?.code ?? "").trim() || null;
+
       const toNumber = (v) => {
         if (v === undefined || v === null || v === "") return null;
         const n = Number(v);
@@ -2952,9 +2958,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           // are calculated from broker_blanc_batches.
           const [result] = await conn.query(
             `INSERT INTO brokers
-               (Name, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies, ParentBrokerId)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [name, cashBalance, 0, 0, 0, parentBrokerId]
+               (Name, Code, CashBalance, PolicyRangeStart, PolicyRangeEnd, InactivePolicies, ParentBrokerId)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [name, code, cashBalance, 0, 0, 0, parentBrokerId]
           );
           const id = result.insertId;
           await insertBatches(conn, id, batches, req.user?.username);
@@ -3016,24 +3022,32 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       // is calculated from them, so neither can be set here.
       const fieldMap = [
         ["Name", b.Name ?? b.name],
+        ["Code", b.Code ?? b.code],
         ["CashBalance", b.CashBalance ?? b.cashBalance],
       ];
 
       for (const [column, value] of fieldMap) {
-        if (value !== undefined && value !== null) {
-          const v = column === "Name" ? String(value).trim() : Number(value);
-          if (column === "Name" && !v) {
-            return res.status(400).json({ error: "Name cannot be empty" });
-          }
-          if (column !== "Name" && !Number.isFinite(v)) {
+        if (value === undefined || value === null) continue;
+        let v;
+        if (column === "CashBalance") {
+          v = Number(value);
+          if (!Number.isFinite(v)) {
             return res
               .status(400)
-              .json({ error: `${column} must be a number` });
+              .json({ error: "CashBalance must be a number" });
           }
-          sets.push(`${column} = ?`);
-          params.push(v);
-          if (column === "CashBalance") newCashBalance = v;
+          newCashBalance = v;
+        } else if (column === "Name") {
+          v = String(value).trim();
+          if (!v) {
+            return res.status(400).json({ error: "Name cannot be empty" });
+          }
+        } else {
+          // Code is a nullable string: an empty value clears the broker ID.
+          v = String(value).trim() || null;
         }
+        sets.push(`${column} = ?`);
+        params.push(v);
       }
 
       // Parent (main) broker mapping. Undefined = unchanged; null = clear the
