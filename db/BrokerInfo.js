@@ -1107,6 +1107,7 @@ module.exports = {
   TryPricing,
   BrokerData,
   BrokerCodes,
+  BranchPricingKeys,
   SubBrokers,
   isSubBrokerName,
   seedBrokersFromInfo,

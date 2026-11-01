@@ -12,6 +12,7 @@ const { createCurrentCashRouter } = require("./Requests/CurrentCash.js");
 const { createCardPaymentsRouter } = require("./Requests/CardPayments.js");
 const { createBrokerRouter } = require("./Requests/Brokers.js");
 const { createTariffsRouter } = require("./Requests/Tariffs.js");
+const { createBranchesRouter } = require("./Requests/Branches.js");
 const { createReportsRouter } = require("./Requests/Reports.js");
 const { createTestRouter } = require("./Requests/Test.js");
 const { initWsServer } = require("./Users/websocket.js");
@@ -299,6 +300,7 @@ async function start() {
   app.use(createCardPaymentsRouter(DBConnection));
   app.use(createBrokerRouter(DBConnection));
   app.use(createTariffsRouter(DBConnection));
+  app.use(createBranchesRouter(DBConnection));
   app.use(createReportsRouter(DBConnection));
   app.use(createTestRouter(DBConnection));
 

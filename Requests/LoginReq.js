@@ -2,6 +2,7 @@
 const express = require("express");
 const Bcrypt = require("bcryptjs");
 const Crypto = require("crypto");
+const { isBranchEnabled } = require("../db/branches.js");
 
 const ROLE_PAGES = {
   1: "/admin",
@@ -74,6 +75,15 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
         return sendLoginResponse(res, 401, {
           error: "Invalid username or password",
         });
+      }
+
+      // A disabled branch must not be used to log in. The branch is optional on
+      // the login payload (the worker client sends it when a branch is selected);
+      // empty/unknown branches are allowed for backward compatibility.
+      const loginBranch =
+        typeof req.body["branch"] === "string" ? req.body["branch"].trim() : "";
+      if (loginBranch && !(await isBranchEnabled(DBConnection, loginBranch))) {
+        return sendLoginResponse(res, 403, { error: "Branch is disabled" });
       }
 
       const GeneratedToken = Crypto.randomBytes(32).toString("hex");

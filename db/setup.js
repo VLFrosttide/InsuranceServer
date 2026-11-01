@@ -787,6 +787,32 @@ async function runSetup(config = {}) {
      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
    `);
 
+  // Managed branch registry. Admins enable/disable branches and create new ones
+  // from the dashboard. A disabled branch blocks employee login and blocks the
+  // creation of new insurances through it (enforced in the request handlers).
+  await db.query(`
+     CREATE TABLE IF NOT EXISTS branches (
+       id INT NOT NULL AUTO_INCREMENT,
+       Name VARCHAR(100) NOT NULL,
+       Enabled TINYINT(1) NOT NULL DEFAULT 1,
+       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       PRIMARY KEY (id),
+       UNIQUE KEY uq_branches_name (Name)
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+   `);
+
+  // Seed the branches the system already knows about. New branches are created
+  // by admins through POST /admin/branches. INSERT IGNORE keeps this idempotent.
+  {
+    const { BranchPricingKeys } = require("./BrokerInfo.js");
+    for (const branchName of Object.keys(BranchPricingKeys)) {
+      await db.query(
+        "INSERT IGNORE INTO branches (Name, Enabled) VALUES (?, 1)",
+        [branchName]
+      );
+    }
+  }
+
   // branch_tariffs now stores a Currency (EUR/TRY) so the Lesovo / Kap
   // Andreevo crossings can quote Auto policies in Turkish lira separately
   // from their EUR walk-in rates. Re-key the unique index for older DBs.

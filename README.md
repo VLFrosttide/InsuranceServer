@@ -212,6 +212,23 @@ Email addresses attached to a broker (one broker → many emails).
 
 Use case: stores the multiple contact emails of each broker.
 
+### `branches`
+
+Managed branch registry. Admins can enable/disable a branch and create new
+ones from the dashboard.
+
+| Column      | Type           | Notes                                          |
+| ----------- | -------------- | ---------------------------------------------- |
+| `id`        | `INT`          | Auto-increment PK                              |
+| `Name`      | `VARCHAR(100)` | Unique branch name                             |
+| `Enabled`   | `TINYINT(1)`   | `1` = on, `0` = off                            |
+| `CreatedAt` | `DATETIME`     | Creation time                                  |
+
+Use case: turning a branch off forbids employees from logging in through that
+branch and blocks the creation of new insurances through it. Every broker is
+now serviced by every available branch (email cards are no longer restricted by
+branch).
+
 ## Run the server
 
 ```bash
@@ -332,6 +349,18 @@ Admin-only (`role 1`) broker management:
 - `DELETE /brokers/:id` — delete a broker (detaches any linked insurances)
 
 Each created insurance whose email sender is associated with a broker charges that broker a flat fee: the broker balance is reduced by the full Price (it may go infinitely negative, and this never touches current cash) and the broker InactivePolicies is decremented by 1.
+
+## Branches
+
+Branches are managed from the admin dashboard's Branches tab. A disabled branch
+blocks employee login and blocks the creation of new insurances through it.
+
+- `GET /branches` — public list of enabled branches (for login branch pickers)
+- Admin (`role 1`):
+  - `GET /admin/branches` — list every branch (with `Enabled` state)
+  - `POST /admin/branches` — create a branch (`{ "name": "..." }`)
+  - `PATCH /admin/branches/:id` — enable/disable and/or rename a branch
+    (`{ "enabled": true }` or `{ "name": "..." }`)
 
 ## WebSocket
 

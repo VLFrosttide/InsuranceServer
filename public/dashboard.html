@@ -18,6 +18,7 @@
             <span id="UserName" class="username"></span>
             <button id="SettingsBtn" class="btn-ghost" data-i18n="settings.button">Settings</button>
             <button id="RegistrationsBtn" class="btn-ghost hidden" data-i18n="admin.pending.button">Registrations</button>
+            <button id="BranchesBtn" class="btn-ghost hidden" data-i18n="admin.branches.button">Branches</button>
             <button id="LogoutBtn" class="btn-ghost" data-i18n="logout">Logout</button>
         </div>
     </header>
@@ -258,6 +259,24 @@
             <div class="modal-body">
                 <ul id="PendingList" class="pending-list"></ul>
                 <p id="PendingMsg" class="msg" role="alert" aria-live="polite"></p>
+            </div>
+        </div>
+    </div>
+
+    <div id="BranchesOverlay" class="overlay hidden">
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="BranchesTitle">
+            <div class="modal-head">
+                <h2 id="BranchesTitle" data-i18n="admin.branches.title">Branches</h2>
+                <button id="BranchesCloseBtn" class="btn-ghost" type="button" data-i18n="close">Close</button>
+            </div>
+            <div class="modal-body">
+                <p class="settings-hint" data-i18n="admin.branches.hint">Turn branches on or off. Employees cannot log in through a disabled branch and no new insurances can be created through it.</p>
+                <ul id="BranchList" class="branch-list"></ul>
+                <div class="email-add">
+                    <input id="NewBranchInput" type="text" data-i18n-placeholder="admin.branches.placeholder" placeholder="New branch name" />
+                    <button id="CreateBranchBtn" type="button" class="btn-ghost" data-i18n="admin.branches.create">Create</button>
+                </div>
+                <p id="BranchMsg" class="msg" role="alert" aria-live="polite"></p>
             </div>
         </div>
     </div>

@@ -1,6 +1,7 @@
 const { WebSocketServer, WebSocket } = require("ws");
 const mailStore = require("../Mail/mailStore.js");
 const { canSeeEmail, extractAddress } = require("../Mail/branchRouting.js");
+const { isBranchEnabled } = require("../db/branches.js");
 
 function checkCutOffSender(from) {
   const { isCutOffBrokerSender } = require("../Mail/brokerSenders.js");
@@ -454,11 +455,21 @@ async function handleMessage(ws, data) {
 
       if (rows && rows.length > 0) {
         const username = rows[0].Username;
+        const branch = typeof msg.branch === "string" ? msg.branch : "";
+
+        // A disabled branch must not be used to log in. Workers select a branch
+        // at login, so refuse the socket auth when that branch has been turned
+        // off by an admin. Empty/unknown branches stay allowed for compatibility.
+        if (branch && !(await isBranchEnabled(db, branch))) {
+          safeSend(ws, { type: "auth_error", error: "Branch is disabled" });
+          return;
+        }
+
         ws.username = username;
         ws.role = rows[0].Role;
         // Branch the worker selected at login; used to restrict which
         // brokers' emails this worker may see.
-        ws.branch = typeof msg.branch === "string" ? msg.branch : "";
+        ws.branch = branch;
         // Register the worker on the presence board (unless they are already
         // online from a connection still within its offline grace period).
         if (String(ws.role) === PRESENCE_ROLE) {

@@ -352,9 +352,9 @@ function normalizeCashInflow(data) {
         "Value",
       ]) ?? 0;
 
-    // Total owed = the sum of every insurance made by this broker within the
-    // requested window. The server reports it under one of several names.
-    const totalOwed =
+    // Owed for the period = the sum of every insurance made by this broker
+    // within the requested window. The server reports it under several names.
+    const owedForPeriod =
       pickPaymentValue(item, [
         "totalOwed",
         "TotalOwed",
@@ -372,8 +372,9 @@ function normalizeCashInflow(data) {
         "Debt",
       ]) ?? 0;
 
-    // Leftover balance carried over from previous cycles (opening balance).
-    const leftover =
+    // Broker balance right before the period's payment — a signed balance where
+    // a negative value means the broker owes money.
+    const previousBalance =
       pickPaymentValue(item, [
         "leftover",
         "Leftover",
@@ -391,38 +392,39 @@ function normalizeCashInflow(data) {
         "CarryOver",
       ]) ?? 0;
 
-    // Weekly balance is this cycle only: owed minus inflow, excluding any
-    // leftover carried over from earlier cycles.
-    const weeklyBalance = totalOwed - cashInflow;
-    // Total amount the broker currently owes: what was carried over from
-    // previous cycles plus this cycle's net (owed minus paid).
-    const totalDue = leftover + weeklyBalance;
+    // Weekly balance is this cycle only: inflow minus owed, excluding any
+    // balance carried over from earlier cycles.
+    const weeklyBalance = cashInflow - owedForPeriod;
 
-    // Keep rows that have meaningful data: any owed/leftover amount, or a
+    // Leftover balance = the broker balance right before payment, adjusted by
+    // this period's insurances (owed) and payments (inflow). A payment reduces
+    // what the broker owes, so a balance of -100 plus a 50 payment leaves -50.
+    const leftoverBalance = previousBalance + cashInflow - owedForPeriod;
+
+    // Keep rows that have meaningful data: any owed/balance amount, or a
     // cash inflow of at least €200 (the previous inclusion rule).
     const significant =
-      Math.abs(totalOwed) >= 1 || Math.abs(leftover) >= 1 || cashInflow >= 200;
+      Math.abs(owedForPeriod) >= 1 || Math.abs(previousBalance) >= 1 || cashInflow >= 200;
     if (!significant) continue;
 
     rows.push({
       name: name || t("report.cashInflow.unknownBroker"),
       cashInflow,
-      totalOwed,
+      owedForPeriod,
       weeklyBalance,
-      leftover,
-      totalDue,
+      previousBalance,
+      leftoverBalance,
     });
   }
 
-  // Most-indebted brokers first.
-  rows.sort((a, b) => b.totalDue - a.totalDue || b.totalOwed - a.totalOwed);
   return rows;
 }
 
-// Interpolate a heat colour from green (lowest owed) to red (highest owed).
-function owedHeat(value, min, max) {
+// Interpolate a heat colour for a weekly balance: red for the most negative
+// (brokers who owe the most this period) through to green for the most positive.
+function weeklyHeat(value, min, max) {
   const t = max === min ? 0.5 : (value - min) / (max - min);
-  const hue = Math.round(140 * (1 - t)); // 140 (green) -> 0 (red)
+  const hue = Math.round(140 * t); // min -> 0 (red), max -> 140 (green)
   return {
     color: "hsl(" + hue + ", 70%, 45%)",
     tint: "hsla(" + hue + ", 70%, 45%, 0.16)",
@@ -430,7 +432,9 @@ function owedHeat(value, min, max) {
 }
 
 // Build a single cash-inflow card. `isTotal` marks the all-brokers sum card.
-function buildCashInflowCard(row, isTotal, heat) {
+// When `isTotal` is true the four stats become sort controls for the table;
+// `sortKey` highlights the active one and `onSort` is called on click.
+function buildCashInflowCard(row, isTotal, heat, sortKey, sortDir, onSort) {
   const card = document.createElement("div");
   card.className = "cashinflow-card" + (isTotal ? " cashinflow-total" : "");
 
@@ -441,13 +445,29 @@ function buildCashInflowCard(row, isTotal, heat) {
   const stats = document.createElement("div");
   stats.className = "cashinflow-stats";
 
-  const addStat = (label, value, cls, color) => {
+  const addStat = (key, label, value, cls, color) => {
     const item = document.createElement("div");
     item.className = "cashinflow-stat";
 
+    if (isTotal) {
+      item.classList.add("cashinflow-stat-sort");
+      item.setAttribute("role", "button");
+      item.setAttribute("tabindex", "0");
+      if (key === sortKey) item.classList.add("active");
+      const activate = () => onSort && onSort(key);
+      item.addEventListener("click", activate);
+      item.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          activate();
+        }
+      });
+    }
+
     const labelEl = document.createElement("span");
     labelEl.className = "cashinflow-stat-label";
-    labelEl.textContent = label;
+    labelEl.textContent =
+      isTotal && key === sortKey ? label + (sortDir === 1 ? " ↑" : " ↓") : label;
 
     const valueEl = document.createElement("span");
     valueEl.className = "cashinflow-stat-value" + (cls ? " " + cls : "");
@@ -460,24 +480,38 @@ function buildCashInflowCard(row, isTotal, heat) {
   };
 
   addStat(
+    "owedForPeriod",
     t("report.cashInflow.totalOwed"),
-    row.totalOwed,
+    row.owedForPeriod,
     "",
-    isTotal ? "var(--accent)" : heat.color
+    isTotal ? "var(--accent)" : ""
   );
-  addStat(t("report.cashInflow.cashInflow"), row.cashInflow, "cashinflow-inflow", "");
   addStat(
+    "cashInflow",
+    t("report.cashInflow.cashInflow"),
+    row.cashInflow,
+    "cashinflow-inflow",
+    ""
+  );
+  addStat(
+    "weeklyBalance",
     t("report.cashInflow.weeklyBalance"),
     row.weeklyBalance,
     row.weeklyBalance > 0 ? "cashinflow-weekly-pos" : "cashinflow-weekly-neg",
     ""
   );
-  addStat(t("report.cashInflow.leftover"), row.leftover, "cashinflow-leftover", "");
+  addStat(
+    "leftoverBalance",
+    t("report.cashInflow.leftover"),
+    row.leftoverBalance,
+    "cashinflow-leftover",
+    ""
+  );
 
   card.appendChild(nameEl);
   card.appendChild(stats);
 
-  // Colour-code the card itself by how much this broker owes.
+  // Colour-code the card itself by this broker's weekly balance.
   if (!isTotal && heat) {
     card.style.borderLeftColor = heat.color;
     card.style.background =
@@ -485,6 +519,85 @@ function buildCashInflowCard(row, isTotal, heat) {
   }
 
   return card;
+}
+
+// Current sort key for the cash-inflow table. Defaults to the weekly balance.
+let cashInflowSortKey = "weeklyBalance";
+// Sort direction: -1 = highest first (descending), 1 = lowest first (ascending).
+let cashInflowSortDir = -1;
+
+function renderCashInflow(rows) {
+  // Sort a copy by the selected value, falling back to the weekly balance then
+  // the amount owed for the period for stable ordering. `cashInflowSortDir`
+  // flips between highest first (-1) and lowest first (1).
+  const sorted = rows.slice().sort((a, b) => {
+    return (
+      (Number(b[cashInflowSortKey]) - Number(a[cashInflowSortKey]) ||
+        Number(b.weeklyBalance) - Number(a.weeklyBalance) ||
+        Number(b.owedForPeriod) - Number(a.owedForPeriod)) *
+      cashInflowSortDir
+    );
+  });
+
+  // Heat range across brokers so the gradient always spans the full weekly
+  // balance spread: red for the most negative, green for the most positive.
+  let minWeekly = Infinity;
+  let maxWeekly = -Infinity;
+  for (const row of rows) {
+    if (row.weeklyBalance < minWeekly) minWeekly = row.weeklyBalance;
+    if (row.weeklyBalance > maxWeekly) maxWeekly = row.weeklyBalance;
+  }
+  if (!Number.isFinite(minWeekly)) minWeekly = 0;
+  if (!Number.isFinite(maxWeekly)) maxWeekly = 0;
+
+  // One combined card summing every broker into an all-brokers total. Its four
+  // stats are the clickable sort controls.
+  const totals = rows.reduce(
+    (acc, row) => {
+      acc.owedForPeriod += row.owedForPeriod;
+      acc.cashInflow += row.cashInflow;
+      acc.weeklyBalance += row.weeklyBalance;
+      acc.leftoverBalance += row.leftoverBalance;
+      return acc;
+    },
+    {
+      name: t("report.cashInflow.allBrokers"),
+      owedForPeriod: 0,
+      cashInflow: 0,
+      weeklyBalance: 0,
+      leftoverBalance: 0,
+    }
+  );
+
+  CashInflowGrid.innerHTML = "";
+  CashInflowGrid.appendChild(
+    buildCashInflowCard(
+      totals,
+      true,
+      null,
+      cashInflowSortKey,
+      cashInflowSortDir,
+      (key) => {
+        if (cashInflowSortKey === key) {
+          cashInflowSortDir *= -1;
+        } else {
+          cashInflowSortKey = key;
+          cashInflowSortDir = -1;
+        }
+        renderCashInflow(rows);
+      }
+    )
+  );
+
+  for (const row of sorted) {
+    CashInflowGrid.appendChild(
+      buildCashInflowCard(
+        row,
+        false,
+        weeklyHeat(row.weeklyBalance, minWeekly, maxWeekly)
+      )
+    );
+  }
 }
 
 async function loadCashInflow() {
@@ -534,40 +647,7 @@ async function loadCashInflow() {
     return;
   }
 
-  // Heat range across brokers so the gradient always spans least -> most owed.
-  let minOwed = Infinity;
-  let maxOwed = -Infinity;
-  for (const row of rows) {
-    if (row.totalDue < minOwed) minOwed = row.totalDue;
-    if (row.totalDue > maxOwed) maxOwed = row.totalDue;
-  }
-  if (!Number.isFinite(minOwed)) minOwed = 0;
-  if (!Number.isFinite(maxOwed)) maxOwed = 0;
-
-  // One combined card summing every broker into an all-brokers total.
-  const totals = rows.reduce(
-    (acc, row) => {
-      acc.totalOwed += row.totalOwed;
-      acc.cashInflow += row.cashInflow;
-      acc.weeklyBalance += row.weeklyBalance;
-      acc.leftover += row.leftover;
-      return acc;
-    },
-    {
-      name: t("report.cashInflow.allBrokers"),
-      totalOwed: 0,
-      cashInflow: 0,
-      weeklyBalance: 0,
-      leftover: 0,
-    }
-  );
-  CashInflowGrid.appendChild(buildCashInflowCard(totals, true, null));
-
-  for (const row of rows) {
-    CashInflowGrid.appendChild(
-      buildCashInflowCard(row, false, owedHeat(row.totalDue, minOwed, maxOwed))
-    );
-  }
+  renderCashInflow(rows);
 }
 
 ReportFrom.addEventListener("change", loadReport);
@@ -1096,6 +1176,7 @@ async function load() {
 onLangChange(() => {
   applyBrokerMode();
   renderBrokerList();
+  loadCashInflow();
   if (selectedId !== null) {
     const b = brokers.find((x) => x.id === selectedId);
     if (b) selectBroker(b.id);
@@ -1379,6 +1460,148 @@ RegistrationsBtn.addEventListener("click", openRegistrations);
 RegistrationsCloseBtn.addEventListener("click", () =>
   closeOverlay(RegistrationsOverlay)
 );
+
+// --- Admin branches ----------------------------------------------------------
+
+const BranchesOverlay = document.getElementById("BranchesOverlay");
+const BranchesBtn = document.getElementById("BranchesBtn");
+const BranchesCloseBtn = document.getElementById("BranchesCloseBtn");
+const BranchList = document.getElementById("BranchList");
+const NewBranchInput = document.getElementById("NewBranchInput");
+const CreateBranchBtn = document.getElementById("CreateBranchBtn");
+const BranchMsg = document.getElementById("BranchMsg");
+
+if (role === "1" && BranchesBtn) {
+  BranchesBtn.classList.remove("hidden");
+}
+
+async function openBranches() {
+  setMsg(BranchMsg, "", false);
+  openOverlay(BranchesOverlay);
+  await loadBranches();
+}
+
+async function loadBranches() {
+  BranchList.innerHTML = "";
+  setMsg(BranchMsg, "", false);
+  try {
+    const data = await api("/admin/branches");
+    renderBranches(data.branches || []);
+  } catch (err) {
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = err.message || t("admin.branches.loadFailed");
+    BranchList.appendChild(li);
+  }
+}
+
+function renderBranches(branches) {
+  if (branches.length === 0) {
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = t("admin.branches.empty");
+    BranchList.appendChild(li);
+    return;
+  }
+
+  for (const b of branches) {
+    const li = document.createElement("li");
+    li.className = "branch-item";
+
+    const name = document.createElement("span");
+    name.className = "branch-name";
+    name.textContent = b.Name;
+
+    const label = document.createElement("label");
+    label.className = "switch";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = Boolean(b.Enabled);
+
+    const track = document.createElement("span");
+    track.className = "switch-track";
+    const knob = document.createElement("span");
+    knob.className = "switch-knob";
+    track.appendChild(knob);
+
+    const statusText = document.createElement("span");
+    statusText.className = "switch-label";
+    statusText.textContent = checkbox.checked
+      ? t("admin.branches.on")
+      : t("admin.branches.off");
+
+    checkbox.addEventListener("change", async () => {
+      const enabled = checkbox.checked;
+      statusText.textContent = enabled
+        ? t("admin.branches.on")
+        : t("admin.branches.off");
+      try {
+        await api("/admin/branches/" + encodeURIComponent(b.id), {
+          method: "PATCH",
+          body: JSON.stringify({ enabled }),
+        });
+        setMsg(
+          BranchMsg,
+          enabled
+            ? t("admin.branches.enabled", { name: b.Name })
+            : t("admin.branches.disabled", { name: b.Name }),
+          false
+        );
+      } catch (err) {
+        checkbox.checked = !enabled;
+        statusText.textContent = checkbox.checked
+          ? t("admin.branches.on")
+          : t("admin.branches.off");
+        setMsg(BranchMsg, err.message || t("admin.branches.toggleFailed"), true);
+      }
+    });
+
+    label.appendChild(checkbox);
+    label.appendChild(track);
+    label.appendChild(statusText);
+
+    li.appendChild(name);
+    li.appendChild(label);
+    BranchList.appendChild(li);
+  }
+}
+
+async function createBranch() {
+  const name = NewBranchInput.value.trim();
+  if (!name) {
+    setMsg(BranchMsg, t("admin.branches.nameRequired"), true);
+    return;
+  }
+  try {
+    await api("/admin/branches", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
+    NewBranchInput.value = "";
+    setMsg(BranchMsg, t("admin.branches.created", { name }), false);
+    await loadBranches();
+  } catch (err) {
+    setMsg(BranchMsg, err.message || t("admin.branches.createFailed"), true);
+  }
+}
+
+BranchesBtn.addEventListener("click", openBranches);
+BranchesCloseBtn.addEventListener("click", () => closeOverlay(BranchesOverlay));
+CreateBranchBtn.addEventListener("click", createBranch);
+NewBranchInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    createBranch();
+  }
+});
+
+// Keep the dynamic branch list labels in sync when the language changes.
+onLangChange(() => {
+  if (BranchesOverlay && !BranchesOverlay.classList.contains("hidden")) {
+    loadBranches();
+  }
+});
 
 // --- Main broker: sub-brokers (underlings) + per-broker pricing -------------
 

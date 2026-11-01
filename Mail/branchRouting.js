@@ -1,35 +1,16 @@
 "use strict";
 
-// Restricts which branch's workers may see emails from specific brokers.
+// Email visibility is no longer restricted by branch.
 //
-//  - Emails from the Varna broker  -> only workers logged into Kapitan Andreevo
-//  - Emails from the Barutcu broker -> only workers logged into Lesovo
-//
-// Emails from any other sender are visible to every branch.
-
-const { BrokerData } = require("../db/BrokerInfo.js");
-
-const KAP_ANDREEVO_BRANCH = "ГКПП Капитан Андреево";
-const LESOVO_BRANCH = "ГКПП Лесово";
-
-// Broker name (key in BrokerInfo.BrokerData) -> the single branch allowed to see it.
-const BROKER_BRANCH_RESTRICTIONS = {
-  Varna: KAP_ANDREEVO_BRANCH,
-  Barutcu: LESOVO_BRANCH,
-};
+// Previously some brokers were only serviced by a specific branch (Varna ->
+// Kapitan Andreevo, Barutcu -> Lesovo). Every broker is now serviced by every
+// available branch, so a worker logged into any branch can see and process any
+// broker's email.
 
 function normalize(value) {
   return String(value || "")
     .trim()
     .toLowerCase();
-}
-
-// emailAddress (lowercased) -> required branch
-const senderToBranch = new Map();
-for (const [brokerName, branch] of Object.entries(BROKER_BRANCH_RESTRICTIONS)) {
-  for (const address of BrokerData[brokerName] || []) {
-    senderToBranch.set(normalize(address), branch);
-  }
 }
 
 // Extracts the bare address from a "From" header such as `Name <a@b.com>`.
@@ -40,20 +21,18 @@ function extractAddress(from) {
 }
 
 /**
- * Branch required to see this email, or null if it is visible to all branches.
+ * Branch required to see this email. Always null now: every broker is serviced
+ * by every branch.
  */
 function requiredBranchFor(email) {
-  if (!email) return null;
-  return senderToBranch.get(extractAddress(email.from)) || null;
+  return null;
 }
 
 /**
- * Whether a worker logged into `branch` may see `email`.
+ * Whether a worker logged into `branch` may see `email`. Always true now.
  */
 function canSeeEmail(branch, email) {
-  const required = requiredBranchFor(email);
-  if (!required) return true;
-  return normalize(branch) === normalize(required);
+  return true;
 }
 
 module.exports = { canSeeEmail, requiredBranchFor, extractAddress };

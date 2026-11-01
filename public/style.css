@@ -562,16 +562,38 @@ body {
   word-break: break-word;
 }
 
+.cashinflow-stat-sort {
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 4px 6px;
+  margin: -4px -6px;
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.cashinflow-stat-sort:hover {
+  background: rgba(56, 189, 248, 0.14);
+}
+
+.cashinflow-stat-sort.active {
+  background: rgba(56, 189, 248, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.45);
+}
+
+.cashinflow-stat-sort:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .cashinflow-inflow {
   color: var(--success);
 }
 
 .cashinflow-weekly-pos {
-  color: var(--danger);
+  color: var(--success);
 }
 
 .cashinflow-weekly-neg {
-  color: var(--success);
+  color: var(--danger);
 }
 
 .cashinflow-leftover {
@@ -1192,6 +1214,80 @@ button,
 .btn-small {
   padding: 6px 10px;
   font-size: 12px;
+}
+
+.branch-list {
+  list-style: none;
+  margin: 0 0 16px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.branch-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.branch-name {
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.switch-track {
+  position: relative;
+  width: 42px;
+  height: 24px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--border);
+  transition: background 0.15s ease;
+}
+
+.switch-knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.15s ease;
+}
+
+.switch input:checked + .switch-track {
+  background: var(--accent-strong);
+}
+
+.switch input:checked + .switch-track .switch-knob {
+  transform: translateX(18px);
+}
+
+.switch-label {
+  font-size: 13px;
+  color: var(--muted);
 }
 
 .muted {

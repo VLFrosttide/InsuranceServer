@@ -31,6 +31,7 @@ const {
   computePolicyTariffPrice,
 } = require("./Brokers.js");
 const { sendReply } = require("../Mail/SendReply.js");
+const { isBranchEnabled } = require("../db/branches.js");
 
 /**
  * Resolve an insurance payment type from the received value.
@@ -674,6 +675,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         return res.status(400).json({ error: currencyError });
       }
 
+      // A disabled branch must not issue new insurances.
+      if (!(await isBranchEnabled(DBConnection, branch))) {
+        return res.status(403).json({ error: "This branch is disabled" });
+      }
+
       // Optional explicit broker assignment. When set, the policy is paid from
       // that broker's balance (PaymentType = "Broker"); otherwise it is a
       // walk-in paid in cash or by card.
@@ -1059,6 +1065,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       if (currencyError) {
         return res.status(400).json({ error: currencyError });
       }
+
+      // A disabled branch must not issue new insurances.
+      if (!(await isBranchEnabled(DBConnection, branch))) {
+        return res.status(403).json({ error: "This branch is disabled" });
+      }
+
       const requestedPayment = resolvePaymentType(
         b.Cash ?? b.cash ?? b.PaymentType ?? b.paymentType
       );
