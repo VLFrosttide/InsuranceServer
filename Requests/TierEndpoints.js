@@ -2385,7 +2385,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                   reason: `Annul ${blancNumber}`,
                   currency: insurance.CurrencyType,
                 },
-                moveTime.createdAt
+                insurance.CreationDate
               );
             }
             if (isBrokerLinked(insurance)) {
@@ -2421,7 +2421,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                 amount: refund,
                 reason: `Annul ${blancNumber}`,
                 currency: insurance.CurrencyType,
-              }, moveTime.createdAt);
+              }, insurance.CreationDate);
             }
 
             if (isBrokerLinked(insurance)) {
