@@ -588,6 +588,62 @@ const recordCashMovement = (module.exports.recordCashMovement =
   });
 
 /**
+ * Record a cash movement in the `cash_transactions` ledger WITHOUT touching the
+ * running `current_cash` balance. Used when a correction is back-dated to an
+ * earlier day whose drawer has already been closed (each day has its own
+ * drawer): the movement must reduce that earlier day's daily total, not today's
+ * running drawer.
+ *
+ * NOTE: runs inside the caller's transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ * @param {string} username
+ * @param {"increase"|"reduce"} type
+ * @param {number|string} amount
+ * @param {string} reason
+ * @param {string} [currency]
+ * @param {string} [createdAt]
+ * @returns {Promise<number>}
+ */
+const recordCashLedgerOnly = (module.exports.recordCashLedgerOnly =
+  async function recordCashLedgerOnly(
+    conn,
+    branch,
+    username,
+    type,
+    amount,
+    reason,
+    currency,
+    createdAt
+  ) {
+    const decimal = toDecimal(amount);
+    if (decimal === null || decimal <= 0) {
+      throw new Error("amount must be a positive number");
+    }
+    if (typeof reason !== "string" || !reason.trim()) {
+      throw new Error("reason is required");
+    }
+    if (type !== "increase" && type !== "reduce") {
+      throw new Error("type must be 'increase' or 'reduce'");
+    }
+    const b = normalizeBranch(branch);
+    const cur = normalizeCurrency(currency);
+    const ts =
+      typeof createdAt === "string" && createdAt.trim() !== ""
+        ? createdAt.trim()
+        : clientLocalDateTime(0);
+
+    await conn.query(
+      `INSERT INTO cash_transactions (Branch, Type, Amount, Currency, Username, Reason, CreatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [b, type, decimal, cur, username, reason.trim(), ts]
+    );
+
+    return decimal;
+  });
+
+/**
  * Apply a movement to one of the stored total_cash parts (CardPart/BrokerPart).
  *
  * Unlike current cash, a part is allowed to go negative: reversing a payment

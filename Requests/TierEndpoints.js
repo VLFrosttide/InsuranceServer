@@ -13,6 +13,7 @@ const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
 const {
   recordCashMovement,
+  recordCashLedgerOnly,
   recordChannelMovement,
   movePolicyBranch,
   toDecimal,
@@ -331,6 +332,16 @@ function resolveMoveCreatedAt(body) {
     return { createdAt: parsed };
   }
   return { createdAt: clientLocalDateTime(b.TzOffset ?? b.tzOffset ?? null) };
+}
+
+/**
+ * Whether two "YYYY-MM-DD HH:MM:SS" wall-clock strings fall on the same local
+ * calendar day. Used to tell a same-day annulment (the refund physically leaves
+ * today's drawer) from a back-dated one (the refund reduces the creation day's
+ * drawer instead of today's).
+ */
+function isSameLocalDay(a, b) {
+  return String(a || "").slice(0, 10) === String(b || "").slice(0, 10);
 }
 
 // ---------------------------------------------------------------------------
@@ -2374,19 +2385,36 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             const oldRefund = Math.max(0, Math.round((price - oldFee) * 100) / 100);
             const refundDelta = Math.round((refund - oldRefund) * 100) / 100;
             if (refundDelta !== 0) {
-              await movePolicyMoney(
-                conn,
-                effectivePayment(insurance),
-                refundDelta > 0 ? "reduce" : "increase",
-                {
-                  branch: insurance.Branch,
-                  username: req.user.username,
-                  amount: Math.round(Math.abs(refundDelta) * 100) / 100,
-                  reason: `Annul ${blancNumber}`,
-                  currency: insurance.CurrencyType,
-                },
-                insurance.CreationDate
-              );
+              const payment = effectivePayment(insurance);
+              const crossDay =
+                payment === "Cash" &&
+                !isSameLocalDay(insurance.CreationDate, moveTime.createdAt);
+              if (crossDay) {
+                await recordCashLedgerOnly(
+                  conn,
+                  insurance.Branch,
+                  req.user.username,
+                  refundDelta > 0 ? "reduce" : "increase",
+                  Math.round(Math.abs(refundDelta) * 100) / 100,
+                  `Annul ${blancNumber}`,
+                  insurance.CurrencyType,
+                  insurance.CreationDate
+                );
+              } else {
+                await movePolicyMoney(
+                  conn,
+                  payment,
+                  refundDelta > 0 ? "reduce" : "increase",
+                  {
+                    branch: insurance.Branch,
+                    username: req.user.username,
+                    amount: Math.round(Math.abs(refundDelta) * 100) / 100,
+                    reason: `Annul ${blancNumber}`,
+                    currency: insurance.CurrencyType,
+                  },
+                  insurance.CreationDate
+                );
+              }
             }
             if (isBrokerLinked(insurance)) {
               const oldBrokerRefund = oldPayer === "broker" ? oldRefund : price;
@@ -2415,13 +2443,35 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             // comes out of the Broker channel and never reduces current cash -
             // the drawer never received that money in the first place.
             if (refund > 0) {
-              await movePolicyMoney(conn, effectivePayment(insurance), "reduce", {
-                branch: insurance.Branch,
-                username: req.user.username,
-                amount: refund,
-                reason: `Annul ${blancNumber}`,
-                currency: insurance.CurrencyType,
-              }, insurance.CreationDate);
+              const payment = effectivePayment(insurance);
+              // A cash refund of a policy created on an EARLIER day must reduce
+              // that earlier day's drawer, not today's. Card and broker payments
+              // are already netted by creation date in the daily report, but
+              // cash is keyed on the ledger's CreatedAt, so its entry is back-
+              // dated here and the running drawer is left untouched.
+              const crossDay =
+                payment === "Cash" &&
+                !isSameLocalDay(insurance.CreationDate, moveTime.createdAt);
+              if (crossDay) {
+                await recordCashLedgerOnly(
+                  conn,
+                  insurance.Branch,
+                  req.user.username,
+                  "reduce",
+                  refund,
+                  `Annul ${blancNumber}`,
+                  insurance.CurrencyType,
+                  insurance.CreationDate
+                );
+              } else {
+                await movePolicyMoney(conn, payment, "reduce", {
+                  branch: insurance.Branch,
+                  username: req.user.username,
+                  amount: refund,
+                  reason: `Annul ${blancNumber}`,
+                  currency: insurance.CurrencyType,
+                }, insurance.CreationDate);
+              }
             }
 
             if (isBrokerLinked(insurance)) {
