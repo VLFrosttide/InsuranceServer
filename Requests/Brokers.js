@@ -138,6 +138,28 @@ const resolveBrokerId = (module.exports.resolveBrokerId =
   });
 
 /**
+ * Whether a blanc number falls inside one of a broker's blanc batches.
+ * A broker with no batch (or a non-numeric blanc) reports `false`.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @param {any} blancNumber
+ * @returns {Promise<boolean>}
+ */
+const blancInBrokerBatches = (module.exports.blancInBrokerBatches =
+  async function blancInBrokerBatches(conn, brokerId, blancNumber) {
+    const numeric = parseInt(String(blancNumber ?? "").trim(), 10);
+    if (!Number.isFinite(numeric)) return false;
+    const [rows] = await conn.query(
+      `SELECT id FROM broker_blanc_batches
+        WHERE BrokerId = ? AND RangeStart <= ? AND RangeEnd >= ?
+        LIMIT 1`,
+      [brokerId, numeric, numeric]
+    );
+    return rows.length > 0;
+  });
+
+/**
  * Resolve the broker that an insurance belongs to from the sender of the
  * incoming email.
  *

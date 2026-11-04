@@ -21,6 +21,7 @@ const {
 const { recordCardPayment, reduceCardBalance } = require("./CardPayments.js");
 const {
   resolveBrokerByEmail,
+  blancInBrokerBatches,
   decreaseBrokerForInsurance,
   restoreBrokerForAnnulment,
   restoreBrokerForDeletion,
@@ -152,6 +153,38 @@ function toFlag(value) {
   if (value === undefined || value === null) return false;
   const s = String(value).trim().toLowerCase();
   return s === "true" || s === "1" || s === "yes";
+}
+
+/**
+ * Reject a broker-linked insurance whose blanc number is not inside any of the
+ * broker's blanc batches. An explicit force flag lets the caller (which has
+ * already asked the user) create the policy anyway. Returns true when the
+ * response was sent and the create must be aborted.
+ *
+ * @param {import("express").Response} res
+ * @param {{query: Function}} conn
+ * @param {number|null} brokerId
+ * @param {any} blancNumber
+ * @param {object} body
+ * @returns {Promise<boolean>}
+ */
+async function rejectIfBlancOutsideBrokerBatches(
+  res,
+  conn,
+  brokerId,
+  blancNumber,
+  body
+) {
+  if (brokerId === null) return false;
+  if (toFlag(body?.ForceOutsideBlancBatch ?? body?.forceOutsideBlancBatch)) {
+    return false;
+  }
+  if (await blancInBrokerBatches(conn, brokerId, blancNumber)) return false;
+  res.status(422).json({
+    error: "This blanc number is not in any of the broker's blanc batches",
+    code: "BLANC_OUTSIDE_BROKER_BATCHES",
+  });
+  return true;
 }
 
 /**
@@ -791,6 +824,18 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
       }
 
+      if (
+        await rejectIfBlancOutsideBrokerBatches(
+          res,
+          DBConnection,
+          brokerId,
+          blancNumber,
+          b
+        )
+      ) {
+        return;
+      }
+
       const priceDecimal = toDecimal(price);
 
       await DBConnection.withTransaction(async (conn) => {
@@ -1223,6 +1268,18 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       }
 
       const priceDecimal = toDecimal(price);
+
+      if (
+        await rejectIfBlancOutsideBrokerBatches(
+          res,
+          DBConnection,
+          brokerId,
+          blancNumber,
+          b
+        )
+      ) {
+        return;
+      }
 
       // A broker that an admin has manually cut off (the "cut off" button in the
       // brokers list) cannot have new insurances created until re-enabled. This
