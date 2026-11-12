@@ -122,6 +122,9 @@ async function runSetup(config = {}) {
       Balance DECIMAL(15,2) NOT NULL DEFAULT 0,
       Status VARCHAR(20) NOT NULL DEFAULT 'active',
       Email VARCHAR(255) NULL,
+      Deleted TINYINT(1) NOT NULL DEFAULT 0,
+      DeletedAt DATETIME NULL,
+      DeletedBy VARCHAR(45) NULL,
       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (Username),
       UNIQUE KEY Username_UNIQUE (Username)
@@ -193,6 +196,25 @@ async function runSetup(config = {}) {
       "ALTER TABLE users ADD COLUMN CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
     );
     console.log("Added users.CreatedAt column");
+  }
+  // Soft-delete support for accounts: an admin can delete a user from the Users
+  // panel. The row is never physically removed — it is only tagged as Deleted so
+  // the account (and everything it authored) stays in the database and an admin
+  // can restore it. A deleted account cannot sign in and is hidden from the
+  // users list.
+  if (!userColNames.has("Deleted")) {
+    await db.query(
+      "ALTER TABLE users ADD COLUMN Deleted TINYINT(1) NOT NULL DEFAULT 0"
+    );
+    console.log("Added users.Deleted column");
+  }
+  if (!userColNames.has("DeletedAt")) {
+    await db.query("ALTER TABLE users ADD COLUMN DeletedAt DATETIME NULL");
+    console.log("Added users.DeletedAt column");
+  }
+  if (!userColNames.has("DeletedBy")) {
+    await db.query("ALTER TABLE users ADD COLUMN DeletedBy VARCHAR(45) NULL");
+    console.log("Added users.DeletedBy column");
   }
   // Prune the legacy payout percentage column. No percentages are used.
   if (userColNames.has("PayoutPercentage")) {
@@ -771,6 +793,9 @@ async function runSetup(config = {}) {
        PolicyRangeStart INT NOT NULL,
        PolicyRangeEnd INT NOT NULL,
        InactivePolicies INT NOT NULL DEFAULT 0,
+       Deleted TINYINT(1) NOT NULL DEFAULT 0,
+       DeletedAt DATETIME NULL,
+       DeletedBy VARCHAR(45) NULL,
        CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
        PRIMARY KEY (id),
        UNIQUE KEY uq_brokers_name (Name)
@@ -1002,6 +1027,26 @@ async function runSetup(config = {}) {
   if (!brokerColNames.has("Code")) {
     await db.query("ALTER TABLE brokers ADD COLUMN Code VARCHAR(50) NULL");
     console.log("Added brokers.Code column");
+  }
+
+  // Soft-delete support for brokers: an admin can delete a broker from the
+  // brokers list. The row is kept (tagged with Deleted/DeletedAt/DeletedBy) so
+  // its balance history, blanc batches, emails and linked policies stay intact,
+  // and an admin can restore it. A deleted broker is hidden from every list and
+  // its addresses stop being recognised as broker senders.
+  if (!brokerColNames.has("Deleted")) {
+    await db.query(
+      "ALTER TABLE brokers ADD COLUMN Deleted TINYINT(1) NOT NULL DEFAULT 0"
+    );
+    console.log("Added brokers.Deleted column");
+  }
+  if (!brokerColNames.has("DeletedAt")) {
+    await db.query("ALTER TABLE brokers ADD COLUMN DeletedAt DATETIME NULL");
+    console.log("Added brokers.DeletedAt column");
+  }
+  if (!brokerColNames.has("DeletedBy")) {
+    await db.query("ALTER TABLE brokers ADD COLUMN DeletedBy VARCHAR(45) NULL");
+    console.log("Added brokers.DeletedBy column");
   }
 
   // Backfill the broker IDs for the brokers listed in BrokerInfo.BrokerCodes.

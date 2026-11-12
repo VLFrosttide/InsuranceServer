@@ -186,6 +186,7 @@ const resolveBrokerByEmail = (module.exports.resolveBrokerByEmail =
          FROM broker_emails be
          JOIN brokers b ON b.id = be.BrokerId
         WHERE LOWER(TRIM(be.Email)) = LOWER(?)
+          AND b.Deleted = 0
         ORDER BY be.id
         LIMIT 1`,
       [address]
@@ -1708,10 +1709,19 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   router.get("/brokers", auth, requireBrokerView, async (req, res) => {
     try {
       const scoped = req.brokerScope;
+      // Soft-deleted brokers are hidden from every list (a broker-scoped account
+      // then simply sees nothing). Only an admin may ask for them, with
+      // ?includeDeleted=1, so the client can offer Restore.
+      const includeDeleted =
+        scoped === null &&
+        String(req.user?.role) === "1" &&
+        ["1", "true", "yes"].includes(
+          String(req.query.includeDeleted || "").toLowerCase()
+        );
       const [rows] = await DBConnection.query(
         scoped === null
-          ? `SELECT ${BROKER_COLUMNS} FROM brokers ORDER BY id`
-          : `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
+          ? `SELECT ${BROKER_COLUMNS} FROM brokers WHERE Deleted = 0 ORDER BY id`
+          : `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ? AND Deleted = 0`,
         scoped === null ? [] : [scoped]
       );
       const summaries = await loadSummaries();
@@ -1744,7 +1754,22 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       const allowNegativeBalance = await getBrokerAllowNegativeBalance(
         DBConnection
       );
-      res.json({ brokers: rows, allowNegativeBalance });
+
+      // Soft-deleted brokers, listed only for an admin who asked for them. Their
+      // row (balance, blancs, emails, policies) is untouched, so Restore is just
+      // clearing the flags - see POST /brokers/:id/restore.
+      let deleted = [];
+      if (includeDeleted) {
+        const [deletedRows] = await DBConnection.query(
+          `SELECT ${BROKER_COLUMNS}, DeletedAt, DeletedBy
+             FROM brokers
+            WHERE Deleted = 1
+            ORDER BY id`
+        );
+        deleted = deletedRows;
+      }
+
+      res.json({ brokers: rows, allowNegativeBalance, includeDeleted, deleted });
     } catch (err) {
       console.error("Broker list failed:", err);
       res.status(500).json({ error: "Failed to fetch brokers" });
@@ -1770,7 +1795,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   router.get("/brokers/export", auth, requireRole(1), async (req, res) => {
     try {
       const [rows] = await DBConnection.query(
-        `SELECT ${BROKER_COLUMNS} FROM brokers ORDER BY id`
+        `SELECT ${BROKER_COLUMNS} FROM brokers WHERE Deleted = 0 ORDER BY id`
       );
       const [emailRows] = await DBConnection.query(
         "SELECT BrokerId, Email FROM broker_emails ORDER BY BrokerId, id"
@@ -3223,7 +3248,13 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     }
   });
 
-  // DELETE /brokers/:id — remove a broker and detach any linked insurances.
+  // DELETE /brokers/:id — soft-delete a broker. The row is never removed: it is
+  // flagged with Deleted/DeletedAt/DeletedBy (like a soft-deleted insurance or
+  // movement), so its balance, blanc batches, emails, tariff list and linked
+  // policies all stay intact, and an admin can bring it back with
+  // POST /brokers/:id/restore. A deleted broker is hidden from every list and
+  // its addresses stop resolving to a broker (resolveBrokerByEmail), so its
+  // emails are not shown to workers either.
   router.delete("/brokers/:id", auth, requireAdmin, async (req, res) => {
     try {
       const brokerId = parseBrokerId(req.params.id);
@@ -3239,26 +3270,58 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         return res.status(404).json({ error: "Broker not found" });
       }
 
-      await DBConnection.withTransaction(async (conn) => {
-        // Detach any linked insurance policies before removing the broker.
-        await conn.query(
-          "UPDATE insurance SET BrokerId = NULL WHERE BrokerId = ?",
-          [brokerId]
-        );
-        await conn.query("DELETE FROM broker_emails WHERE BrokerId = ?", [
-          brokerId,
-        ]);
-        await conn.query(
-          "DELETE FROM broker_blanc_batches WHERE BrokerId = ?",
-          [brokerId]
-        );
-        await conn.query("DELETE FROM brokers WHERE id = ?", [brokerId]);
-      });
+      await DBConnection.query(
+        "UPDATE brokers SET Deleted = 1, DeletedAt = NOW(), DeletedBy = ? WHERE id = ?",
+        [String(req.user?.username || ""), brokerId]
+      );
 
-      res.json({ message: "Broker deleted", id: brokerId });
+      // Drop the broker's live email cards and claims: it must stop receiving
+      // new email policies the moment it is deleted.
+      const [emailRows] = await DBConnection.query(
+        "SELECT Email FROM broker_emails WHERE BrokerId = ?",
+        [brokerId]
+      );
+      const { evictEmailsForAddresses } = require("../Users/websocket.js");
+      await evictEmailsForAddresses(emailRows.map((r) => r.Email));
+
+      res.json({ message: "Broker deleted", id: brokerId, deleted: true });
     } catch (err) {
       console.error("Broker delete failed:", err);
       res.status(500).json({ error: "Failed to delete broker" });
+    }
+  });
+
+  // POST /brokers/:id/restore — bring a soft-deleted broker back into every
+  // list. Nothing else has to be re-applied: the balance, blanc batches, emails
+  // and policies of the broker were never touched by the delete.
+  router.post("/brokers/:id/restore", auth, requireAdmin, async (req, res) => {
+    try {
+      const brokerId = parseBrokerId(req.params.id);
+      if (brokerId === null) {
+        return res.status(400).json({ error: "Invalid broker id" });
+      }
+
+      const [rows] = await DBConnection.query(
+        "SELECT id, Deleted FROM brokers WHERE id = ?",
+        [brokerId]
+      );
+      const broker = rows[0] || null;
+      if (!broker) {
+        return res.status(404).json({ error: "Broker not found" });
+      }
+      if (!Number(broker.Deleted)) {
+        return res.status(400).json({ error: "Broker is not deleted" });
+      }
+
+      await DBConnection.query(
+        "UPDATE brokers SET Deleted = 0, DeletedAt = NULL, DeletedBy = NULL WHERE id = ?",
+        [brokerId]
+      );
+
+      res.json({ message: "Broker restored", id: brokerId });
+    } catch (err) {
+      console.error("Broker restore failed:", err);
+      res.status(500).json({ error: "Failed to restore broker" });
     }
   });
 

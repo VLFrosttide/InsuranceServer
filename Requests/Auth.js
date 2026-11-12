@@ -5,7 +5,9 @@
 // the same token may also be supplied via an Authorization header.
 //
 // Suspended users (users.Status = 'suspended') are rejected even when they
-// present a valid token, so an admin can immediately lock an account out.
+// present a valid token, so an admin can immediately lock an account out. The
+// same goes for a soft-deleted account (users.Deleted = 1): it keeps its row so
+// an admin can restore it, but no session of it is honoured.
 
 /**
  * Extract the session token from either an Authorization header or a cookie.
@@ -46,7 +48,7 @@ module.exports.requireAuth = function requireAuth(DBConnection) {
       }
 
       const [rows] = await DBConnection.query(
-        `SELECT t.Username, u.Role, u.Status, u.BrokerId
+        `SELECT t.Username, u.Role, u.Status, u.BrokerId, u.Deleted
            FROM tokens t
            JOIN users u ON u.Username = t.Username
           WHERE t.Token = ? AND t.Expires > NOW()`,
@@ -57,6 +59,12 @@ module.exports.requireAuth = function requireAuth(DBConnection) {
         return res
           .status(401)
           .json({ error: "Unauthorized: invalid or expired token" });
+      }
+
+      // A soft-deleted account must not be able to keep using a session that
+      // survived the delete (the delete drops its tokens, this is the backstop).
+      if (Number(rows[0].Deleted) === 1) {
+        return res.status(403).json({ error: "Account deleted" });
       }
 
       if (String(rows[0].Status || "active") !== "active") {

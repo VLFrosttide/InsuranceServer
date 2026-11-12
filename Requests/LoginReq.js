@@ -57,6 +57,13 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
 
       const user = rows[0];
 
+      // A soft-deleted account (an admin removed it from the Users panel) keeps
+      // its row for record-keeping, but it can never sign in again. An admin can
+      // restore it, which clears the flag.
+      if (Number(user.Deleted) === 1) {
+        return sendLoginResponse(res, 403, { error: "Account deleted" });
+      }
+
       if (String(user.Status || "active") !== "active") {
         if (String(user.Status) === "pending") {
           return sendLoginResponse(res, 403, {

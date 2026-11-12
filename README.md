@@ -52,10 +52,16 @@ Stores every account on the system (admins, workers, clients).
 | `Password` | `VARCHAR`     | bcrypt hash                       |
 | `Role`     | `INT`         | `1` admin, `2` worker, `3` client |
 | `Status`   | `VARCHAR(20)` | `active` or `suspended`           |
+| `Deleted`  | `TINYINT(1)`  | `1` = soft-deleted (with `DeletedAt` / `DeletedBy`) |
 
 Use case: authentication, authorization, admin/worker dashboards, and client
 profiles. Balances live on `brokers` (a client can also be a
 broker). `Role` defaults to `3` (client) when added by the migration.
+
+Deleting an account from the Users screen never removes the row: it is flagged
+with `Deleted`/`DeletedAt`/`DeletedBy` (its sessions are dropped, so it cannot
+sign in, and it disappears from `GET /admin/users`), and an admin restores it
+with `POST /admin/users/:username/restore`.
 
 ### `insurance`
 
@@ -200,6 +206,7 @@ Broker accounts.
 | `PolicyRangeStart` | `INT`           | Start of blanc-number range       |
 | `PolicyRangeEnd`   | `INT`           | End of blanc-number range         |
 | `InactivePolicies` | `INT`           | Remaining inactive policies       |
+| `Deleted`          | `TINYINT(1)`    | `1` = soft-deleted (with `DeletedAt` / `DeletedBy`) |
 | `CreatedAt`        | `DATETIME`      | Creation time                     |
 
 Use case: broker management. Admins/workers can increase/reduce a broker
@@ -293,6 +300,7 @@ still sent over `http://`. The Electron client does not rely on the cookie:
   `PATCH /admin/users/:username`,
   `POST /admin/users/:username/suspend`,
   `POST /admin/users/:username/delete`,
+  `POST /admin/users/:username/restore`,
   `POST /admin/users/:username/promote`
 - Worker (`role 2`): `/worker`, `/worker/clients`,
   `POST /worker/clients/balance`, `POST /worker/insurances`
@@ -380,6 +388,8 @@ is left exactly as it was. The run is marked in `app_settings` as
 `cash_from_brokers_backfill`, so it never repeats.
 
 - `GET /brokers` — list all brokers with balance and inactive policies
+  (`?includeDeleted=1`, admin only, also returns the soft-deleted ones as
+  `deleted`, each with `DeletedAt`/`DeletedBy`)
 - `GET /brokers/:id` — single broker
 - `POST /brokers/:id/increase` — body `{ "amount": 100, "branch": "..." }` (the money is the branch's Cash from Brokers; current cash is not touched)
 - `POST /brokers/:id/reduce` — body `{ "amount": 50 }` (may go infinitely negative; touches neither current cash nor Cash from Brokers)
@@ -390,7 +400,14 @@ Admin-only (`role 1`) broker management:
   linked insurance counts) as JSON or a downloadable CSV
 - `POST /brokers` — create a broker
 - `PATCH /brokers/:id` — update a broker's fields and/or its emails
-- `DELETE /brokers/:id` — delete a broker (detaches any linked insurances)
+- `DELETE /brokers/:id` — soft-delete a broker. The row is kept in `brokers`,
+  flagged with `Deleted`/`DeletedAt`/`DeletedBy`, so its balance, blanc batches,
+  emails, tariffs and linked policies are untouched; it is hidden from
+  `GET /brokers` and the export, its addresses no longer resolve to a broker
+  (`resolveBrokerByEmail`, so its emails are not shown), new insurances for it
+  are rejected, and its live email claims are evicted
+- `POST /brokers/:id/restore` — clear those flags, bringing the broker (with the
+  balance and blancs it kept) back into every list
 
 Each created insurance whose email sender is associated with a broker charges that broker a flat fee: the broker balance is reduced by the full Price (it may go infinitely negative, and this never touches current cash) and the broker InactivePolicies is decremented by 1.
 

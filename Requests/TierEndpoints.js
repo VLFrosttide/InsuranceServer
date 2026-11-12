@@ -521,12 +521,30 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
   router.get("/admin/users", auth, requireRole(1), async (req, res) => {
     try {
+      // Soft-deleted accounts are hidden from the list: they cannot sign in and
+      // are kept only for record-keeping. An admin can still see them with
+      // ?includeDeleted=1 (the Users panel does, to offer Restore).
       const [users] = await DBConnection.query(
         `SELECT Username, Role, Balance, Status, BrokerId, Email, CreatedAt
          FROM users
+         WHERE Deleted = 0
          ORDER BY CreatedAt DESC, Username`
       );
-      res.json({ users });
+      const includeDeleted = ["1", "true", "yes"].includes(
+        String(req.query.includeDeleted || "").toLowerCase()
+      );
+      let deleted = [];
+      if (includeDeleted) {
+        const [rows] = await DBConnection.query(
+          `SELECT Username, Role, Balance, Status, BrokerId, Email, CreatedAt,
+                  DeletedAt, DeletedBy
+           FROM users
+           WHERE Deleted = 1
+           ORDER BY DeletedAt DESC, Username`
+        );
+        deleted = rows;
+      }
+      res.json({ users, deleted });
     } catch (err) {
       console.error("Admin users lookup failed:", err);
       res.status(500).json({ error: "Failed to fetch users" });
@@ -545,7 +563,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       }
 
       const [rows] = await DBConnection.query(
-        "SELECT Username, Role FROM users WHERE Username = ?",
+        "SELECT Username, Role FROM users WHERE Username = ? AND Deleted = 0",
         [username]
       );
       if (rows.length === 0) {
@@ -963,7 +981,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
   async function fetchUser(res, username) {
     const [rows] = await DBConnection.query(
-      `SELECT ${ADMIN_USER_COLUMNS} FROM users WHERE Username = ?`,
+      `SELECT ${ADMIN_USER_COLUMNS} FROM users WHERE Username = ? AND Deleted = 0`,
       [username]
     );
     return rows[0] || null;
@@ -1004,6 +1022,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     }
   );
 
+  // POST /admin/users/:username/delete — soft delete. The row is never removed:
+  // it is flagged with Deleted/DeletedAt/DeletedBy (like a soft-deleted
+  // insurance or broker movement), so the account can no longer sign in (its
+  // sessions are dropped) but an admin can bring it back with /restore and
+  // everything the account authored stays intact.
   router.post(
     "/admin/users/:username/delete",
     auth,
@@ -1028,14 +1051,64 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
 
         await DBConnection.withTransaction(async (conn) => {
+          // Invalidate any live sessions, then hide the account.
           await conn.query("DELETE FROM tokens WHERE Username = ?", [username]);
-          await conn.query("DELETE FROM users WHERE Username = ?", [username]);
+          await conn.query(
+            "UPDATE users SET Deleted = 1, DeletedAt = NOW(), DeletedBy = ? WHERE Username = ?",
+            [String(req.user.username || ""), username]
+          );
         });
 
-        res.json({ message: "User deleted", username });
+        res.json({ message: "User deleted", username, deleted: true });
       } catch (err) {
         console.error("Admin delete failed:", err);
         res.status(500).json({ error: "Failed to delete user" });
+      }
+    }
+  );
+
+  // POST /admin/users/:username/restore — bring a soft-deleted account back.
+  // The row (and its password, broker link, balance and author name) was never
+  // touched by the delete, so clearing the flags is all it takes.
+  router.post(
+    "/admin/users/:username/restore",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      try {
+        const username = String(req.params.username || "").trim();
+        if (!username) {
+          return res.status(400).json({ error: "Username is required" });
+        }
+
+        const [rows] = await DBConnection.query(
+          `SELECT ${ADMIN_USER_COLUMNS}, Deleted FROM users WHERE Username = ?`,
+          [username]
+        );
+        const user = rows[0] || null;
+        if (!user) {
+          return res.status(404).json({ error: "User not found" });
+        }
+        if (!Number(user.Deleted)) {
+          return res.status(400).json({ error: "User is not deleted" });
+        }
+
+        await DBConnection.query(
+          "UPDATE users SET Deleted = 0, DeletedAt = NULL, DeletedBy = NULL WHERE Username = ?",
+          [username]
+        );
+
+        const [restored] = await DBConnection.query(
+          `SELECT ${ADMIN_USER_COLUMNS} FROM users WHERE Username = ?`,
+          [username]
+        );
+        res.json({
+          message: "User restored",
+          user: restored[0] || null,
+        });
+      } catch (err) {
+        console.error("Admin restore failed:", err);
+        res.status(500).json({ error: "Failed to restore user" });
       }
     }
   );
@@ -1319,14 +1392,21 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       // A broker that an admin has manually cut off (the "cut off" button in the
       // brokers list) cannot have new insurances created until re-enabled. This
       // is no longer automatic: being "two weeks behind on payment" now only
-      // highlights the row and enables the button.
+      // highlights the row and enables the button. A soft-deleted broker is
+      // treated the same way, so a stale client cannot keep selling for it.
       if (brokerId !== null) {
         const [[brokerRow]] = await DBConnection.query(
-          "SELECT CashBalance, CutOff FROM brokers WHERE id = ?",
+          "SELECT CashBalance, CutOff, Deleted FROM brokers WHERE id = ?",
           [brokerId]
         );
         const currentBalance = brokerRow ? Number(brokerRow.CashBalance) : 0;
         const cutOff = brokerRow ? Boolean(brokerRow.CutOff) : false;
+
+        if (brokerRow && Number(brokerRow.Deleted)) {
+          return res.status(403).json({
+            error: "Broker is deleted; it has to be restored first",
+          });
+        }
 
         if (cutOff) {
           return res.status(403).json({
