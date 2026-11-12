@@ -144,17 +144,22 @@ Use case: the single company cash balance. Increased by policy creation and
 
 Ledger of every cash increase/reduction.
 
-| Column      | Type            | Notes                  |
-| ----------- | --------------- | ---------------------- |
-| `id`        | `INT`           | Auto-increment PK      |
-| `Type`      | `VARCHAR(20)`   | `increase` or `reduce` |
-| `Amount`    | `DECIMAL(15,2)` | Movement amount        |
-| `Username`  | `VARCHAR(45)`   | Who performed it       |
-| `Reason`    | `VARCHAR(255)`  | Human-readable reason  |
-| `CreatedAt` | `DATETIME`      | Creation time          |
+| Column      | Type            | Notes                      |
+| ----------- | --------------- | -------------------------- |
+| `id`        | `INT`           | Auto-increment PK          |
+| `Type`      | `VARCHAR(20)`   | `increase` or `reduce`     |
+| `Amount`    | `DECIMAL(15,2)` | Movement amount            |
+| `Username`  | `VARCHAR(45)`   | Who performed it           |
+| `Reason`    | `VARCHAR(255)`  | Human-readable reason      |
+| `CreatedAt` | `DATETIME`      | Creation time              |
+| `Deleted`   | `TINYINT(1)`    | Soft delete flag (default `0`) |
+| `DeletedAt` | `DATETIME`      | When it was deleted (NULL) |
+| `DeletedBy` | `VARCHAR(45)`   | Admin who deleted it      |
 
 Use case: audit trail for `current_cash` movements (returned by
-`GET /currentcash`).
+`GET /currentcash`). A deleted row is never removed - it is flagged and skipped
+by every read, and its money was reversed when it was deleted
+(`DELETE /currentcash/transactions/:id`).
 
 ### `cash_resets`
 
@@ -306,6 +311,18 @@ the amount that was kept at the time of the reset.
 - `POST /currentcash/increase` — body `{ "amount": 50, "reason": "..." }`
 - `POST /currentcash/reduce` — body `{ "amount": 20, "reason": "..." }`
 - `POST /currentcash/reset` — reset the balance to `0` (records user + kept amount)
+- `PATCH /currentcash/transactions/:id` — correct a ledger entry (only its own
+  author may do this)
+- `DELETE /currentcash/transactions/:id` — soft-delete a ledger entry (admin
+  only). The row is kept in `cash_transactions`, flagged with
+  `Deleted`/`DeletedAt`/`DeletedBy`, and its money is reversed: an `increase` is
+  taken back off the drawer, a `reduce` is put back in, with a matching
+  `Delete of cash transaction #<id>` row in the Total cash ledger. A reversal the
+  drawer cannot fund (a `reduction` whose money was already spent or reset) is
+  rejected with `400` and nothing changes. Deleted entries are excluded from
+  `GET /currentcash`, from the day's expenses, from the daily report's cash net
+  and from the historical balance walk, so the drawer and the ledger stay in
+  step.
 
 Reductions are rejected when the amount exceeds the available cash. Creating an
 insurance automatically increases the current cash by the policy `Price`, with

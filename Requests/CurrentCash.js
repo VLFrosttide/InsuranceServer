@@ -11,7 +11,10 @@
 // currency, and the branch it applied to. Every reset records the user who
 // performed it and the amount that was kept per currency at the time of the
 // reset. Ledger entries can be corrected afterwards, but only by their original
-// author.
+// author. An admin can also DELETE a ledger entry: it is soft-deleted (kept in
+// the table, flagged with Deleted/DeletedAt/DeletedBy) and its money is moved in
+// the opposite direction, so the drawer and the Total cash ledger both stop
+// counting it.
 //
 // ---------------------------------------------------------------------------
 // TWO RECORDS OF CASH FLOW: current cash and total cash.
@@ -344,12 +347,14 @@ const getCurrentCashAsOf = (module.exports.getCurrentCashAsOf =
     const b = normalizeBranch(branch);
     const live = await getCurrentCash(conn, b);
 
-    // Movements recorded after the requested day (increase + / reduce -).
+    // Movements recorded after the requested day (increase + / reduce -). A
+    // soft-deleted movement no longer counts anywhere (its money was already
+    // given back when it was deleted), so it is skipped here as well.
     const [laterMoves] = await conn.query(
       `SELECT Currency,
          ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
        FROM cash_transactions
-       WHERE Branch = ? AND CreatedAt >= ?
+       WHERE Branch = ? AND CreatedAt >= ? AND Deleted = 0
        GROUP BY Currency`,
       [b, nextDate]
     );
@@ -1440,9 +1445,11 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
       }
       const balances = await getCurrentCash(DBConnection, branch);
       const cardBalance = await getBranchCardBalance(DBConnection, branch);
+      // Soft-deleted ledger rows are kept for the record but never listed: an
+      // admin deleted them, so they no longer count as money of this branch.
       const [txs] = await DBConnection.query(
         `SELECT * FROM cash_transactions
-          WHERE Branch = ? AND CreatedAt >= ? AND CreatedAt < ?
+          WHERE Branch = ? AND Deleted = 0 AND CreatedAt >= ? AND CreatedAt < ?
           ORDER BY id DESC`,
         [branch, day.date, day.nextDate]
       );
@@ -1552,12 +1559,14 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
 
       // Total daily cash: the net cash-drawer movement of the day across all
       // branches. Walk-in cash payments and manual increases/reductions are all
-      // recorded as cash_transactions rows, so the net is their sum.
+      // recorded as cash_transactions rows, so the net is their sum. A
+      // soft-deleted row is left out: its money was already reversed off the
+      // drawer, so counting it again would double the correction.
       const [cash] = await DBConnection.query(
         `SELECT Currency,
            ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
          FROM cash_transactions
-         WHERE CreatedAt >= ? AND CreatedAt < ?
+         WHERE Deleted = 0 AND CreatedAt >= ? AND CreatedAt < ?
          GROUP BY Currency`,
         [day.date, day.nextDate]
       );
@@ -1812,6 +1821,11 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         }
 
         const tx = rows[0];
+        // A deleted entry was already undone (its money was moved back), so
+        // there is nothing left to correct.
+        if (tx.Deleted) {
+          return res.status(400).json({ error: "Transaction already deleted" });
+        }
         if (String(tx.Username) !== String(req.user.username)) {
           return res.status(403).json({
             error: "Forbidden: you can only edit your own transactions",
@@ -1929,6 +1943,102 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         }
         console.error("CurrentCash transaction update failed:", err);
         res.status(500).json({ error: "Failed to update transaction" });
+      }
+    }
+  );
+
+  // DELETE /currentcash/transactions/:id — soft-delete a ledger entry.
+  //
+  // Admin-only. The row is never physically removed: it is flagged with
+  // Deleted/DeletedAt/DeletedBy, so the record of what happened is kept, but it
+  // is excluded from every read (`GET /currentcash`, the expenses of the day,
+  // the daily report and the historical balance walk) from then on.
+  //
+  // Deleting a ledger entry undoes it, exactly like the correction in PATCH
+  // does: the drawer is moved in the opposite direction (an increase is taken
+  // back off, a reduction is put back in) and the matching row is written to
+  // the Total cash ledger, so both records of cash flow still list the same
+  // movements. The reversal is dated with the client's local wall-clock time.
+  //
+  // A reduction whose money is no longer in the drawer (it was spent or reset
+  // in between) cannot be undone: the drawer would have to go negative, so the
+  // deletion is rejected and nothing changes.
+  router.delete(
+    "/currentcash/transactions/:id",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      try {
+        const id = Number(req.params.id);
+        const [rows] = await DBConnection.query(
+          "SELECT * FROM cash_transactions WHERE id = ?",
+          [id]
+        );
+        if (!Number.isInteger(id) || rows.length === 0) {
+          return res.status(404).json({ error: "Transaction not found" });
+        }
+
+        const tx = rows[0];
+        if (tx.Deleted) {
+          return res.status(400).json({ error: "Transaction already deleted" });
+        }
+
+        const txBranch = normalizeBranch(tx.Branch);
+        const currency = normalizeCurrency(tx.Currency);
+        const amount = Math.abs(Number(tx.Amount) || 0);
+        // The movement that undoes this entry.
+        const reverseType = tx.Type === "increase" ? "reduce" : "increase";
+
+        // The deletion is stamped with the client's local time, like every
+        // other ledger row the client writes.
+        const time = resolveRequestCreatedAt(req.body);
+        if (time.error) {
+          return res.status(400).json({ error: time.error });
+        }
+
+        await DBConnection.withTransaction(async (conn) => {
+          if (amount > 0) {
+            await adjustBalance(conn, txBranch, currency, reverseType, amount);
+
+            // Total cash reads CurrentCash live, so its balance already moved
+            // with adjustBalance above; this row keeps the Total cash ledger
+            // listing the same movements as the cash ledger.
+            await logTotalCash(
+              conn,
+              txBranch,
+              req.user.username,
+              reverseType,
+              amount,
+              `Delete of cash transaction #${id}`,
+              currency,
+              "Cash",
+              time.createdAt
+            );
+          }
+
+          await conn.query(
+            `UPDATE cash_transactions
+             SET Deleted = 1, DeletedAt = ?, DeletedBy = ?
+             WHERE id = ?`,
+            [time.createdAt, req.user.username, id]
+          );
+        });
+
+        res.json({
+          message: "Transaction deleted",
+          id,
+          reversed: amount,
+          type: reverseType,
+          currency,
+          branch: txBranch,
+        });
+      } catch (err) {
+        const msg = (err && err.message) || "";
+        if (msg.includes("insufficient")) {
+          return res.status(400).json({ error: msg });
+        }
+        console.error("CurrentCash transaction deletion failed:", err);
+        res.status(500).json({ error: "Failed to delete transaction" });
       }
     }
   );
