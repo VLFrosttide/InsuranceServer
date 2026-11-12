@@ -421,6 +421,41 @@ function brokerNameMatches(storedBroker, query) {
 module.exports.brokerNameMatches = brokerNameMatches;
 
 // ---------------------------------------------------------------------------
+// Walk-in (branch-issued) broker names
+// ---------------------------------------------------------------------------
+
+// A policy issued at a branch is a walk-in: it is paid in cash or by card and
+// stores no BrokerId, only the branch name in its Broker column. The border
+// crossings are nevertheless registered as brokers (they hold blanc batches and
+// have a human-readable ID), so a walk-in policy still has an ID to show in the
+// lookup table / Excel export. The branch names differ from the broker names,
+// so the mapping lives in one place - BrokerInfo.BranchPricingKeys:
+//   "ГКПП Капитан Андреево" -> "KapAndreevo" (ID 2.1)
+//   "ГКПП Лесово"           -> "Lesovo"      (ID 4.2)
+//   "Офис Харманли"         -> "Nikolay"     (the office; not a broker)
+// Branches that are not registered as brokers yield "" (no ID).
+// The map is loaded once (first walk-in row) and kept, so a search with many
+// rows does not re-read the seed data for every row.
+let walkInBranchMap = null;
+function walkInBrokerName(branch) {
+  const name = String(branch == null ? "" : branch).trim();
+  if (!name) return "";
+  if (walkInBranchMap === null) {
+    try {
+      walkInBranchMap = require("../db/BrokerInfo.js").BranchPricingKeys || {};
+    } catch (err) {
+      // Never break the lookup because the seed data cannot be loaded; the
+      // rows simply keep an empty ID (the same as an unknown branch). Not
+      // cached, so a later call can still succeed.
+      return "";
+    }
+  }
+  if (!Object.prototype.hasOwnProperty.call(walkInBranchMap, name)) return "";
+  return walkInBranchMap[name] || "";
+}
+module.exports.walkInBrokerName = walkInBrokerName;
+
+// ---------------------------------------------------------------------------
 // Policy currency rules: TRY is restricted to Lesovo / Kap Andreevo Auto.
 // ---------------------------------------------------------------------------
 // Turkish lira is only valid for Auto policies issued at the two border
@@ -1642,8 +1677,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       );
 
       // Attach each broker's human-readable ID (e.g. "4.2") so the client can
-      // show it in the table and in the Excel export. Walk-in policies have no
-      // BrokerId and therefore no broker code.
+      // show it in the table and in the Excel export. An email policy is linked
+      // to its broker through BrokerId, while a walk-in policy has no BrokerId -
+      // it belongs to the branch that issued it, and a border crossing is also a
+      // registered broker, so its ID is resolved through the crossing's broker
+      // name (walkInBrokerName). Branches that are not brokers (the Harmanli
+      // office) keep an empty ID.
       const brokerIds = Array.from(
         new Set(
           rows
@@ -1651,18 +1690,47 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             .filter((id) => Number.isFinite(id) && id > 0)
         )
       );
-      if (brokerIds.length > 0) {
-        const [brokerRows] = await DBConnection.query(
-          `SELECT id, Code FROM brokers WHERE id IN (${brokerIds
-            .map(() => "?")
-            .join(", ")})`,
-          brokerIds
-        );
-        const codeById = new Map(
-          brokerRows.map((b) => [Number(b.id), b.Code || ""])
-        );
+      const walkInNames = Array.from(
+        new Set(
+          rows
+            .filter((r) => !(Number(r.BrokerId) > 0))
+            .map((r) => walkInBrokerName(r.Branch))
+            .filter(Boolean)
+        )
+      );
+      if (brokerIds.length > 0 || walkInNames.length > 0) {
+        const codeById = new Map();
+        const codeByName = new Map();
+        if (brokerIds.length > 0) {
+          const [brokerRows] = await DBConnection.query(
+            `SELECT id, Code FROM brokers WHERE id IN (${brokerIds
+              .map(() => "?")
+              .join(", ")})`,
+            brokerIds
+          );
+          for (const b of brokerRows) {
+            codeById.set(Number(b.id), b.Code || "");
+          }
+        }
+        if (walkInNames.length > 0) {
+          const [walkInRows] = await DBConnection.query(
+            `SELECT Name, Code FROM brokers WHERE Name IN (${walkInNames
+              .map(() => "?")
+              .join(", ")})`,
+            walkInNames
+          );
+          // Keyed case-insensitively: the brokers table compares names without
+          // case, so a stored "kapandreevo" still matches "KapAndreevo".
+          for (const b of walkInRows) {
+            codeByName.set(String(b.Name).toLowerCase(), b.Code || "");
+          }
+        }
         for (const row of rows) {
-          row.BrokerCode = codeById.get(Number(row.BrokerId)) || "";
+          const id = Number(row.BrokerId);
+          row.BrokerCode =
+            Number.isFinite(id) && id > 0
+              ? codeById.get(id) || ""
+              : codeByName.get(walkInBrokerName(row.Branch).toLowerCase()) || "";
         }
       }
 
