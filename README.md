@@ -325,20 +325,47 @@ Each broker has a cash balance. Only admins
 (role 1) and workers (role 2) can view or change a broker balance (unlike
 current cash, a broker balance may go infinitely negative).
 
-Current cash and broker balance are intentionally asymmetric:
+A broker balance never moves current cash:
 
-- `POST /brokers/:id/increase` mirrors the same amount into current cash
-  (money is actually coming in), so current cash goes up too.
+- `POST /brokers/:id/increase` is money handed over by the broker. It is kept
+  apart from current cash as the branch's **Cash from Brokers** (see below).
 - `POST /brokers/:id/reduce`, and the automatic per-policy deduction made when
-  an insurance is created from an email card, never touch current cash.
-  Current cash never decreases as a side effect of a broker balance
-  reduction, and a reduction is never blocked by how much current cash
-  happens to be available.
+  an insurance is created from an email card, touch neither current cash nor
+  Cash from Brokers, and are never blocked by how much cash happens to be
+  available.
+
+### Cash from Brokers
+
+Each top-up is stored once, as a `broker_balance_movements` row of type
+`increase` carrying the `Branch` that took the money and its `Currency`. A
+branch's Cash from Brokers is not a stored total: it is the sum of that
+branch's top-ups recorded since its last reset, so correcting or deleting a
+top-up in the broker's history corrects it here too. Refunds of annulled or
+deleted insurances, price changes and admin balance edits are not money handed
+over and are never counted.
+
+- `GET /currentcash` returns `brokerCash` (the balance per currency),
+  `brokerCashTransactions` (the top-ups of the requested day) and
+  `brokerCashResets`.
+- `GET /currentcash/daily` returns `cashFromBrokers` (the top-ups of the day).
+- `POST /currentcash/reset` also clears it, recording the kept amounts in
+  `broker_cash_resets`.
+
+Top-ups made before this was introduced have no branch and were mirrored into
+current cash at the time. `db/setup.js` runs `db/separateBrokerCash.js` once on
+start-up to move them over: it matches each of those top-ups to the current-cash
+increase it was mirrored into, gives the movement that cash row's `Branch` and
+`Currency`, deletes the mirrored cash row, shortens the resets that kept that
+money (recording the kept amount in `broker_cash_resets`) and takes what is left
+out of `current_cash` (never below zero). A top-up the migration cannot match -
+its cash entry was edited into another amount, or it has no cash entry at all -
+is left exactly as it was. The run is marked in `app_settings` as
+`cash_from_brokers_backfill`, so it never repeats.
 
 - `GET /brokers` — list all brokers with balance and inactive policies
 - `GET /brokers/:id` — single broker
-- `POST /brokers/:id/increase` — body `{ "amount": 100 }` (mirrors into current cash)
-- `POST /brokers/:id/reduce` — body `{ "amount": 50 }` (may go infinitely negative; does not touch current cash)
+- `POST /brokers/:id/increase` — body `{ "amount": 100, "branch": "..." }` (the money is the branch's Cash from Brokers; current cash is not touched)
+- `POST /brokers/:id/reduce` — body `{ "amount": 50 }` (may go infinitely negative; touches neither current cash nor Cash from Brokers)
 
 Admin-only (`role 1`) broker management:
 

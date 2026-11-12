@@ -331,8 +331,12 @@ async function main() {
       JSON.stringify(demoBroker)
     );
 
-    // Worker can increase a broker balance. The movement is mirrored into
-    // current cash (reason/currency are required).
+    // Worker can increase a broker balance. The money is the branch's Cash from
+    // Brokers: it never touches current cash (reason/currency are required).
+    const cashBeforeBrokerIncrease = (
+      await req("GET", "/currentcash", null, workerToken)
+    ).data.balances.EUR;
+
     r = await req(
       "POST",
       `/brokers/${brokerId}/increase`,
@@ -345,9 +349,22 @@ async function main() {
       JSON.stringify(r.data)
     );
 
-    // Worker can reduce a broker balance. Unlike the increase endpoint, this
-    // never touches current cash: current cash only ever goes up when a
-    // broker balance is increased, never down when it is reduced.
+    const afterBrokerIncrease = (
+      await req("GET", "/currentcash", null, workerToken)
+    ).data;
+    check(
+      "Broker increase does not change current cash",
+      afterBrokerIncrease.balances.EUR === cashBeforeBrokerIncrease,
+      `${cashBeforeBrokerIncrease} -> ${afterBrokerIncrease.balances.EUR}`
+    );
+    check(
+      "Broker increase is recorded as the branch's Cash from Brokers",
+      Number((afterBrokerIncrease.brokerCash || {}).EUR) >= 100,
+      JSON.stringify(afterBrokerIncrease.brokerCash)
+    );
+
+    // Worker can reduce a broker balance. Like an increase, this never touches
+    // current cash: a broker balance move and the cash drawer are separate.
     const cashBeforeBrokerReduce = (
       await req("GET", "/currentcash", null, workerToken)
     ).data.balances.EUR;

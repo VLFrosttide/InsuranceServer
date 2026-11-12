@@ -39,10 +39,13 @@
 // tagged with the channel it came through (Source = Cash | Card | Broker).
 //
 // Email cash payments (an insurance created from a broker's email) are funded by
-// that broker's balance: the money already entered the drawer when the broker
+// that broker's balance: the money was already handed over when the broker
 // topped up, so such a policy REDUCES `brokers.CashBalance` and is recorded
-// under the Broker channel only. It must never increase current cash a second
-// time.
+// under the Broker channel only. It must never increase current cash.
+//
+// CASH FROM BROKERS is a third, separate balance: the money a broker hands over
+// when their balance is topped up. It is NOT part of current cash (see "Cash
+// from brokers, per branch" below).
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
@@ -643,6 +646,78 @@ const recordCashLedgerOnly = (module.exports.recordCashLedgerOnly =
     return decimal;
   });
 
+// ---------------------------------------------------------------------------
+// Expences: the money that left a branch's drawer BY HAND on one day.
+//
+// The drawer's ledger (`cash_transactions`) holds two kinds of reductions:
+//
+//   - the MANUAL ones, entered with the "Reduce" button together with a reason
+//     the worker typed in ("rent", "supplies", "salary" ...). Those are the
+//     branch's expenses.
+//   - the ones the insurances routes write when a policy moves money: the
+//     refund of an annulled policy, the money a deletion gives back, and the
+//     reversal of an edit/price correction. They lower the drawer too, but they
+//     are policy movements, NOT money the branch spent, so they must not be
+//     counted as expenses.
+//
+// A ledger row carries no reference to the policy it belongs to, so the second
+// kind is recognised by the reason its writer always uses (see
+// Requests/TierEndpoints.js): "Annul <blanc>", "Delete <blanc>",
+// "Restore <blanc>", "Edit <blanc>" and "Price change <blanc>". Every other
+// reduction was typed in by hand and is an expense.
+// ---------------------------------------------------------------------------
+
+const POLICY_MOVEMENT_REASON_PREFIXES = [
+  "Annul ",
+  "Delete ",
+  "Restore ",
+  "Edit ",
+  "Price change ",
+];
+
+/**
+ * Whether a cash-ledger reason was written by an insurance movement
+ * (annulment, deletion, restoration, edit or price correction) instead of by a
+ * worker recording an expense by hand.
+ *
+ * @param {string} reason
+ * @returns {boolean}
+ */
+const isPolicyMovementReason = (module.exports.isPolicyMovementReason =
+  function isPolicyMovementReason(reason) {
+    const text = typeof reason === "string" ? reason.trim() : "";
+    if (!text) return false;
+    return POLICY_MOVEMENT_REASON_PREFIXES.some((prefix) =>
+      text.startsWith(prefix)
+    );
+  });
+
+/**
+ * Split one day's `cash_transactions` rows into the branch's EXPENCES - the
+ * manual reductions only - and their per-currency total. Refunds of annulled or
+ * deleted insurances and the corrections of edited policies are left out: they
+ * are policy movements, not money the branch spent.
+ *
+ * @param {object[]} rows  The day's `cash_transactions` rows.
+ * @returns {{ expences: object[], totalExpences: Record<string, number> }}
+ */
+const splitExpences = (module.exports.splitExpences =
+  function splitExpences(rows) {
+    const expences = (rows || []).filter(
+      (row) =>
+        String(row.Type || "").toLowerCase() === "reduce" &&
+        !isPolicyMovementReason(row.Reason)
+    );
+    const totalExpences = {};
+    for (const currency of CURRENCIES) totalExpences[currency] = 0;
+    for (const row of expences) {
+      const cur = normalizeCurrency(row.Currency);
+      totalExpences[cur] =
+        Math.round((totalExpences[cur] + (Number(row.Amount) || 0)) * 100) / 100;
+    }
+    return { expences, totalExpences };
+  });
+
 /**
  * Apply a movement to one of the stored total_cash parts (CardPart/BrokerPart).
  *
@@ -747,9 +822,9 @@ const logTotalCash = (module.exports.logTotalCash =
  * on top of current cash.
  *
  * Broker: an insurance created from a broker's email is funded by that broker's
- * balance (see decreaseBrokerForInsurance in Brokers.js). The cash already
- * entered the drawer when the broker topped up, so current cash must NOT be
- * increased again - the payment is recorded here only.
+ * balance (see decreaseBrokerForInsurance in Brokers.js). The money was already
+ * handed over when the broker topped up (it is the branch's Cash from Brokers),
+ * so current cash must NOT be increased - the payment is recorded here only.
  *
  * NOTE: runs inside the caller's transaction.
  *
@@ -1057,6 +1132,162 @@ const resetBranchCard = (module.exports.resetBranchCard =
     return kept;
   });
 
+// ---------------------------------------------------------------------------
+// Cash from brokers, per branch.
+//
+// When a broker hands over money their balance is increased
+// (POST /brokers/:id/increase in Brokers.js). That money used to be mirrored
+// into current cash; it is now kept apart as the branch's "Cash from Brokers".
+//
+// It is not stored as a running total. Every top-up is already a row in
+// `broker_balance_movements` (Type = 'increase') carrying the branch that took
+// the money and its currency, so the balance is computed on every read as the
+// branch's top-ups recorded after its last reset. The balance and the
+// "Transactions cash from brokers" list are therefore the same data: a top-up
+// an admin corrects or deletes in the broker's history is corrected here too.
+//
+// Only manual top-ups count. The other movements that raise a broker balance -
+// the refund of an annulled or deleted insurance, a price change, an admin
+// adjustment - are not money handed over, and carry no branch.
+//
+// "Reset to 0" hands the branch's money over, so it clears this balance too:
+// `broker_cash_resets` records what was kept and the id of the last movement
+// the reset covered (movement ids, unlike the client-supplied CreatedAt, are
+// strictly ordered).
+// ---------------------------------------------------------------------------
+
+// The movements that are cash handed over by a broker (`m` = the movement).
+const BROKER_CASH_WHERE =
+  "m.Type = 'increase' AND m.Deleted = 0 AND m.Amount > 0";
+
+/**
+ * Id of the last broker movement covered by a branch's most recent cash-from-
+ * brokers reset (0 when the branch was never reset).
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch  Already normalised.
+ * @returns {Promise<number>}
+ */
+async function brokerCashResetMarker(conn, branch) {
+  const [rows] = await conn.query(
+    "SELECT COALESCE(MAX(LastMovementId), 0) AS Marker FROM broker_cash_resets WHERE Branch = ?",
+    [branch]
+  );
+  return rows.length ? Number(rows[0].Marker) || 0 : 0;
+}
+
+/**
+ * Sum a branch's broker top-ups per currency, for the movements after
+ * `afterId` and (when given) up to and including `throughId`.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch  Already normalised.
+ * @param {number} afterId
+ * @param {number} [throughId]
+ * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, TRY: 0 }
+ */
+async function sumBrokerCash(conn, branch, afterId, throughId) {
+  const bounded = throughId !== undefined;
+  const upper = bounded ? " AND m.id <= ?" : "";
+  const [rows] = await conn.query(
+    `SELECT m.Currency, ROUND(SUM(m.Amount), 2) AS Total
+       FROM broker_balance_movements m
+      WHERE ${BROKER_CASH_WHERE} AND m.Branch = ? AND m.id > ?${upper}
+      GROUP BY m.Currency`,
+    bounded ? [branch, afterId, throughId] : [branch, afterId]
+  );
+  const totals = {};
+  for (const currency of CURRENCIES) totals[currency] = 0;
+  for (const row of rows) {
+    const cur = normalizeCurrency(row.Currency);
+    totals[cur] =
+      Math.round((totals[cur] + (Number(row.Total) || 0)) * 100) / 100;
+  }
+  return totals;
+}
+
+/**
+ * Read a branch's Cash from Brokers, keyed by currency code: the money brokers
+ * handed over at that branch since its last reset.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, TRY: 0 }
+ */
+const getBrokerCash = (module.exports.getBrokerCash =
+  async function getBrokerCash(conn, branch) {
+    const b = normalizeBranch(branch);
+    return sumBrokerCash(conn, b, await brokerCashResetMarker(conn, b));
+  });
+
+/**
+ * The broker top-ups a branch received on one day, newest first.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ * @param {string} date  "YYYY-MM-DD" of the day.
+ * @param {string} nextDate  "YYYY-MM-DD" of the day after.
+ * @returns {Promise<object[]>}
+ */
+const getBrokerCashTransactions = (module.exports.getBrokerCashTransactions =
+  async function getBrokerCashTransactions(conn, branch, date, nextDate) {
+    const [rows] = await conn.query(
+      `SELECT m.id, m.BrokerId, b.Name AS BrokerName, m.Amount, m.Currency,
+              m.Author AS Username, m.Reason, m.CreatedAt
+         FROM broker_balance_movements m
+         LEFT JOIN brokers b ON b.id = m.BrokerId
+        WHERE ${BROKER_CASH_WHERE} AND m.Branch = ?
+          AND m.CreatedAt >= ? AND m.CreatedAt < ?
+        ORDER BY m.id DESC`,
+      [normalizeBranch(branch), date, nextDate]
+    );
+    return rows;
+  });
+
+/**
+ * Clear a branch's Cash from Brokers and record who did it and how much was
+ * kept per currency. Nothing is recorded for a currency with nothing to keep.
+ *
+ * NOTE: runs inside the caller's transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ * @param {string} username
+ * @param {string} [createdAt]  Client's local wall-clock time. Defaults to the
+ *   server's UTC clock.
+ * @returns {Promise<Record<string, number>>} Kept amount per currency.
+ */
+const resetBrokerCash = (module.exports.resetBrokerCash =
+  async function resetBrokerCash(conn, branch, username, createdAt) {
+    const b = normalizeBranch(branch);
+    const ts =
+      typeof createdAt === "string" && createdAt.trim() !== ""
+        ? createdAt.trim()
+        : clientLocalDateTime(0);
+
+    // The reset covers the movements recorded so far. Bounding the sum by the
+    // same id keeps a top-up that lands while this runs in the next period.
+    const after = await brokerCashResetMarker(conn, b);
+    const [last] = await conn.query(
+      "SELECT COALESCE(MAX(id), 0) AS LastId FROM broker_balance_movements"
+    );
+    const through = Math.max(
+      after,
+      last.length ? Number(last[0].LastId) || 0 : 0
+    );
+    const kept = await sumBrokerCash(conn, b, after, through);
+
+    for (const currency of CURRENCIES) {
+      if (kept[currency] === 0) continue;
+      await conn.query(
+        "INSERT INTO broker_cash_resets (Branch, Username, Currency, KeptAmount, LastMovementId, CreatedAt) VALUES (?, ?, ?, ?, ?, ?)",
+        [b, username, currency, kept[currency], through, ts]
+      );
+    }
+
+    return kept;
+  });
+
 /**
  * Reset current cash to zero (all currencies) for a branch and record who did
  * it and how much was kept per currency.
@@ -1121,15 +1352,17 @@ const resetCurrentCash = (module.exports.resetCurrentCash =
 
 /**
  * "Reset to 0" for a branch: zeroes the branch's current cash (every
- * currency) AND the branch's card balance, recording both resets.
+ * currency), the branch's card balance AND its cash from brokers, recording
+ * each reset.
  *
  * NOTE: runs inside the caller's transaction.
  *
  * @param {import("mysql2/promise").Connection} conn
  * @param {string} branch
  * @param {string} username
- * @returns {Promise<{cash: Record<string, number>, card: number}>} What was
- *   kept: cash per currency and the card balance.
+ * @returns {Promise<{cash: Record<string, number>, card: number,
+ *   brokerCash: Record<string, number>}>} What was kept: cash per currency,
+ *   the card balance and cash from brokers per currency.
  */
 const resetBranch = (module.exports.resetBranch = async function resetBranch(
   conn,
@@ -1139,7 +1372,8 @@ const resetBranch = (module.exports.resetBranch = async function resetBranch(
 ) {
   const cash = await resetCurrentCash(conn, branch, username, createdAt);
   const card = await resetBranchCard(conn, branch, username, createdAt);
-  return { cash, card };
+  const brokerCash = await resetBrokerCash(conn, branch, username, createdAt);
+  return { cash, card, brokerCash };
 });
 
 /**
@@ -1227,12 +1461,38 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
           ORDER BY id DESC`,
         [branch, day.date, day.nextDate]
       );
+      // Cash from Brokers: the branch's balance, the top-ups it received on the
+      // requested day, and the resets that cleared it that day.
+      const brokerCash = await getBrokerCash(DBConnection, branch);
+      const brokerCashTransactions = await getBrokerCashTransactions(
+        DBConnection,
+        branch,
+        day.date,
+        day.nextDate
+      );
+      const [brokerCashResets] = await DBConnection.query(
+        `SELECT * FROM broker_cash_resets
+          WHERE Branch = ? AND CreatedAt >= ? AND CreatedAt < ?
+          ORDER BY id DESC`,
+        [branch, day.date, day.nextDate]
+      );
+      // The day's EXPENCES: the manual reductions of the same ledger, i.e.
+      // everything except the refunds/corrections the insurances routes wrote
+      // for an annulled, deleted, restored or edited policy (see "Expences"
+      // above). They are read from the rows already fetched, so the list always
+      // matches the Transactions table shown next to it on the same day.
+      const { expences, totalExpences } = splitExpences(txs);
       res.json({
         balances,
         cardBalance,
+        brokerCash,
         transactions: txs,
+        expences,
+        totalExpences,
+        brokerCashTransactions,
         resets,
         cardResets,
+        brokerCashResets,
         date: day.date,
       });
     } catch (err) {
@@ -1244,8 +1504,9 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
   // GET /currentcash/daily — country-wide daily report for the day in the
   // query string. It is independent of the branch selector above: insurances
   // and cash movements are counted across ALL branches. When ?branch= is
-  // provided, the report becomes branch-scoped: `cardPayments` and
-  // `brokerBalance` are restricted to that branch, and `availableCash` carries
+  // provided, the report becomes branch-scoped: `cardPayments`,
+  // `brokerBalance` and `cashFromBrokers` (the money brokers handed over that
+  // day) are restricted to that branch, and `availableCash` carries
   // that branch's cash drawer balance at the end of the requested day (so
   // walking the date back shows the amount it actually had then, not today's).
   //   ?date=YYYY-MM-DD  day to report on (default: the client's today)
@@ -1353,6 +1614,28 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         return out;
       };
 
+      // Total cash from brokers: the money brokers handed over that day (top-ups
+      // of a broker balance), restricted to the branch when one is supplied.
+      // Top-ups recorded before this money was separated were given a branch and
+      // taken out of current cash by db/separateBrokerCash.js, so past days show
+      // the same split; a top-up the migration could not match stays in current
+      // cash and is therefore not counted here.
+      const [brokerCashRows] = await DBConnection.query(
+        `SELECT m.Currency, ROUND(SUM(m.Amount), 2) AS Total
+           FROM broker_balance_movements m
+          WHERE ${BROKER_CASH_WHERE} AND m.Branch IS NOT NULL
+            AND m.CreatedAt >= ? AND m.CreatedAt < ?${
+              branch ? " AND m.Branch = ?" : ""
+            }
+          GROUP BY m.Currency`,
+        [day.date, day.nextDate, ...branchArg]
+      );
+      const cashFromBrokers = { EUR: 0, TRY: 0 };
+      for (const row of brokerCashRows) {
+        cashFromBrokers[normalizeCurrency(row.Currency)] =
+          Number(row.Total) || 0;
+      }
+
       const report = {
         date: day.date,
         totalInsurances: Number(counts[0].total) || 0,
@@ -1362,6 +1645,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         countryWideInsurances: Math.max(0, lastPolicy - firstPolicy),
         cardPayments: byBranch(cardRows),
         brokerBalance: byBranch(brokerRows),
+        cashFromBrokers,
       };
 
       // The selected branch's cash drawer balance at the end of the chosen day.
@@ -1479,8 +1763,9 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
     }
   );
 
-  // POST /currentcash/reset — "Reset to 0": zero all currencies AND the card
-  // balance of a branch, recording both resets. Expects { branch } in the body.
+  // POST /currentcash/reset — "Reset to 0": zero all currencies, the card
+  // balance AND the cash from brokers of a branch, recording each reset.
+  // Expects { branch } in the body.
   router.post("/currentcash/reset", auth, requireCashRole, async (req, res) => {
     try {
       const { branch } = req.body || {};
@@ -1489,14 +1774,15 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
       if (time.error) {
         return res.status(400).json({ error: time.error });
       }
-      const { cash, card } = await DBConnection.withTransaction((conn) =>
-        resetBranch(conn, b, req.user.username, time.createdAt)
+      const { cash, card, brokerCash } = await DBConnection.withTransaction(
+        (conn) => resetBranch(conn, b, req.user.username, time.createdAt)
       );
 
       res.status(200).json({
-        message: "Current cash and card balance reset",
+        message: "Current cash, card balance and cash from brokers reset",
         kept: cash,
         cardKept: card,
+        brokerCashKept: brokerCash,
         branch: b,
         author: req.user.username,
       });

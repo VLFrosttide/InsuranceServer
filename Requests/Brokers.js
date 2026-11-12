@@ -5,15 +5,16 @@
 // (role 2) can increase/reduce. Unlike daily current cash, a broker balance
 // may go infinitely negative.
 //
-// Current cash and broker balance are intentionally asymmetric:
-//   - Increasing a broker's balance mirrors the same amount into current
-//     cash (money is actually coming in), so current cash goes up too.
+// A broker balance never moves current cash:
+//   - Increasing a broker's balance is money handed over by the broker. It
+//     is kept apart from current cash as the branch's "Cash from Brokers":
+//     the top-up is recorded once, as a balance movement carrying the branch
+//     that took the money and its currency (see CurrentCash.js).
 //   - Reducing a broker's balance (including the per-policy deduction made
 //     when an insurance is created from an email card, see
-//     decreaseBrokerForInsurance below) never touches current cash. Current
-//     cash must never decrease as a side effect of a broker balance
-//     reduction, and a broker reduction must never be blocked by how much
-//     current cash happens to be available.
+//     decreaseBrokerForInsurance below) touches neither current cash nor
+//     Cash from Brokers, and is never blocked by how much cash happens to be
+//     available.
 //
 // Creating an insurance whose email sender is associated with a broker
 // deducts a flat fee (the policy price) from that broker's balance. No
@@ -54,7 +55,6 @@ const isSubBrokerName =
     : (name) => DEFAULT_SUB_BROKERS.has(String(name ?? "").trim());
 const {
   toDecimal,
-  recordCashMovement,
   normalizeCurrency,
   normalizeBranch,
   clientLocalDateTime,
@@ -833,7 +833,10 @@ const adjustBrokerForPriceChange = (module.exports.adjustBrokerForPriceChange =
 // the website can show each broker's balance movement per bi-weekly period.
 // `Amount` is signed: positive increases the balance, negative decreases it.
 // Policy-derived rows also carry the policy's BlancNumber; manual rows leave
-// it NULL.
+// it NULL. A manual top-up ("increase") is money handed over by the broker, so
+// it also carries the Branch that took the money and its Currency: those rows
+// are the branch's "Cash from Brokers" (see CurrentCash.js). Branch is NULL on
+// every other movement.
 
 const BROKER_MOVEMENT_TABLE_SQL = `CREATE TABLE IF NOT EXISTS broker_balance_movements (
   id INT NOT NULL AUTO_INCREMENT,
@@ -847,8 +850,11 @@ const BROKER_MOVEMENT_TABLE_SQL = `CREATE TABLE IF NOT EXISTS broker_balance_mov
   Deleted TINYINT(1) NOT NULL DEFAULT 0,
   DeletedAt DATETIME NULL,
   DeletedBy VARCHAR(45) NULL,
+  Branch VARCHAR(45) NULL,
+  Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
   PRIMARY KEY (id),
-  KEY idx_broker_movements_broker_time (BrokerId, CreatedAt)
+  KEY idx_broker_movements_broker_time (BrokerId, CreatedAt),
+  KEY idx_broker_movements_branch_time (Branch, CreatedAt)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 COMMENT='Every change to a broker CashBalance (signed Amount)'`;
 module.exports.BROKER_MOVEMENT_TABLE_SQL = BROKER_MOVEMENT_TABLE_SQL;
@@ -863,8 +869,11 @@ module.exports.BROKER_MOVEMENT_TABLE_SQL = BROKER_MOVEMENT_TABLE_SQL;
  * @param {string} type  e.g. "policy" | "annulment" | "deletion" |
  *                       "price_change" | "increase" | "reduce" | "adjust"
  * @param {{reason?: string, author?: string, blancNumber?: string,
- *          createdAt?: string}} [meta]  `createdAt` is an already-resolved
- *          client-local "YYYY-MM-DD HH:MM:SS" string.
+ *          createdAt?: string, branch?: string, currency?: string}} [meta]
+ *          `createdAt` is an already-resolved client-local
+ *          "YYYY-MM-DD HH:MM:SS" string. `branch` (with `currency`) is passed
+ *          only for money handed over by the broker: it marks the movement as
+ *          that branch's Cash from Brokers.
  * @returns {Promise<number>} the (rounded) amount recorded, or 0 if skipped.
  */
 const recordBrokerMovement = (module.exports.recordBrokerMovement =
@@ -879,19 +888,38 @@ const recordBrokerMovement = (module.exports.recordBrokerMovement =
       const parsed = parseClientDateTime(meta.createdAt);
       if (parsed) createdAt = parsed;
     }
+    const columns = [
+      "BrokerId",
+      "Amount",
+      "Type",
+      "Reason",
+      "Author",
+      "BlancNumber",
+      "CreatedAt",
+    ];
+    const values = [
+      brokerId,
+      amt,
+      type,
+      String(meta.reason ?? ""),
+      String(meta.author ?? ""),
+      meta.blancNumber ? String(meta.blancNumber) : null,
+      createdAt,
+    ];
+    // Only money handed over by the broker names a branch (an empty one
+    // included). Every other movement leaves Branch NULL, which keeps it out
+    // of Cash from Brokers.
+    if (typeof meta.branch === "string") {
+      columns.push("Branch", "Currency");
+      values.push(
+        normalizeBranch(meta.branch),
+        normalizeCurrency(meta.currency)
+      );
+    }
     await conn.query(
-      `INSERT INTO broker_balance_movements
-         (BrokerId, Amount, Type, Reason, Author, BlancNumber, CreatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        brokerId,
-        amt,
-        type,
-        String(meta.reason ?? ""),
-        String(meta.author ?? ""),
-        meta.blancNumber ? String(meta.blancNumber) : null,
-        createdAt,
-      ]
+      `INSERT INTO broker_balance_movements (${columns.join(", ")})
+       VALUES (${columns.map(() => "?").join(", ")})`,
+      values
     );
     return amt;
   });
@@ -2755,7 +2783,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     }
   );
 
-  // POST /brokers/:id/increase  { amount, reason, currency }
+  // POST /brokers/:id/increase  { amount, reason, currency, branch }
+  // The money is recorded as Cash from Brokers of `branch` (the branch that
+  // took it); current cash is not touched.
   router.post(
     "/brokers/:id/increase",
     auth,
@@ -2786,8 +2816,10 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           return res.status(400).json({ error: moveTime.error });
         }
 
-        // Update the broker balance and mirror the movement into current cash in
-        // one transaction, so the two ledgers can never diverge.
+        // Money handed over by a broker is the branch's Cash from Brokers, never
+        // current cash. The top-up is recorded once, as a broker balance
+        // movement carrying the branch that took the money and its currency
+        // (see "Cash from brokers, per branch" in CurrentCash.js).
         const affectedRows = await DBConnection.withTransaction(
           async (conn) => {
             const [r] = await conn.query(
@@ -2796,21 +2828,12 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             );
             if (r.affectedRows === 0) return r.affectedRows;
 
-            await recordCashMovement(
-              conn,
-              branch,
-              req.user.username,
-              "increase",
-              amount,
-              reason,
-              currency,
-              moveTime.createdAt
-            );
-
             await recordBrokerMovement(conn, brokerId, amount, "increase", {
               reason,
               author: req.user.username,
               createdAt: moveTime.createdAt,
+              branch,
+              currency,
             });
 
             return r.affectedRows;
@@ -2829,6 +2852,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           message: "Broker balance increased",
           amount,
           currency,
+          branch,
           broker,
         });
       } catch (err) {
@@ -2843,10 +2867,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   );
 
   // POST /brokers/:id/reduce  { amount, reason, currency } — balance may go
-  // infinitely negative. Unlike the increase endpoint, this does NOT touch
-  // current cash: current cash only ever increases when a broker balance is
-  // increased (money actually coming in), so reducing a broker balance must
-  // never decrease current cash or be blocked by its availability.
+  // infinitely negative. It touches neither current cash nor Cash from
+  // Brokers: reducing a broker balance must never decrease either of them or
+  // be blocked by how much cash happens to be available.
   router.post(
     "/brokers/:id/reduce",
     auth,

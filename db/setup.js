@@ -8,6 +8,7 @@
 // Requires .env to contain DB_PASSWORD (MySQL root password).
 
 const mysql = require("mysql2/promise");
+const { separateBrokerCash } = require("./separateBrokerCash.js");
 
 /**
  * One-time split of the old global card balance into per-branch balances
@@ -862,10 +863,34 @@ async function runSetup(config = {}) {
        Deleted TINYINT(1) NOT NULL DEFAULT 0,
        DeletedAt DATETIME NULL,
        DeletedBy VARCHAR(45) NULL,
+       Branch VARCHAR(45) NULL,
+       Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
        PRIMARY KEY (id),
-       KEY idx_broker_movements_broker_time (BrokerId, CreatedAt)
+       KEY idx_broker_movements_broker_time (BrokerId, CreatedAt),
+       KEY idx_broker_movements_branch_time (Branch, CreatedAt)
      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
      COMMENT='Every change to a broker CashBalance (signed Amount)'
+   `);
+
+  // Cash from Brokers: the money brokers hand over when their balance is topped
+  // up is kept apart from current cash (see Requests/CurrentCash.js). The
+  // balance is computed from the top-ups in broker_balance_movements; this
+  // table records each "Reset to 0" of it - who did it, how much was kept per
+  // currency, and the last movement the reset covered.
+  await db.query(`
+     CREATE TABLE IF NOT EXISTS broker_cash_resets (
+       id INT NOT NULL AUTO_INCREMENT,
+       Branch VARCHAR(45) NOT NULL DEFAULT '',
+       Username VARCHAR(45) NOT NULL,
+       Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
+       KeptAmount DECIMAL(15,2) NOT NULL DEFAULT 0,
+       LastMovementId INT NOT NULL DEFAULT 0,
+       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       PRIMARY KEY (id),
+       KEY idx_broker_cash_resets_branch (Branch),
+       KEY idx_broker_cash_resets_username (Username)
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+     COMMENT='Resets of a branch Cash from Brokers (kept amount per currency)'
    `);
   // Global key/value settings (e.g. whether broker requests that would push a
   // broker balance negative are accepted). Keyed by `name` so future toggles
@@ -984,6 +1009,57 @@ async function runSetup(config = {}) {
       "ALTER TABLE broker_balance_movements ADD COLUMN DeletedBy VARCHAR(45) NULL"
     );
     console.log("Added broker_balance_movements.DeletedBy column");
+  }
+
+  // Cash from Brokers: a manual top-up carries the branch that took the money
+  // and its currency. Branch stays NULL on every other movement. Top-ups made
+  // before this change were mirrored into current cash and have no branch yet;
+  // the separation further down gives them one and takes them out of the drawer.
+  if (!movementColNames.has("Branch")) {
+    await db.query(
+      "ALTER TABLE broker_balance_movements ADD COLUMN Branch VARCHAR(45) NULL"
+    );
+    await db.query(
+      "ALTER TABLE broker_balance_movements ADD KEY idx_broker_movements_branch_time (Branch, CreatedAt)"
+    );
+    console.log("Added broker_balance_movements.Branch column");
+  }
+  if (!movementColNames.has("Currency")) {
+    await db.query(
+      "ALTER TABLE broker_balance_movements ADD COLUMN Currency VARCHAR(3) NOT NULL DEFAULT 'EUR'"
+    );
+    console.log("Added broker_balance_movements.Currency column");
+  }
+
+  // Cash from Brokers: broker top-ups recorded before the split above were also
+  // mirrored into current cash, so they still count as Available cash. Take them
+  // out of the drawer once (see db/separateBrokerCash.js). The migration is
+  // transactional and marks itself in `app_settings`; a failure rolls it back and
+  // is retried on the next start, so setup carries on either way.
+  try {
+    await db.beginTransaction();
+    let separated;
+    try {
+      separated = await separateBrokerCash(db, { log: console.warn });
+      await db.commit();
+    } catch (err) {
+      await db.rollback();
+      throw err;
+    }
+    if (separated.ran) {
+      const detail = separated.groups
+        .map((g) => `${g.Branch || "(no branch)"} ${g.Currency} ${g.Amount}`)
+        .join(", ");
+      console.log(
+        `Separated ${separated.pairs} broker top-up(s) from current cash` +
+          (detail ? `: ${detail}` : "")
+      );
+    }
+  } catch (err) {
+    console.warn(
+      "Could not separate past broker top-ups from current cash:",
+      (err && err.message) || err
+    );
   }
 
   // One-time backfill of the broker balance ledger from existing insurances,
