@@ -1552,10 +1552,46 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
            AND CreationDate >= ? AND CreationDate < ?`,
         [day.date, day.nextDate]
       );
+      const hasNumberedPolicies = !!(span[0] && span[0].firstPolicy !== null);
       const firstPolicy =
         span[0] && span[0].firstPolicy !== null ? Number(span[0].firstPolicy) : 0;
       const lastPolicy =
         span[0] && span[0].lastPolicy !== null ? Number(span[0].lastPolicy) : 0;
+
+      // The two policies that set the ends of that range. The figure is only
+      // the distance between the day's lowest and highest policy number, so a
+      // single mistyped or out-of-series number at either end changes it by
+      // hundreds of thousands. Returning the two records lets the screen show
+      // which policies produced the number, making such an outlier obvious.
+      const policyRef = (row) =>
+        row
+          ? {
+              PolicyNumber: String(row.PolicyNumber ?? ""),
+              BlancNumber: String(row.BlancNumber ?? ""),
+              Branch: String(row.Branch ?? ""),
+              Author: String(row.Author ?? ""),
+              CreatedAt: String(row.CreatedAt ?? ""),
+            }
+          : null;
+      const countryWideRange = { first: null, last: null };
+      if (hasNumberedPolicies) {
+        const edgeSql = (direction) =>
+          `SELECT PolicyNumber, BlancNumber, Branch, Author,
+                  DATE_FORMAT(CreationDate, '%Y-%m-%d %H:%i') AS CreatedAt
+             FROM insurance
+            WHERE Deleted = 0
+              AND PolicyNumber REGEXP '^[0-9]+$'
+              AND CreationDate >= ? AND CreationDate < ?
+            ORDER BY CAST(PolicyNumber AS UNSIGNED) ${direction},
+                     BlancNumber ${direction}
+            LIMIT 1`;
+        const [[firstRows], [lastRows]] = await Promise.all([
+          DBConnection.query(edgeSql("ASC"), [day.date, day.nextDate]),
+          DBConnection.query(edgeSql("DESC"), [day.date, day.nextDate]),
+        ]);
+        countryWideRange.first = policyRef(firstRows && firstRows[0]);
+        countryWideRange.last = policyRef(lastRows && lastRows[0]);
+      }
 
       // Total daily cash: the net cash-drawer movement of the day across all
       // branches. Walk-in cash payments and manual increases/reductions are all
@@ -1652,6 +1688,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         walkInInsurances: Number(counts[0].walkIn) || 0,
         totalDailyCash,
         countryWideInsurances: Math.max(0, lastPolicy - firstPolicy),
+        countryWideRange,
         cardPayments: byBranch(cardRows),
         brokerBalance: byBranch(brokerRows),
         cashFromBrokers,
