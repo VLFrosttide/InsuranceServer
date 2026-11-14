@@ -2035,7 +2035,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         const [policies] = await DBConnection.query(
           `SELECT PolicyNumber, BlancNumber, CarNumber, Price, CurrencyType,
                   Duration, Otomobil, NonTurk, CardFee, Branch, PaymentType,
-                  CreationDate, StartDate, Annulled
+                  CreationDate, StartDate, Annulled, AnnulFee, AnnulDate
              FROM insurance
             WHERE ${conditions.join(" AND ")}
             ORDER BY CreationDate DESC`,
@@ -2053,6 +2053,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               ...p,
               Price: null,
               CurrencyType: null,
+              // The live annulled price is money too, so it is hidden with the
+              // rest of the pricing.
+              AnnulFee: null,
             })
           );
           brokerCashBalance = null;

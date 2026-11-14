@@ -249,6 +249,10 @@ npm start
 
 The server listens on `http://127.0.0.1:5501`.
 
+It exposes the REST API and the WebSocket only. The broker website is hosted
+separately (see the `InsuranceWebsite` repository) and talks to this server
+through `API_BASE`.
+
 To run without Gmail integration (useful for quick testing):
 
 ```powershell
