@@ -1382,6 +1382,296 @@ const resetBranch = (module.exports.resetBranch = async function resetBranch(
 });
 
 /**
+ * Plan an "as of" shift close for a branch: split the current cash drawer, the
+ * card balance and Cash from Brokers at `cutoff`.
+ *
+ * The kept part of each balance is what it held at the cutoff (computed from
+ * the movement timestamps); the remaining part is everything recorded after it
+ * and stays live.
+ *
+ * Resets recorded at or after the cutoff make the split ambiguous (the balance
+ * has already been handed over since), so they are refused: the admin must fix
+ * the most recent open shift instead.
+ *
+ * Read-only: the caller applies the plan with applyBranchAsOf().
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ * @param {string} cutoff  "YYYY-MM-DD HH:MM:SS"
+ * @returns {Promise<object|{error: string}>}
+ */
+const planBranchAsOf = (module.exports.planBranchAsOf =
+  async function planBranchAsOf(conn, branch, cutoff) {
+    const b = normalizeBranch(branch);
+    const cut = parseClientDateTime(cutoff);
+    if (!cut) {
+      return { error: "Cutoff must be in YYYY-MM-DD HH:MM:SS format" };
+    }
+    const round2 = (value) => Math.round((Number(value) || 0) * 100) / 100;
+    const zero = () => {
+      const out = {};
+      for (const currency of CURRENCIES) out[currency] = 0;
+      return out;
+    };
+
+    const [laterRows] = await conn.query(
+      `SELECT
+         (SELECT COUNT(*) FROM cash_resets WHERE Branch = ? AND CreatedAt >= ?) AS CashResets,
+         (SELECT COUNT(*) FROM card_resets WHERE Branch = ? AND CreatedAt >= ?) AS CardResets,
+         (SELECT COUNT(*) FROM broker_cash_resets WHERE Branch = ? AND CreatedAt >= ?) AS BrokerResets`,
+      [b, cut, b, cut, b, cut]
+    );
+    const later = laterRows[0] || {};
+    if (
+      Number(later.CashResets) ||
+      Number(later.CardResets) ||
+      Number(later.BrokerResets)
+    ) {
+      return {
+        error: "A shift has already been closed at or after this cutoff",
+      };
+    }
+
+    // Current cash: live balance minus the signed cash movements after the
+    // cutoff (no resets after it - checked above).
+    const [cashRows] = await conn.query(
+      "SELECT Currency, CurrentCash FROM current_cash WHERE id = ? AND Branch = ?",
+      [CASH_ROW_ID, b]
+    );
+    const liveCash = zero();
+    for (const row of cashRows) {
+      if (liveCash[row.Currency] !== undefined) {
+        liveCash[row.Currency] = round2(row.CurrentCash);
+      }
+    }
+    const [cashMoveRows] = await conn.query(
+      `SELECT Currency,
+              ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
+         FROM cash_transactions
+        WHERE Branch = ? AND Deleted = 0 AND CreatedAt >= ?
+        GROUP BY Currency`,
+      [b, cut]
+    );
+    const cashAfter = zero();
+    for (const row of cashMoveRows) {
+      if (cashAfter[row.Currency] !== undefined) {
+        cashAfter[row.Currency] = round2(row.Net);
+      }
+    }
+
+    // Card balance: the CardPart is the per-currency share of it, so split the
+    // parts and sum them back into the single branch card balance.
+    const [partRows] = await conn.query(
+      "SELECT Currency, CardPart FROM total_cash WHERE id = ? AND Branch = ?",
+      [TOTAL_ROW_ID, b]
+    );
+    const liveCardPart = zero();
+    for (const row of partRows) {
+      if (liveCardPart[row.Currency] !== undefined) {
+        liveCardPart[row.Currency] = round2(row.CardPart);
+      }
+    }
+    const [cardMoveRows] = await conn.query(
+      `SELECT Currency,
+              ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
+         FROM total_cash_transactions
+        WHERE Branch = ? AND Source = 'Card' AND CreatedAt >= ?
+        GROUP BY Currency`,
+      [b, cut]
+    );
+    const cardAfter = zero();
+    for (const row of cardMoveRows) {
+      if (cardAfter[row.Currency] !== undefined) {
+        cardAfter[row.Currency] = round2(row.Net);
+      }
+    }
+
+    // Cash from brokers: only manual top-ups count. Split them by CreatedAt
+    // since the last reset marker; the marker advances to the last top-up that
+    // belongs to the closed shift.
+    const marker = await brokerCashResetMarker(conn, b);
+    const [brokerLiveRows] = await conn.query(
+      `SELECT Currency, ROUND(SUM(Amount), 2) AS Total
+         FROM broker_balance_movements m
+        WHERE ${BROKER_CASH_WHERE} AND m.Branch = ? AND m.id > ?
+        GROUP BY Currency`,
+      [b, marker]
+    );
+    const [brokerAsOfRows] = await conn.query(
+      `SELECT Currency, ROUND(SUM(Amount), 2) AS Total
+         FROM broker_balance_movements m
+        WHERE ${BROKER_CASH_WHERE} AND m.Branch = ? AND m.id > ? AND m.CreatedAt < ?
+        GROUP BY Currency`,
+      [b, marker, cut]
+    );
+    const [throughRows] = await conn.query(
+      `SELECT COALESCE(MAX(m.id), 0) AS ThroughId
+         FROM broker_balance_movements m
+        WHERE ${BROKER_CASH_WHERE} AND m.Branch = ? AND m.id > ? AND m.CreatedAt < ?`,
+      [b, marker, cut]
+    );
+    const liveBroker = zero();
+    const asOfBroker = zero();
+    for (const row of brokerLiveRows) {
+      if (liveBroker[row.Currency] !== undefined) {
+        liveBroker[row.Currency] = round2(row.Total);
+      }
+    }
+    for (const row of brokerAsOfRows) {
+      if (asOfBroker[row.Currency] !== undefined) {
+        asOfBroker[row.Currency] = round2(row.Total);
+      }
+    }
+    const through = Math.max(
+      marker,
+      Number(throughRows[0] && throughRows[0].ThroughId) || 0
+    );
+
+    const kept = { cash: zero(), card: 0, brokerCash: zero() };
+    const remaining = { cash: zero(), card: 0, brokerCash: zero() };
+    const cardParts = { kept: zero(), remaining: zero() };
+    let cardKept = 0;
+    let cardRemaining = 0;
+
+    for (const currency of CURRENCIES) {
+      const cashKept = round2(liveCash[currency] - cashAfter[currency]);
+      const cashRemaining = round2(cashAfter[currency]);
+      if (cashRemaining < 0) {
+        return {
+          error: `Today's cash is below the midnight balance for ${currency}`,
+        };
+      }
+      if (cashKept < 0) {
+        return {
+          error: `The cash balance at the cutoff is negative for ${currency}`,
+        };
+      }
+      kept.cash[currency] = cashKept;
+      remaining.cash[currency] = cashRemaining;
+
+      const partKept = round2(liveCardPart[currency] - cardAfter[currency]);
+      const partRemaining = round2(cardAfter[currency]);
+      cardParts.kept[currency] = partKept;
+      cardParts.remaining[currency] = partRemaining;
+      cardKept = round2(cardKept + partKept);
+      cardRemaining = round2(cardRemaining + partRemaining);
+
+      const brokerRemaining = round2(
+        liveBroker[currency] - asOfBroker[currency]
+      );
+      if (brokerRemaining < 0) {
+        return {
+          error: `Cash from brokers is below the midnight balance for ${currency}`,
+        };
+      }
+      kept.brokerCash[currency] = asOfBroker[currency];
+      remaining.brokerCash[currency] = brokerRemaining;
+    }
+
+    kept.card = cardKept;
+    remaining.card = cardRemaining;
+    return { kept, remaining, cardParts, brokerThrough: through, cutoff: cut };
+  });
+
+/**
+ * Apply a plan produced by planBranchAsOf(). Runs inside the caller's
+ * transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ * @param {string} username
+ * @param {object} plan
+ * @returns {Promise<object>} The applied plan.
+ */
+const applyBranchAsOf = (module.exports.applyBranchAsOf =
+  async function applyBranchAsOf(conn, branch, username, plan) {
+    const b = normalizeBranch(branch);
+    const ts = plan.cutoff;
+
+    await ensureAllCashRows(conn, b);
+    await ensureAllTotalRows(conn, b);
+    await ensureBranchCardRow(conn, b);
+
+    for (const currency of CURRENCIES) {
+      await conn.query(
+        "UPDATE current_cash SET CurrentCash = ? WHERE id = ? AND Branch = ? AND Currency = ?",
+        [plan.remaining.cash[currency], CASH_ROW_ID, b, currency]
+      );
+      await conn.query(
+        "INSERT INTO cash_resets (Branch, Username, Currency, KeptAmount, CreatedAt) VALUES (?, ?, ?, ?, ?)",
+        [b, username, currency, plan.kept.cash[currency], ts]
+      );
+      await logTotalCash(
+        conn,
+        b,
+        username,
+        "reduce",
+        plan.kept.cash[currency],
+        "Current cash reset (shift end)",
+        currency,
+        "Cash",
+        ts
+      );
+
+      const partKept = plan.cardParts.kept[currency];
+      await conn.query(
+        "UPDATE total_cash SET CardPart = ? WHERE id = ? AND Branch = ? AND Currency = ?",
+        [plan.cardParts.remaining[currency], TOTAL_ROW_ID, b, currency]
+      );
+      if (partKept > 0) {
+        await logTotalCash(
+          conn,
+          b,
+          username,
+          "reduce",
+          partKept,
+          "Card balance reset (shift end)",
+          currency,
+          "Card",
+          ts
+        );
+      } else if (partKept < 0) {
+        await logTotalCash(
+          conn,
+          b,
+          username,
+          "increase",
+          -partKept,
+          "Card balance reset (shift end)",
+          currency,
+          "Card",
+          ts
+        );
+      }
+
+      if (plan.kept.brokerCash[currency] !== 0) {
+        await conn.query(
+          "INSERT INTO broker_cash_resets (Branch, Username, Currency, KeptAmount, LastMovementId, CreatedAt) VALUES (?, ?, ?, ?, ?, ?)",
+          [
+            b,
+            username,
+            currency,
+            plan.kept.brokerCash[currency],
+            plan.brokerThrough,
+            ts,
+          ]
+        );
+      }
+    }
+
+    await conn.query(
+      "UPDATE branch_card_balance SET CardBalance = ? WHERE Branch = ?",
+      [plan.remaining.card, b]
+    );
+    await conn.query(
+      "INSERT INTO card_resets (Branch, Username, KeptAmount, CreatedAt) VALUES (?, ?, ?, ?)",
+      [b, username, plan.kept.card, ts]
+    );
+
+    return plan;
+  });
+
+/**
  * Create the CurrentCash router.
  *
  * @param {import("mysql2/promise").Connection} DBConnection
@@ -2076,6 +2366,63 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         }
         console.error("CurrentCash transaction deletion failed:", err);
         res.status(500).json({ error: "Failed to delete transaction" });
+      }
+    }
+  );
+
+  // POST /currentcash/reset-asof — close a shift at a cutoff timestamp.
+  // Admin-only. Splits current cash, the card balance and Cash from Brokers at
+  // the cutoff: the part held at that moment is recorded as kept, and all
+  // movements after it stay in the live balances.
+  //   { branch, Cutoff: "YYYY-MM-DD HH:MM:SS", DryRun?: boolean }
+  router.post(
+    "/currentcash/reset-asof",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      try {
+        const body = req.body || {};
+        const b = normalizeBranch(body.branch);
+        const cut = parseClientDateTime(body.Cutoff ?? body.cutoff);
+        if (!cut) {
+          return res
+            .status(400)
+            .json({ error: "Cutoff must be in YYYY-MM-DD HH:MM:SS format" });
+        }
+        const dryRun = body.DryRun === true || body.dryRun === true;
+
+        if (dryRun) {
+          const plan = await planBranchAsOf(DBConnection, b, cut);
+          if (plan.error) {
+            return res.status(400).json({ error: plan.error });
+          }
+          return res.json({ ...plan, branch: b, cutoff: cut });
+        }
+
+        const plan = await DBConnection.withTransaction(async (conn) => {
+          const p = await planBranchAsOf(conn, b, cut);
+          if (p.error) {
+            const err = new Error(p.error);
+            err.status = 400;
+            throw err;
+          }
+          return applyBranchAsOf(conn, b, req.user.username, p);
+        });
+
+        res.json({
+          ...plan,
+          branch: b,
+          cutoff: cut,
+          author: req.user.username,
+        });
+      } catch (err) {
+        if (err && err.status === 400) {
+          return res.status(400).json({ error: err.message });
+        }
+        console.error("CurrentCash as-of reset failed:", err);
+        res
+          .status(500)
+          .json({ error: "Failed to close the shift as of the cutoff" });
       }
     }
   );
