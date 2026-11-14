@@ -1,67 +1,12 @@
 "use strict";
 const path = require("node:path");
 const walkParts = require("./walkParts.js");
+const { headerValue, readMessageBody } = require("./messageText.js");
 const { notifyUnreadEmail } = require("../Users/websocket.js");
 const mailStore = require("./mailStore.js");
 const { shouldShowBrokerEmail } = require("./brokerSenders.js");
 
 const RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
-
-function headerValue(headers, name) {
-  const h = (headers || []).find(
-    (x) => x.name.toLowerCase() === name.toLowerCase()
-  );
-  return h ? h.value : "";
-}
-
-function htmlToRoughText(html) {
-  const NBSP = "&" + "nbsp;";
-  const AMP = "&" + "amp;";
-  const LT = "&" + "lt;";
-  const GT = "&" + "gt;";
-  // Line breaks are kept (block elements become newlines and quoted
-  // <blockquote> content gets "> " prefixes) so the client can still split a
-  // reply into the separate emails it contains (renderer/emailThread.js).
-  // "&amp;" is decoded last, so "&amp;lt;" stays the literal text "&lt;".
-  let text = html
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<hr[^>]*>/gi, "\n________________________________\n")
-    .replace(/<blockquote[^>]*>/gi, "\n\u0001")
-    .replace(/<\/blockquote\s*>/gi, "\u0002\n")
-    .replace(/<\/?(p|div|tr|li|h[1-6]|table|ul|ol)\b[^>]*>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .split(NBSP)
-    .join(" ")
-    .split(LT)
-    .join("<")
-    .split(GT)
-    .join(">")
-    .split(AMP)
-    .join("&");
-
-  // Prefix every line inside a <blockquote> with one "> " per nesting level.
-  let depth = 0;
-  text = text
-    .split("\n")
-    .map((line) => {
-      const lineDepth = depth;
-      for (const ch of line) {
-        if (ch === "\u0001") depth++;
-        else if (ch === "\u0002") depth = Math.max(0, depth - 1);
-      }
-      const clean = line
-        .replace(/[\u0001\u0002]/g, "")
-        .replace(/[ \t\f\v\r]+/g, " ")
-        .trim();
-      const level = Math.max(lineDepth, depth);
-      return clean ? "> ".repeat(level) + clean : "";
-    })
-    .join("\n");
-
-  return text.replace(/\n{3,}/g, "\n\n").trim();
-}
 
 function uniqueFileName(name, used) {
   let cleaned = String(name)
@@ -201,13 +146,11 @@ module.exports.ProcessEmail = async function ProcessEmail(
 
   const msg = res.data;
   const headers = msg.payload?.headers || [];
-  const bag = { textParts: [], htmlParts: [], attachmentParts: [] };
-  walkParts(msg.payload, messageId, bag);
-
-  let body = bag.textParts.join("\n\n").trim();
-  if (!body && bag.htmlParts.length)
-    body = htmlToRoughText(bag.htmlParts.join("\n"));
-  if (!body && msg.snippet) body = msg.snippet;
+  const { body, bag } = readMessageBody(
+    msg.payload,
+    messageId,
+    msg.snippet
+  );
 
   const emailInfo = {
     account,
@@ -229,7 +172,10 @@ module.exports.ProcessEmail = async function ProcessEmail(
     return null;
   }
 
-  // Store the email so workers can list/claim it after the broadcast.
+  // Store the email so workers can list/claim it after the broadcast. A new
+  // email in a conversation means the broker has answered whatever reply the
+  // workers sent: clear the answered state so every client revives the card.
+  mailStore.clearAnsweredForThread(account, emailInfo.threadId);
   mailStore.add(emailInfo);
   // A restored email (notify: false) is read in Gmail and about to be claimed
   // by the reconnecting worker. Stamp it in the same synchronous step as add()

@@ -17,6 +17,11 @@
 const activeEmails = new Map(); // account\u0000messageId -> emailInfo
 const claimedBy = new Map(); // account\u0000messageId -> username
 const gmailByAccount = new Map(); // account label -> Gmail API client
+// account\u0000threadId -> { at, by, text, messageId } for conversations a worker
+// has answered. While a thread is in this map its emails carry answeredAt /
+// answeredBy, so every dashboard parks the card as "answered, awaiting the
+// broker". A new incoming email in the thread (the broker's answer) clears it.
+const answeredThreads = new Map();
 // account\u0000messageId -> timestamp (ms) of the last time a worker cancelled
 // (released) the email. The poller uses it to avoid dropping a just-released
 // email whose "mark unread" had not reached Gmail yet when the sweep began.
@@ -32,6 +37,39 @@ const KEY_SEP = "\u0000";
 function key(account, messageId) {
   return `${account || ""}${KEY_SEP}${messageId}`;
 }
+
+// One key per conversation. Gmail's thread id is the reliable identity; a
+// message without one is treated as its own thread.
+function threadKey(email) {
+  const account = (email && email.account) || "";
+  const threadId = String((email && email.threadId) || "").trim();
+  if (threadId) return `${account}${KEY_SEP}${threadId}`;
+  return `${account}${KEY_SEP}msg:${(email && email.messageId) || ""}`;
+}
+
+// Copy the thread's answered state onto one stored email, so the WebSocket
+// payloads (list_emails / new_email / email_released) carry it.
+function applyAnsweredState(email) {
+  const record = answeredThreads.get(threadKey(email));
+  if (!record) {
+    delete email.answeredAt;
+    delete email.answeredBy;
+    return;
+  }
+  email.answeredAt = record.at;
+  email.answeredBy = record.by;
+}
+
+// Drop the answered record once no stored email of that conversation is left,
+// so the map cannot grow after cards are completed/dismissed.
+function dropAnsweredIfThreadGone(email) {
+  const k = threadKey(email);
+  for (const other of activeEmails.values()) {
+    if (threadKey(other) === k) return;
+  }
+  answeredThreads.delete(k);
+}
+
 
 // The WebSocket protocol references an email only by its raw Gmail message ID
 // (it does not send an account). On the rare cross-account collision the first
@@ -103,9 +141,11 @@ module.exports.has = function has(account, messageId) {
 };
 
 module.exports.add = function add(email) {
+  applyAnsweredState(email);
   activeEmails.set(key(email.account, email.messageId), email);
   return email;
 };
+
 
 module.exports.get = function get(messageId) {
   return findByMessageId(messageId) || null;
@@ -182,6 +222,72 @@ module.exports.getClaimer = function getClaimer(messageId) {
   return claimedBy.get(key(email.account, email.messageId)) || null;
 };
 
+/**
+ * Mark the conversation containing `messageId` as answered (a worker replied to
+ * the broker). Every stored email of the thread is stamped with answeredAt /
+ * answeredBy so dashboards show the card as parked and dimmed.
+ *
+ * @param {string} messageId
+ * @param {string} by        Username of the worker who replied.
+ * @param {string} [text]    The reply body (kept for context).
+ * @param {number} [at]      Epoch ms; defaults to now.
+ * @returns {{at:number, by:string, text:string, messageId:string}|null}
+ */
+module.exports.markAnswered = function markAnswered(
+  messageId,
+  by,
+  text = "",
+  at = Date.now()
+) {
+  const email = findByMessageId(messageId);
+  if (!email) return null;
+  const k = threadKey(email);
+  const record = {
+    at,
+    by: String(by || ""),
+    text: String(text || ""),
+    messageId,
+  };
+  answeredThreads.set(k, record);
+  for (const other of activeEmails.values()) {
+    if (threadKey(other) === k) applyAnsweredState(other);
+  }
+  return record;
+};
+
+/** The answered record of one stored email's conversation, or null. */
+module.exports.answeredFor = function answeredFor(email) {
+  if (!email) return null;
+  return answeredThreads.get(threadKey(email)) || null;
+};
+
+/**
+ * The broker answered: clear the thread's answered state before the new email
+ * is stored/broadcast, so every client revives and re-queues the card.
+ *
+ * @param {string} account
+ * @param {string} threadId
+ */
+module.exports.clearAnsweredForThread = function clearAnsweredForThread(
+  account,
+  threadId
+) {
+  const id = String(threadId || "").trim();
+  if (!id) return;
+  const k = `${account || ""}${KEY_SEP}${id}`;
+  answeredThreads.delete(k);
+  for (const email of activeEmails.values()) {
+    if (
+      (email.account || "") === (account || "") &&
+      String(email.threadId || "").trim() === id
+    ) {
+      delete email.answeredAt;
+      delete email.answeredBy;
+    }
+  }
+};
+
+
 module.exports.remove = function remove(messageId) {
   const email = findByMessageId(messageId);
   if (!email) return;
@@ -190,6 +296,7 @@ module.exports.remove = function remove(messageId) {
   claimedBy.delete(k);
   releasedAt.delete(k);
   handled.add(k);
+  dropAnsweredIfThreadGone(email);
   if (handled.size > HANDLED_LIMIT) {
     handled.delete(handled.values().next().value);
   }
@@ -207,6 +314,7 @@ module.exports.evict = function evict(messageId) {
   activeEmails.delete(k);
   claimedBy.delete(k);
   releasedAt.delete(k);
+  dropAnsweredIfThreadGone(email);
   return { email, wasClaimed };
 };
 

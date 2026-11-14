@@ -33,6 +33,8 @@ const {
   computePolicyTariffPrice,
 } = require("./Brokers.js");
 const { sendReply } = require("../Mail/SendReply.js");
+const mailStore = require("../Mail/mailStore.js");
+const { fetchThreadConversation } = require("../Mail/threadHistory.js");
 const { isBranchEnabled } = require("../db/branches.js");
 
 /**
@@ -1548,12 +1550,49 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
 
         await sendReply(messageId, [], bodyText);
-        res.json({ message: "Reply sent" });
+        // Remember that the conversation was answered: dashboards park and
+        // dim its card until the broker's answer arrives (ProcessEmail clears
+        // this when a new email in the thread is stored).
+        const answeredAt = Date.now();
+        mailStore.markAnswered(
+          messageId,
+          req.user && req.user.username,
+          bodyText,
+          answeredAt
+        );
+        res.json({ message: "Reply sent", answeredAt });
       } catch (err) {
         console.error("Worker insurance reply failed:", err);
         res.status(500).json({
           error: err && err.message ? err.message : "Failed to send reply",
         });
+      }
+    }
+  );
+
+  // GET /worker/emails/:messageId/thread
+  // The full Gmail conversation of one email card, used by the add-insurance
+  // form to show every client and employee message above the reply form.
+  // Oldest message first. The email must still be in the store (it is claimed
+  // while the form is open), so the correct inbox is known.
+  router.get(
+    "/worker/emails/:messageId/thread",
+    auth,
+    requireRole(2),
+    async (req, res) => {
+      const messageId = String(req.params.messageId || "").trim();
+      if (!messageId) {
+        return res.status(400).json({ error: "messageId is required" });
+      }
+      try {
+        const conversation = await fetchThreadConversation(messageId);
+        if (!conversation) {
+          return res.status(404).json({ error: "Email not found" });
+        }
+        res.json(conversation);
+      } catch (err) {
+        console.error("Failed to load the email conversation:", err);
+        res.status(500).json({ error: "Failed to load conversation" });
       }
     }
   );
