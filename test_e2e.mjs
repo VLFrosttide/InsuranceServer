@@ -719,6 +719,8 @@ async function main() {
         EmailFrom: subEmail,
         PaymentType: "Broker",
         DisableReturnEmail: true,
+        // The fixture does not create a blanc batch for the sub-broker.
+        ForceOutsideBlancBatch: true,
       },
       workerToken
     );
@@ -739,16 +741,19 @@ async function main() {
       JSON.stringify(r.data?.broker)
     );
 
-    // 7. Verify underlings endpoint (shown to main broker) uses sub-broker display price (35)
+    // 7. Verify the underlings endpoint (shown to the main broker) reports the
+    //    sub-broker's real current balance (74) while still exposing its
+    //    display-priced balance (65) and display totals (35).
     r = await req("GET", `/brokers/${mainBrokerId}/underlings`, null, adminToken);
     const uEntry = (r.data?.underlings || []).find((u) => u.id === subBrokerId);
     check(
-      "GET /brokers/:id/underlings shows sub-broker display totalPrice (35), totalBalance (35), and display CashBalance (65)",
+      "GET /brokers/:id/underlings shows real CashBalance (74), display CashBalance (65), and display totalPrice (35)",
       r.status === 200 &&
         uEntry &&
         Number(uEntry.totalPrice) === 35 &&
         Number(uEntry.totalBalance) === 35 &&
-        Math.abs(Number(uEntry.CashBalance) - 65) < 0.01 &&
+        Math.abs(Number(uEntry.CashBalance) - 74) < 0.01 &&
+        Math.abs(Number(uEntry.displayCashBalance) - 65) < 0.01 &&
         Number(r.data?.totalBalance) === 35,
       JSON.stringify(r.data)
     );
@@ -798,7 +803,17 @@ async function main() {
       JSON.stringify(r.data?.brokers?.[0])
     );
 
-    r = await req("GET", `/brokers/${subBrokerId}/history`, null, subToken);
+    // Use an explicit upper bound a day ahead: the policy movement is created in
+    // the same second as the request, and the default `until` (now) excludes it.
+    const historyUntil =
+      new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10) +
+      " 23:59:59";
+    r = await req(
+      "GET",
+      `/brokers/${subBrokerId}/history?until=${encodeURIComponent(historyUntil)}`,
+      null,
+      subToken
+    );
     const subPolicyMov = (r.data?.movements || []).find((m) => m.Type === "policy");
     check(
       "Sub-broker GET /brokers/:id/history shows display movement (-35) and balance (65), never -26/74",

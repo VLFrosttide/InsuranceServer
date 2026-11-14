@@ -2229,6 +2229,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               id: u.id,
               Name: u.Name,
               CashBalance: null,
+              displayCashBalance: null,
               ParentBrokerId: u.ParentBrokerId,
               IsSubBroker: u.IsSubBroker,
               PricingConfigured: u.PricingConfigured,
@@ -2259,7 +2260,14 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             result.push({
               id: u.id,
               Name: u.Name,
-              CashBalance: disp.displayCashBalance,
+              // The underling's real current balance (`brokers.CashBalance`):
+              // negative = what it still owes, positive = leftover credit.
+              // The display balance below is priced with the sub-broker's own
+              // show prices, so it overstates the debt and must not be used as
+              // the amount owed. The main broker (the only caller of this
+              // endpoint, besides an admin) is allowed to see the real balance.
+              CashBalance: Math.round((Number(u.CashBalance) || 0) * 100) / 100,
+              displayCashBalance: disp.displayCashBalance,
               ParentBrokerId: u.ParentBrokerId,
               IsSubBroker: u.IsSubBroker,
               PricingConfigured: u.PricingConfigured,
