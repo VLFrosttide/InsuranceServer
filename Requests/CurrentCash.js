@@ -1892,6 +1892,11 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
       // day. The Current cash screen's Card balance card opens this list, so it
       // uses the same filters as the daily cardPayments figure: a walk-in
       // (broker-less) card policy, by creation day, for this branch.
+      //
+      // `insurance` has NO `id` column (its primary key is `BlancNumber`), so the
+      // tie-break on same-day creations must use the blanc number; ordering by
+      // `id` made MySQL reject the whole Current cash lookup with
+      // "Unknown column 'id' in 'ORDER BY'".
       const [cardInsurances] = await DBConnection.query(
         `SELECT * FROM insurance
           WHERE Deleted = 0
@@ -1899,7 +1904,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
             AND BrokerId IS NULL
             AND Branch = ?
             AND CreationDate >= ? AND CreationDate < ?
-          ORDER BY CreationDate DESC, id DESC`,
+          ORDER BY CreationDate DESC, BlancNumber DESC`,
         [branch, day.date, day.nextDate]
       );
       // Cash from Brokers: the branch's balance, the top-ups it received on the
