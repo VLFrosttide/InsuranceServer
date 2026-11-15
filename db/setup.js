@@ -511,6 +511,11 @@ async function runSetup(config = {}) {
   // removed: an admin deleting a ledger entry from the Current cash screen
   // flags it with Deleted/DeletedAt/DeletedBy (soft delete), so the record of
   // what happened survives while the row stops counting anywhere.
+  //
+  // `Type` is 'increase', 'reduce' (an expense) or 'handover' (money physically
+  // given to a person - see the file header of Requests/CurrentCash.js).
+  // `Recipient` names the person who took hand-over money and stays NULL for
+  // every other movement.
   await db.query(`
     CREATE TABLE IF NOT EXISTS cash_transactions (
       id INT NOT NULL AUTO_INCREMENT,
@@ -520,6 +525,7 @@ async function runSetup(config = {}) {
       Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
       Username VARCHAR(45) NOT NULL,
       Reason VARCHAR(255) NOT NULL,
+      Recipient VARCHAR(100) NULL,
       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       Deleted TINYINT(1) NOT NULL DEFAULT 0,
       DeletedAt DATETIME NULL,
@@ -530,30 +536,37 @@ async function runSetup(config = {}) {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
 
-  // Soft-delete columns for ledgers created before they existed. Same shape as
-  // the broker_balance_movements migration further down.
-  const [cashTxSoftCols] = await db.query(
+  // Columns added to ledgers created before they existed (MySQL 8 has no
+  // ADD COLUMN IF NOT EXISTS). Same shape as the broker_balance_movements
+  // migration further down.
+  const [cashTxColsNow] = await db.query(
     "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
     [DB_NAME, "cash_transactions"]
   );
-  const cashTxSoftColNames = new Set(cashTxSoftCols.map((c) => c.COLUMN_NAME));
-  if (!cashTxSoftColNames.has("Deleted")) {
+  const cashTxColumnNames = new Set(cashTxColsNow.map((c) => c.COLUMN_NAME));
+  if (!cashTxColumnNames.has("Deleted")) {
     await db.query(
       "ALTER TABLE cash_transactions ADD COLUMN Deleted TINYINT(1) NOT NULL DEFAULT 0"
     );
     console.log("Added cash_transactions.Deleted column");
   }
-  if (!cashTxSoftColNames.has("DeletedAt")) {
+  if (!cashTxColumnNames.has("DeletedAt")) {
     await db.query(
       "ALTER TABLE cash_transactions ADD COLUMN DeletedAt DATETIME NULL"
     );
     console.log("Added cash_transactions.DeletedAt column");
   }
-  if (!cashTxSoftColNames.has("DeletedBy")) {
+  if (!cashTxColumnNames.has("DeletedBy")) {
     await db.query(
       "ALTER TABLE cash_transactions ADD COLUMN DeletedBy VARCHAR(45) NULL"
     );
     console.log("Added cash_transactions.DeletedBy column");
+  }
+  if (!cashTxColumnNames.has("Recipient")) {
+    await db.query(
+      "ALTER TABLE cash_transactions ADD COLUMN Recipient VARCHAR(100) NULL AFTER Reason"
+    );
+    console.log("Added cash_transactions.Recipient column");
   }
 
   await db.query(`

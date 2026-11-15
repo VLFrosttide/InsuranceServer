@@ -41,6 +41,13 @@
 // `total_cash_transactions` is the Total cash ledger: one row per movement,
 // tagged with the channel it came through (Source = Cash | Card | Broker).
 //
+// One movement is deliberately NOT in that ledger: a HAND-OVER (see below). It
+// leaves the drawer without arriving through any channel, so the Total cash
+// BALANCE falls (its cash share is current_cash, read live) while the Total cash
+// ledger stays as it was. Every other writer keeps the two in step, so a
+// reconciliation of that ledger against the balance has to subtract the
+// `Type = 'handover'` rows of `cash_transactions` it is missing.
+//
 // Email cash payments (an insurance created from a broker's email) are funded by
 // that broker's balance: the money was already handed over when the broker
 // topped up, so such a policy REDUCES `brokers.CashBalance` and is recorded
@@ -49,6 +56,16 @@
 // CASH FROM BROKERS is a third, separate balance: the money a broker hands over
 // when their balance is topped up. It is NOT part of current cash (see "Cash
 // from brokers, per branch" below).
+//
+// CASH HANDED OVER is a reduction of the drawer that is NOT an expense: money
+// physically given to a person - a runner taking the takings to the safe, the
+// owner collecting the day's cash ... Its ledger row carries
+// Type = 'handover' and, in `Recipient`, who took the money (the reason says
+// why). It lowers current cash (and therefore Available cash) and, because the
+// cash part of Total cash is read live, the Total cash balance too, but it is
+// NOT a sale of the day: no `total_cash_transactions` row is written, it is
+// excluded from Total daily cash and it never counts as an expense. See
+// "Expences / hand-overs" below.
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
@@ -59,6 +76,11 @@ const CASH_ROW_ID = 1;
 
 // Supported cash currencies.
 const CURRENCIES = ["EUR", "TRY"];
+
+// The ledger `Type` of money handed over to a person: it leaves the drawer, but
+// it is neither a sale (so it stays out of Total daily cash) nor money the
+// branch spent (so it stays out of the expenses).
+const HANDOVER_TYPE = "handover";
 
 /**
  * Parse a money value into a number rounded to 2 decimals.
@@ -347,9 +369,11 @@ const getCurrentCashAsOf = (module.exports.getCurrentCashAsOf =
     const b = normalizeBranch(branch);
     const live = await getCurrentCash(conn, b);
 
-    // Movements recorded after the requested day (increase + / reduce -). A
-    // soft-deleted movement no longer counts anywhere (its money was already
-    // given back when it was deleted), so it is skipped here as well.
+    // Movements recorded after the requested day (increase + / expense -; a
+    // hand-over is not an 'increase', so it subtracts as well - it did leave
+    // the drawer). A soft-deleted movement no longer counts anywhere (its money
+    // was already given back when it was deleted), so it is skipped here as
+    // well.
     const [laterMoves] = await conn.query(
       `SELECT Currency,
          ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
@@ -501,6 +525,12 @@ const getTotalParts = (module.exports.getTotalParts =
  * Read the TOTAL cash balances for a branch, keyed by currency code:
  * current cash (read live) + card part + broker part.
  *
+ * Because the cash share is read live from `current_cash`, every drawer
+ * movement changes this total - including a HAND-OVER, which by design has no
+ * row in `total_cash_transactions` (see the file header). So this balance can be
+ * lower than "sum of the Total cash ledger" by the branch's hand-overs; anyone
+ * comparing the two must take those into account.
+ *
  * @param {import("mysql2/promise").Connection} conn
  * @param {string} branch
  * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, TRY: 0 }
@@ -596,6 +626,84 @@ const recordCashMovement = (module.exports.recordCashMovement =
   });
 
 /**
+ * Record money physically HANDED OVER to a person (a runner taking the day's
+ * takings to the safe, the owner collecting cash ...).
+ *
+ * The drawer is reduced exactly like an expense, but the entry is a different
+ * kind of reduction:
+ *   - it is written with Type = 'handover' and the person who took the money in
+ *     `Recipient`, so the ledger says who received it;
+ *   - NO row is written to the Total cash ledger, so the day's Total daily cash
+ *     keeps showing only the money that came in and was spent;
+ *   - the expenses of the day (see splitExpences below) only take Type =
+ *     'reduce', so a hand-over is never counted as money the branch spent.
+ *
+ * NOTE: runs inside the caller's transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} branch
+ * @param {string} username
+ * @param {number|string} amount  Positive value to take out of the drawer.
+ * @param {string} reason  Why the money was handed over.
+ * @param {string} recipient  Who received the money.
+ * @param {string} [currency]
+ * @param {string} [createdAt]  Client's local wall-clock time
+ *   ("YYYY-MM-DD HH:MM:SS"). Defaults to the server's UTC clock.
+ * @returns {Promise<number>} The applied amount (rounded to 2 decimals).
+ */
+const recordCashHandover = (module.exports.recordCashHandover =
+  async function recordCashHandover(
+    conn,
+    branch,
+    username,
+    amount,
+    reason,
+    recipient,
+    currency,
+    createdAt
+  ) {
+    const decimal = toDecimal(amount);
+    if (decimal === null || decimal <= 0) {
+      throw new Error("amount must be a positive number");
+    }
+    if (typeof reason !== "string" || !reason.trim()) {
+      throw new Error("reason is required");
+    }
+    if (typeof recipient !== "string" || !recipient.trim()) {
+      throw new Error("recipient is required");
+    }
+    const b = normalizeBranch(branch);
+    const cur = normalizeCurrency(currency);
+    const ts =
+      typeof createdAt === "string" && createdAt.trim() !== ""
+        ? createdAt.trim()
+        : clientLocalDateTime(0);
+
+    await adjustBalance(conn, b, cur, "reduce", decimal);
+
+    await conn.query(
+      `INSERT INTO cash_transactions (Branch, Type, Amount, Currency, Username, Reason, Recipient, CreatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        b,
+        HANDOVER_TYPE,
+        decimal,
+        cur,
+        username,
+        reason.trim(),
+        recipient.trim(),
+        ts,
+      ]
+    );
+
+    // Deliberately no logTotalCash() here: the money did not arrive through any
+    // payment channel, so it must not appear in the Total cash ledger and must
+    // not move Total daily cash.
+
+    return decimal;
+  });
+
+/**
  * Record a cash movement in the `cash_transactions` ledger WITHOUT touching the
  * running `current_cash` balance. Used when a correction is back-dated to an
  * earlier day whose drawer has already been closed (each day has its own
@@ -654,9 +762,9 @@ const recordCashLedgerOnly = (module.exports.recordCashLedgerOnly =
 // ---------------------------------------------------------------------------
 // Expences: the money that left a branch's drawer BY HAND on one day.
 //
-// The drawer's ledger (`cash_transactions`) holds two kinds of reductions:
+// The drawer's ledger (`cash_transactions`) holds three kinds of reductions:
 //
-//   - the MANUAL ones, entered with the "Reduce" button together with a reason
+//   - the MANUAL ones, entered with the "Expense" button together with a reason
 //     the worker typed in ("rent", "supplies", "salary" ...). Those are the
 //     branch's expenses.
 //   - the ones the insurances routes write when a policy moves money: the
@@ -664,12 +772,15 @@ const recordCashLedgerOnly = (module.exports.recordCashLedgerOnly =
 //     reversal of an edit/price correction. They lower the drawer too, but they
 //     are policy movements, NOT money the branch spent, so they must not be
 //     counted as expenses.
+//   - the HAND-OVERS (Type = 'handover'), entered with the "Hand over" button:
+//     cash given to a named person that leaves the drawer but is not spent by
+//     the branch. They are a separate type, so they are never expenses.
 //
 // A ledger row carries no reference to the policy it belongs to, so the second
 // kind is recognised by the reason its writer always uses (see
 // Requests/TierEndpoints.js): "Annul <blanc>", "Delete <blanc>",
 // "Restore <blanc>", "Edit <blanc>" and "Price change <blanc>". Every other
-// reduction was typed in by hand and is an expense.
+// reduction of Type 'reduce' was typed in by hand and is an expense.
 // ---------------------------------------------------------------------------
 
 const POLICY_MOVEMENT_REASON_PREFIXES = [
@@ -698,10 +809,24 @@ const isPolicyMovementReason = (module.exports.isPolicyMovementReason =
   });
 
 /**
+ * Whether a cash-ledger row is money HANDED OVER to a person (Type =
+ * 'handover') instead of an increase or an expense.
+ *
+ * @param {string} type
+ * @returns {boolean}
+ */
+const isCashHandover = (module.exports.isCashHandover = function isCashHandover(
+  type
+) {
+  return String(type || "").trim().toLowerCase() === HANDOVER_TYPE;
+});
+
+/**
  * Split one day's `cash_transactions` rows into the branch's EXPENCES - the
  * manual reductions only - and their per-currency total. Refunds of annulled or
  * deleted insurances and the corrections of edited policies are left out: they
- * are policy movements, not money the branch spent.
+ * are policy movements, not money the branch spent. Hand-overs are a different
+ * ledger type ('handover'), so they are left out as well.
  *
  * @param {object[]} rows  The day's `cash_transactions` rows.
  * @returns {{ expences: object[], totalExpences: Record<string, number> }}
@@ -1688,6 +1813,11 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
   const reasonText = (reason) =>
     typeof reason === "string" ? reason.trim() : "";
 
+  // Who received money that was handed over. Both `Recipient` and `recipient`
+  // are accepted, like the other body fields of this router.
+  const recipientText = (recipient) =>
+    typeof recipient === "string" ? recipient.trim() : "";
+
   // GET /currentcash/branches — all branches with cash (branches that have any
   // non-zero balance in any currency).
   router.get(
@@ -1758,6 +1888,20 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
           ORDER BY id DESC`,
         [branch, day.date, day.nextDate]
       );
+      // Walk-in policies paid by card that belong to this branch on the picked
+      // day. The Current cash screen's Card balance card opens this list, so it
+      // uses the same filters as the daily cardPayments figure: a walk-in
+      // (broker-less) card policy, by creation day, for this branch.
+      const [cardInsurances] = await DBConnection.query(
+        `SELECT * FROM insurance
+          WHERE Deleted = 0
+            AND PaymentType = 'Card'
+            AND BrokerId IS NULL
+            AND Branch = ?
+            AND CreationDate >= ? AND CreationDate < ?
+          ORDER BY CreationDate DESC, id DESC`,
+        [branch, day.date, day.nextDate]
+      );
       // Cash from Brokers: the branch's balance, the top-ups it received on the
       // requested day, and the resets that cleared it that day.
       const brokerCash = await getBrokerCash(DBConnection, branch);
@@ -1776,8 +1920,9 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
       // The day's EXPENCES: the manual reductions of the same ledger, i.e.
       // everything except the refunds/corrections the insurances routes wrote
       // for an annulled, deleted, restored or edited policy (see "Expences"
-      // above). They are read from the rows already fetched, so the list always
-      // matches the Transactions table shown next to it on the same day.
+      // above) and except hand-overs, which are their own ledger type. They are
+      // read from the rows already fetched, so the list always matches the
+      // Transactions table shown next to it on the same day.
       const { expences, totalExpences } = splitExpences(txs);
       res.json({
         balances,
@@ -1790,6 +1935,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         resets,
         cardResets,
         brokerCashResets,
+        cardInsurances,
         date: day.date,
       });
     } catch (err) {
@@ -1884,13 +2030,17 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
       }
 
       // Total daily cash: the net cash-drawer movement of the day across all
-      // branches. Walk-in cash payments and manual increases/reductions are all
+      // branches. Walk-in cash payments and manual increases/expenses are all
       // recorded as cash_transactions rows, so the net is their sum. A
       // soft-deleted row is left out: its money was already reversed off the
-      // drawer, so counting it again would double the correction.
+      // drawer, so counting it again would double the correction. A HAND-OVER is
+      // left out as well: the money did leave the drawer, but it was not a sale
+      // and not an expense, so it must not change what the day earned/spent.
       const [cash] = await DBConnection.query(
         `SELECT Currency,
-           ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
+           ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount
+                          WHEN Type = 'reduce' THEN -Amount
+                          ELSE 0 END), 2) AS Net
          FROM cash_transactions
          WHERE Deleted = 0 AND CreatedAt >= ? AND CreatedAt < ?
          GROUP BY Currency`,
@@ -2051,6 +2201,9 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
   );
 
   // POST /currentcash/reduce  { amount, reason, currency, branch }
+  //
+  // The "Expense" button of the Current cash screen. The money leaves the
+  // drawer and IS counted as an expense and in Total daily cash.
   router.post(
     "/currentcash/reduce",
     auth,
@@ -2095,6 +2248,71 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         }
         console.error("CurrentCash reduce failed:", err);
         res.status(500).json({ error: "Failed to reduce current cash" });
+      }
+    }
+  );
+
+  // POST /currentcash/handover
+  //   { amount, reason, recipient, currency, branch }
+  //
+  // The "Hand over" button of the Current cash screen: money physically given to
+  // a person (a runner taking the takings to the safe, the owner collecting the
+  // day's cash ...). Both a reason and the name of the person who took the money
+  // are required. The drawer (Available cash) drops, but the movement is NOT a
+  // sale and NOT an expense: no Total cash ledger row is written and the day's
+  // Total daily cash and expenses stay as they were.
+  router.post(
+    "/currentcash/handover",
+    auth,
+    requireCashRole,
+    async (req, res) => {
+      try {
+        const { amount, reason, currency, branch } = req.body || {};
+        const recipient = recipientText(
+          req.body && (req.body.Recipient ?? req.body.recipient)
+        );
+        const cur = normalizeCurrency(currency);
+        const b = normalizeBranch(branch);
+        const time = resolveRequestCreatedAt(req.body);
+        if (time.error) {
+          return res.status(400).json({ error: time.error });
+        }
+        const applied = await DBConnection.withTransaction((conn) =>
+          recordCashHandover(
+            conn,
+            b,
+            req.user.username,
+            amount,
+            reasonText(reason),
+            recipient,
+            cur,
+            time.createdAt
+          )
+        );
+
+        res.status(201).json({
+          message: "Cash handed over",
+          amount: applied,
+          currency: cur,
+          branch: b,
+          author: req.user.username,
+          reason: reasonText(reason),
+          recipient,
+        });
+      } catch (err) {
+        const msg = (err && err.message) || "";
+        if (
+          msg.includes("amount") ||
+          msg.includes("reason") ||
+          msg.includes("recipient")
+        ) {
+          return res.status(400).json({ error: msg });
+        }
+        if (msg.includes("insufficient")) {
+          return res.status(400).json({ error: msg });
+        }
+        console.error("CurrentCash handover failed:", err);
+        res.status(500).json({ error: "Failed to hand over the cash" });
       }
     }
   );
@@ -2160,19 +2378,40 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         }
 
         const b = req.body || {};
-        const newType = b.Type ?? b.type ?? tx.Type;
+        // Keep the stored value canonical: a hand-over is always exactly
+        // "handover", whatever casing the caller sent.
+        const requestedType = b.Type ?? b.type ?? tx.Type;
+        const newType = isCashHandover(requestedType)
+          ? HANDOVER_TYPE
+          : requestedType;
         const newCurrency = normalizeCurrency(
           b.Currency ?? b.currency ?? tx.Currency
         );
         const newAmount = toDecimal(b.Amount ?? b.amount ?? tx.Amount);
         const newReason = reasonText(b.Reason ?? b.reason ?? tx.Reason);
+        const newRecipient = recipientText(
+          b.Recipient ?? b.recipient ?? tx.Recipient
+        );
         // Branch is preserved from the original transaction.
         const txBranch = normalizeBranch(tx.Branch);
 
-        if (newType !== "increase" && newType !== "reduce") {
+        const oldIsHandover = isCashHandover(tx.Type);
+        const newIsHandover = isCashHandover(newType);
+
+        if (newType !== "increase" && newType !== "reduce" && !newIsHandover) {
           return res
             .status(400)
-            .json({ error: "type must be 'increase' or 'reduce'" });
+            .json({ error: "type must be 'increase', 'reduce' or 'handover'" });
+        }
+        // An entry may be corrected, but not turned into a different KIND of
+        // movement: an expense counted in Total daily cash cannot silently
+        // become a hand-over (or the other way round) without a matching
+        // Total cash correction, and each screen lists them separately.
+        if (oldIsHandover !== newIsHandover) {
+          return res.status(400).json({
+            error:
+              "a hand-over cannot be changed into an increase or an expense, or the other way round",
+          });
         }
         if (newAmount === null || newAmount <= 0) {
           return res
@@ -2181,6 +2420,9 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         }
         if (!newReason) {
           return res.status(400).json({ error: "reason is required" });
+        }
+        if (newIsHandover && !newRecipient) {
+          return res.status(400).json({ error: "recipient is required" });
         }
 
         const oldType = tx.Type;
@@ -2193,6 +2435,11 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         if (time.error) {
           return res.status(400).json({ error: time.error });
         }
+
+        // adjustBalance only knows "increase" and "reduce": both an expense and
+        // a hand-over take money out of the drawer, so they both reduce it.
+        const balanceType = (type) =>
+          isCashHandover(type) ? "reduce" : type;
 
         await DBConnection.withTransaction(async (conn) => {
           // Reverse the original movement.
@@ -2215,39 +2462,57 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
           }
 
           // Apply the corrected movement.
-          await adjustBalance(conn, txBranch, newCurrency, newType, newAmount);
+          await adjustBalance(
+            conn,
+            txBranch,
+            newCurrency,
+            balanceType(newType),
+            newAmount
+          );
 
           // Mirror the correction into the Total cash ledger. Total cash reads
           // CurrentCash live so its balance is already correct; these rows keep
-          // the two records of cash flow listing the same movements.
-          await logTotalCash(
-            conn,
-            txBranch,
-            req.user.username,
-            oldType === "increase" ? "reduce" : "increase",
-            oldAmount,
-            `Correction of cash transaction #${id}`,
-            oldCurrency,
-            "Cash",
-            time.createdAt
-          );
-          await logTotalCash(
-            conn,
-            txBranch,
-            req.user.username,
-            newType,
-            newAmount,
-            `Correction of cash transaction #${id}`,
-            newCurrency,
-            "Cash",
-            time.createdAt
-          );
+          // the two records of cash flow listing the same movements. A hand-over
+          // never has a row in that ledger (see recordCashHandover), so it gets
+          // no correction row either - otherwise Total daily cash would gain or
+          // lose money that never passed through a payment channel.
+          if (!oldIsHandover && !newIsHandover) {
+            await logTotalCash(
+              conn,
+              txBranch,
+              req.user.username,
+              oldType === "increase" ? "reduce" : "increase",
+              oldAmount,
+              `Correction of cash transaction #${id}`,
+              oldCurrency,
+              "Cash",
+              time.createdAt
+            );
+            await logTotalCash(
+              conn,
+              txBranch,
+              req.user.username,
+              newType,
+              newAmount,
+              `Correction of cash transaction #${id}`,
+              newCurrency,
+              "Cash",
+              time.createdAt
+            );
+          }
 
           await conn.query(
             `UPDATE cash_transactions
-             SET Type = ?, Amount = ?, Currency = ?, Reason = ?
+             SET Type = ?, Amount = ?, Currency = ?, Reason = ?, Recipient = ?
              WHERE id = ?`,
-            [newType, newAmount, newCurrency, newReason, id]
+            [
+              newType,
+              newAmount,
+              newCurrency,
+              newReason,
+              newRecipient || null,
+              id,
+            ]
           );
         });
 
@@ -2261,7 +2526,9 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         if (
           msg.includes("amount") ||
           msg.includes("reason") ||
-          msg.includes("type")
+          msg.includes("type") ||
+          msg.includes("recipient") ||
+          msg.includes("hand-over")
         ) {
           return res.status(400).json({ error: msg });
         }
@@ -2283,9 +2550,11 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
   //
   // Deleting a ledger entry undoes it, exactly like the correction in PATCH
   // does: the drawer is moved in the opposite direction (an increase is taken
-  // back off, a reduction is put back in) and the matching row is written to
-  // the Total cash ledger, so both records of cash flow still list the same
-  // movements. The reversal is dated with the client's local wall-clock time.
+  // back off, a reduction or a hand-over is put back in) and the matching row is
+  // written to the Total cash ledger, so both records of cash flow still list
+  // the same movements. A hand-over has no Total cash row to reverse, so only
+  // the drawer is corrected for it. The reversal is dated with the client's
+  // local wall-clock time.
   //
   // A reduction whose money is no longer in the drawer (it was spent or reset
   // in between) cannot be undone: the drawer would have to go negative, so the
@@ -2329,18 +2598,23 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
 
             // Total cash reads CurrentCash live, so its balance already moved
             // with adjustBalance above; this row keeps the Total cash ledger
-            // listing the same movements as the cash ledger.
-            await logTotalCash(
-              conn,
-              txBranch,
-              req.user.username,
-              reverseType,
-              amount,
-              `Delete of cash transaction #${id}`,
-              currency,
-              "Cash",
-              time.createdAt
-            );
+            // listing the same movements as the cash ledger. A hand-over has no
+            // row in the Total cash ledger, so undoing it must not add one
+            // either - that would move Total daily cash by money that was never
+            // a sale or an expense.
+            if (!isCashHandover(tx.Type)) {
+              await logTotalCash(
+                conn,
+                txBranch,
+                req.user.username,
+                reverseType,
+                amount,
+                `Delete of cash transaction #${id}`,
+                currency,
+                "Cash",
+                time.createdAt
+              );
+            }
           }
 
           await conn.query(

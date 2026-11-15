@@ -1279,6 +1279,43 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       b.cutOff = Boolean(b.CutOff);
     }
   }
+  // Attach the newest manual top-up ("increase") of each broker's balance to
+  // the list rows, so the brokers table can show the last payment (amount +
+  // date) without a request per broker. A soft-deleted top-up is skipped: it no
+  // longer counts as money received.
+  async function attachLastPayments(rows) {
+    if (!Array.isArray(rows) || rows.length === 0) return;
+    await ensureMovementTable();
+    const [lastRows] = await DBConnection.query(
+      `SELECT m.BrokerId, m.Amount, m.Currency, m.CreatedAt
+         FROM broker_balance_movements m
+         JOIN (
+           SELECT BrokerId, MAX(id) AS LastId
+             FROM broker_balance_movements
+            WHERE Deleted = 0 AND Type = 'increase'
+            GROUP BY BrokerId
+         ) last ON last.LastId = m.id`
+    );
+    const byBroker = new Map();
+    for (const row of lastRows || []) {
+      byBroker.set(Number(row.BrokerId), {
+        amount: Math.round((Number(row.Amount) || 0) * 100) / 100,
+        currency: String(row.Currency || "EUR"),
+        at:
+          row.CreatedAt instanceof Date
+            ? toLocalDateTime(row.CreatedAt)
+            : row.CreatedAt,
+      });
+    }
+    for (const b of rows) {
+      const last = byBroker.get(Number(b.id));
+      b.LastPaymentAmount = last ? last.amount : null;
+      b.LastPaymentCurrency = last ? last.currency : null;
+      b.LastPaymentAt = last ? last.at : null;
+    }
+  }
+
+
 
   async function loadSummaries(brokerId) {
     await ensureBatchTable();
@@ -1739,6 +1776,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       }
       for (const b of rows) b.emails = emailsByBroker.get(b.id) || [];
       await attachPaymentStatus(rows);
+      await attachLastPayments(rows);
       await attachSubBrokerStatus(DBConnection, rows);
       if (scoped !== null) {
         for (const b of rows) {

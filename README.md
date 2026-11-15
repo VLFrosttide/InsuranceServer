@@ -143,20 +143,22 @@ Single running cash balance (one row, `id = 1`).
 | `UpdatedAt`   | `DATETIME`      | Auto-updated timestamp |
 
 Use case: the single company cash balance. Increased by policy creation and
-`POST /currentcash/increase`, reduced by `POST /currentcash/reduce`, reset to
-`0` by `POST /currentcash/reset`. It is not reset automatically.
+`POST /currentcash/increase`, reduced by `POST /currentcash/reduce` (the
+"Expense" button) and by `POST /currentcash/handover` (money given to a person),
+reset to `0` by `POST /currentcash/reset`. It is not reset automatically.
 
 ### `cash_transactions`
 
-Ledger of every cash increase/reduction.
+Ledger of every cash increase/reduction/hand-over.
 
 | Column      | Type            | Notes                      |
 | ----------- | --------------- | -------------------------- |
 | `id`        | `INT`           | Auto-increment PK          |
-| `Type`      | `VARCHAR(20)`   | `increase` or `reduce`     |
+| `Type`      | `VARCHAR(20)`   | `increase`, `reduce` (an expense) or `handover` |
 | `Amount`    | `DECIMAL(15,2)` | Movement amount            |
 | `Username`  | `VARCHAR(45)`   | Who performed it           |
 | `Reason`    | `VARCHAR(255)`  | Human-readable reason      |
+| `Recipient` | `VARCHAR(100)`  | Who took hand-over money (NULL otherwise) |
 | `CreatedAt` | `DATETIME`      | Creation time              |
 | `Deleted`   | `TINYINT(1)`    | Soft delete flag (default `0`) |
 | `DeletedAt` | `DATETIME`      | When it was deleted (NULL) |
@@ -165,7 +167,9 @@ Ledger of every cash increase/reduction.
 Use case: audit trail for `current_cash` movements (returned by
 `GET /currentcash`). A deleted row is never removed - it is flagged and skipped
 by every read, and its money was reversed when it was deleted
-(`DELETE /currentcash/transactions/:id`).
+(`DELETE /currentcash/transactions/:id`). A `handover` row is money physically
+given to a person: it lowers the drawer, writes no Total cash row, and is
+neither an expense nor part of Total daily cash.
 
 ### `cash_resets`
 
@@ -321,15 +325,27 @@ the amount that was kept at the time of the reset.
 
 - `GET /currentcash` — current total plus transaction and reset history
 - `POST /currentcash/increase` — body `{ "amount": 50, "reason": "..." }`
-- `POST /currentcash/reduce` — body `{ "amount": 20, "reason": "..." }`
+- `POST /currentcash/reduce` — body `{ "amount": 20, "reason": "..." }`. The
+  "Expense" button of the app: the money leaves the drawer, is counted as an
+  expense and lowers Total daily cash.
+- `POST /currentcash/handover` — body
+  `{ "amount": 40, "reason": "Runner to the safe", "recipient": "Ivan" }`. Both
+  the reason and the person who took the money are required. The drawer
+  (Available cash) drops, but no Total cash row is written: a hand-over is
+  neither a sale nor an expense, so Total daily cash and the day's expenses are
+  untouched. Stored as `Type = 'handover'` with `Recipient`, and listed in the
+  day's Transactions.
 - `POST /currentcash/reset` — reset the balance to `0` (records user + kept amount)
 - `PATCH /currentcash/transactions/:id` — correct a ledger entry (only its own
-  author may do this)
+  author may do this). A hand-over may be corrected (amount, currency, reason,
+  recipient) but its type cannot be changed to/from `increase`/`reduce`, so
+  money never silently moves between the expenses and Total daily cash.
 - `DELETE /currentcash/transactions/:id` — soft-delete a ledger entry (admin
   only). The row is kept in `cash_transactions`, flagged with
   `Deleted`/`DeletedAt`/`DeletedBy`, and its money is reversed: an `increase` is
-  taken back off the drawer, a `reduce` is put back in, with a matching
-  `Delete of cash transaction #<id>` row in the Total cash ledger. A reversal the
+  taken back off the drawer, a `reduce` (or a `handover`) is put back in, with a
+  matching `Delete of cash transaction #<id>` row in the Total cash ledger (none
+  for a hand-over, which never had one). A reversal the
   drawer cannot fund (a `reduction` whose money was already spent or reset) is
   rejected with `400` and nothing changes. Deleted entries are excluded from
   `GET /currentcash`, from the day's expenses, from the daily report's cash net
