@@ -10,6 +10,13 @@
 //     is kept apart from current cash as the branch's "Cash from Brokers":
 //     the top-up is recorded once, as a balance movement carrying the branch
 //     that took the money and its currency (see CurrentCash.js).
+//   - A HAND-OVER TO THE OWNER (Type = "handover") is also money the broker
+//     paid, but it went straight to the owner and never reached a branch. It
+//     raises the broker's balance like a top-up, yet it carries NO branch, so
+//     it is never Cash from Brokers (CurrentCash.js only reads top-ups with a
+//     branch) and it writes nothing to the cash drawer. It does count as a
+//     payment: the reports and the broker's last-payment date read the two
+//     types together.
 //   - Reducing a broker's balance (including the per-policy deduction made
 //     when an insurance is created from an email card, see
 //     decreaseBrokerForInsurance below) touches neither current cash nor
@@ -868,13 +875,16 @@ module.exports.BROKER_MOVEMENT_TABLE_SQL = BROKER_MOVEMENT_TABLE_SQL;
  * @param {number} brokerId
  * @param {number|string} amount  signed delta (positive = increase)
  * @param {string} type  e.g. "policy" | "annulment" | "deletion" |
- *                       "price_change" | "increase" | "reduce" | "adjust"
+ *                       "price_change" | "increase" | "reduce" | "adjust" |
+ *                       "handover"
  * @param {{reason?: string, author?: string, blancNumber?: string,
  *          createdAt?: string, branch?: string, currency?: string}} [meta]
  *          `createdAt` is an already-resolved client-local
  *          "YYYY-MM-DD HH:MM:SS" string. `branch` (with `currency`) is passed
  *          only for money handed over by the broker: it marks the movement as
- *          that branch's Cash from Brokers.
+ *          that branch's Cash from Brokers. A hand-over to the owner passes
+ *          `currency` WITHOUT `branch`, so the currency is recorded but the
+ *          movement stays out of Cash from Brokers.
  * @returns {Promise<number>} the (rounded) amount recorded, or 0 if skipped.
  */
 const recordBrokerMovement = (module.exports.recordBrokerMovement =
@@ -909,11 +919,13 @@ const recordBrokerMovement = (module.exports.recordBrokerMovement =
     ];
     // Only money handed over by the broker names a branch (an empty one
     // included). Every other movement leaves Branch NULL, which keeps it out
-    // of Cash from Brokers.
-    if (typeof meta.branch === "string") {
+    // of Cash from Brokers. A hand-over to the owner still records its
+    // currency (the reports show what the owner collected in), just without a
+    // branch.
+    if (typeof meta.branch === "string" || meta.currency !== undefined) {
       columns.push("Branch", "Currency");
       values.push(
-        normalizeBranch(meta.branch),
+        typeof meta.branch === "string" ? normalizeBranch(meta.branch) : null,
         normalizeCurrency(meta.currency)
       );
     }
@@ -1279,10 +1291,10 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       b.cutOff = Boolean(b.CutOff);
     }
   }
-  // Attach the newest manual top-up ("increase") of each broker's balance to
-  // the list rows, so the brokers table can show the last payment (amount +
-  // date) without a request per broker. A soft-deleted top-up is skipped: it no
-  // longer counts as money received.
+  // Attach the newest payment of each broker's balance (a branch top-up or a
+  // hand-over to the owner) to the list rows, so the brokers table can show
+  // the last payment (amount + date) without a request per broker. A
+  // soft-deleted payment is skipped: it no longer counts as money received.
   async function attachLastPayments(rows) {
     if (!Array.isArray(rows) || rows.length === 0) return;
     await ensureMovementTable();
@@ -1292,7 +1304,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
          JOIN (
            SELECT BrokerId, MAX(id) AS LastId
              FROM broker_balance_movements
-            WHERE Deleted = 0 AND Type = 'increase'
+            WHERE Deleted = 0 AND Type IN ('increase', 'handover')
             GROUP BY BrokerId
          ) last ON last.LastId = m.id`
     );
@@ -2680,6 +2692,18 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           if (!type) {
             return res.status(400).json({ error: "Type cannot be empty" });
           }
+          // A hand-over is money the broker paid to the owner: it counts as a
+          // payment but carries no branch, so it is never Cash from Brokers.
+          // Turning a branch top-up into a hand-over (or the other way round)
+          // would silently move the money between those two ledgers, so the
+          // boundary is fixed - delete the wrong row and add the right one.
+          const wasHandover = String(existing.Type || "").trim() === "handover";
+          if (wasHandover !== (type === "handover")) {
+            return res.status(400).json({
+              error:
+                "a handover cannot be changed into an increase or an expense, or the other way round",
+            });
+          }
           sets.push("Type = ?");
           params.push(type);
         }
@@ -3005,6 +3029,91 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         }
         console.error("Broker reduce failed:", err);
         res.status(500).json({ error: "Failed to reduce broker balance" });
+      }
+    }
+  );
+
+  // POST /brokers/:id/handover  { amount, reason, currency, CreatedAt? }
+  // The broker paid the OWNER directly. This is a payment on the broker's
+  // account - their balance grows by the amount, exactly like a top-up - but
+  // the money never reached a branch, so the movement carries NO branch:
+  //   - it is never counted in a branch's Cash from Brokers (CurrentCash.js
+  //     reads only top-ups with a branch), and it writes no cash_transactions
+  //     or total_cash rows;
+  //   - it still counts as a payment in the reports (Reports.js reads
+  //     'increase' and 'handover' together) and as the broker's last payment
+  //     (attachLastPayments below).
+  router.post(
+    "/brokers/:id/handover",
+    auth,
+    requireBrokerRole,
+    async (req, res) => {
+      try {
+        const brokerId = parseBrokerId(req.params.id);
+        if (brokerId === null) {
+          return res.status(400).json({ error: "Invalid broker id" });
+        }
+        const amount = parsePositiveAmount(req.body?.amount);
+        if (amount === null) {
+          return res
+            .status(400)
+            .json({ error: "amount must be a positive number" });
+        }
+        const reason = (
+          typeof req.body?.reason === "string" ? req.body.reason : ""
+        ).trim();
+        if (!reason) {
+          return res.status(400).json({ error: "reason is required" });
+        }
+        const currency = normalizeCurrency(req.body?.currency);
+
+        const moveTime = resolveBrokerCreatedAt(req.body);
+        if (moveTime.error) {
+          return res.status(400).json({ error: moveTime.error });
+        }
+
+        const affectedRows = await DBConnection.withTransaction(
+          async (conn) => {
+            const [r] = await conn.query(
+              "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
+              [amount, brokerId]
+            );
+            if (r.affectedRows === 0) return r.affectedRows;
+
+            // No `branch` on purpose: the owner took the money outside the
+            // branches, so this must not become Cash from Brokers.
+            await recordBrokerMovement(conn, brokerId, amount, "handover", {
+              reason,
+              author: req.user.username,
+              createdAt: moveTime.createdAt,
+              currency,
+            });
+
+            return r.affectedRows;
+          }
+        );
+
+        if (affectedRows === 0) {
+          return res.status(404).json({ error: "Broker not found" });
+        }
+
+        const [[broker]] = await DBConnection.query(
+          `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
+          [brokerId]
+        );
+        res.json({
+          message: "Broker handover recorded",
+          amount,
+          currency,
+          broker,
+        });
+      } catch (err) {
+        const msg = (err && err.message) || "";
+        if (msg.includes("amount") || msg.includes("reason")) {
+          return res.status(400).json({ error: msg });
+        }
+        console.error("Broker handover failed:", err);
+        res.status(500).json({ error: "Failed to record broker handover" });
       }
     }
   );

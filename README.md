@@ -214,7 +214,11 @@ Broker accounts.
 | `CreatedAt`        | `DATETIME`      | Creation time                     |
 
 Use case: broker management. Admins/workers can increase/reduce a broker
-balance. Creating an insurance resolves its broker from the sender email (broker_emails) and deducts a flat fee (the full Price) from its balance while decrementing InactivePolicies. No percentages are used anywhere.
+balance or record a hand-over paid straight to the owner (which raises the
+balance without touching the branches' Cash from Brokers). Creating an
+insurance resolves its broker from the sender email (broker_emails) and deducts
+a flat fee (the full Price) from its balance while decrementing
+InactivePolicies. No percentages are used anywhere.
 
 ### `broker_emails`
 
@@ -374,6 +378,11 @@ A broker balance never moves current cash:
 
 - `POST /brokers/:id/increase` is money handed over by the broker. It is kept
   apart from current cash as the branch's **Cash from Brokers** (see below).
+- `POST /brokers/:id/handover` is money the broker paid straight to the OWNER.
+  It raises the broker's balance and counts as a payment (in
+  `GET /reports/cash-inflow` and in the broker's last-payment date), but it
+  carries no branch, so it is **never** Cash from Brokers and writes nothing to
+  the cash drawer.
 - `POST /brokers/:id/reduce`, and the automatic per-policy deduction made when
   an insurance is created from an email card, touch neither current cash nor
   Cash from Brokers, and are never blocked by how much cash happens to be
@@ -387,7 +396,9 @@ branch's Cash from Brokers is not a stored total: it is the sum of that
 branch's top-ups recorded since its last reset, so correcting or deleting a
 top-up in the broker's history corrects it here too. Refunds of annulled or
 deleted insurances, price changes and admin balance edits are not money handed
-over and are never counted.
+over and are never counted. Nor is a hand-over to the owner (`handover`): that
+money is a payment on the broker's balance, but it never reached a branch, so
+it is excluded by both its type and its missing `Branch`.
 
 - `GET /currentcash` returns `brokerCash` (the balance per currency),
   `brokerCashTransactions` (the top-ups of the requested day) and
@@ -412,6 +423,7 @@ is left exactly as it was. The run is marked in `app_settings` as
   `deleted`, each with `DeletedAt`/`DeletedBy`)
 - `GET /brokers/:id` — single broker
 - `POST /brokers/:id/increase` — body `{ "amount": 100, "branch": "..." }` (the money is the branch's Cash from Brokers; current cash is not touched)
+- `POST /brokers/:id/handover` — body `{ "amount": 100, "currency": "EUR", "reason": "..." }` (the broker paid the owner directly: the balance grows like a top-up and the reports count it as a payment, but no branch takes the money, so Cash from Brokers is untouched)
 - `POST /brokers/:id/reduce` — body `{ "amount": 50 }` (may go infinitely negative; touches neither current cash nor Cash from Brokers)
 
 Admin-only (`role 1`) broker management:

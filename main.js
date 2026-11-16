@@ -15,6 +15,9 @@ const { createTariffsRouter } = require("./Requests/Tariffs.js");
 const { createBranchesRouter } = require("./Requests/Branches.js");
 const { createReportsRouter } = require("./Requests/Reports.js");
 const { createTestRouter } = require("./Requests/Test.js");
+const {
+  createDiagnosticsRouter,
+} = require("./Requests/Diagnostics.js");
 const { initWsServer } = require("./Users/websocket.js");
 const { runSetup } = require("./db/setup.js");
 
@@ -97,6 +100,68 @@ const recentFailures = [];
 function pushRing(items, item, limit) {
   items.push(item);
   if (items.length > limit) items.shift();
+}
+
+// ---------------------------------------------------------------------------
+// Per-IP / per-path request-rate tracker.
+//
+// There is no API rate limit, so a client stuck in a retry loop (or a page
+// polling too often) cannot be told apart from a single slow request in the
+// access log. This keeps a one-minute count per (ip, method, path) and exposes
+// the busiest entries to the admin diagnostics view. It is measurement only:
+// nothing is rejected because of it.
+// ---------------------------------------------------------------------------
+const POLL_WINDOW_MS = 60 * 1000;
+const POLL_MAX_TRACKED = 4000;
+const pollBuckets = new Map(); // `${ip}|${method} ${path}` -> {count, windowStart, lastAt}
+
+function noteRequestRate(entry) {
+  try {
+    const now = Date.now();
+    const key = `${entry.ip || "?"}|${entry.method} ${String(entry.path || "").split("?")[0]}`;
+    let bucket = pollBuckets.get(key);
+    if (!bucket || now - bucket.windowStart >= POLL_WINDOW_MS) {
+      bucket = {
+        count: 0,
+        windowStart: now,
+        lastAt: now,
+        ip: entry.ip || null,
+        method: entry.method,
+        path: String(entry.path || "").split("?")[0],
+        lastStatus: null,
+      };
+      pollBuckets.set(key, bucket);
+    }
+    bucket.count += 1;
+    bucket.lastAt = now;
+    bucket.lastStatus = entry.status;
+    if (pollBuckets.size > POLL_MAX_TRACKED) {
+      for (const [k, b] of pollBuckets) {
+        if (now - b.lastAt > POLL_WINDOW_MS) pollBuckets.delete(k);
+        if (pollBuckets.size <= POLL_MAX_TRACKED) break;
+      }
+    }
+  } catch {
+    // Measurement must never affect request handling.
+  }
+}
+
+function pollingStats() {
+  const now = Date.now();
+  const rows = [];
+  for (const bucket of pollBuckets.values()) {
+    if (now - bucket.windowStart >= POLL_WINDOW_MS) continue;
+    rows.push({
+      ip: bucket.ip,
+      method: bucket.method,
+      path: bucket.path,
+      requestsPerMinute: bucket.count,
+      lastStatus: bucket.lastStatus,
+      secondsSinceLastRequest: Math.round((now - bucket.lastAt) / 1000),
+    });
+  }
+  rows.sort((a, b) => b.requestsPerMinute - a.requestsPerMinute);
+  return rows.slice(0, 20);
 }
 
 // Resolve the client's real IP address. The API sits behind a CDN/reverse
@@ -229,8 +294,19 @@ async function start() {
         durationMs,
         ip: clientIp(req),
         user,
+        // The origin/proxy headers are what a CDN or antivirus web filter
+        // rewrites, so record them with every request: comparing them across
+        // clients is how a blocked origin or a missing X-Forwarded-For shows up.
+        origin: req.headers.origin || null,
+        referer: req.headers.referer || null,
+        forwardedFor: req.headers["x-forwarded-for"] || null,
+        realIp: req.headers["x-real-ip"] || null,
+        userAgent: req.headers["user-agent"]
+          ? String(req.headers["user-agent"]).slice(0, 160)
+          : null,
       };
       pushRing(recentRequests, entry, RECENT_REQUESTS_LIMIT);
+      noteRequestRate(entry);
       if (res.statusCode >= 400) {
         pushRing(recentFailures, entry, RECENT_FAILURES_LIMIT);
       }
@@ -303,6 +379,19 @@ async function start() {
   app.use(createBranchesRouter(DBConnection));
   app.use(createReportsRouter(DBConnection));
   app.use(createTestRouter(DBConnection));
+
+  // Client diagnostics (failed requests captured on the PCs) + the admin-only
+  // inspection endpoints. Mounted with the access log's rings and the polling
+  // tracker so an admin can compare what a client saw with what the server saw.
+  app.use(
+    createDiagnosticsRouter(DBConnection, {
+      clientIp,
+      recentRequests: () => recentRequests.slice(),
+      recentFailures: () => recentFailures.slice(),
+      pollingStats,
+      trustProxy: () => app.get("trust proxy"),
+    })
+  );
 
   // The website is hosted separately; this server is API-only (REST + WebSocket).
 

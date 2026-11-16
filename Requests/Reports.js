@@ -151,8 +151,9 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
   //   totalOwed      — net value of the insurances the broker made in the period
   //                    (full price while active, the annul fee once annulled,
   //                    nothing once deleted).
-  //   amount         — cash actually received from the broker ("increase"
-  //                    movements on the balance ledger).
+  //   amount         — cash actually received from the broker (a top-up taken
+  //                    by a branch plus a hand-over paid to the owner, i.e.
+  //                    "increase" and "handover" movements on the ledger).
   //   weeklyBalance  — totalOwed - amount (this cycle only, no leftover).
   //   leftover       — the balance carried over from previous cycles, expressed
   //                    as "owed": positive when the broker still owes, negative
@@ -183,11 +184,14 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
       const fromDay = fromRaw;
       const toDay = addOneDay(toRaw);
 
-      // 1) Cash inflow: money received from the broker within the period.
+      // 1) Cash inflow: money received from the broker within the period - a
+      //    top-up taken by a branch ('increase') or a payment handed straight
+      //    to the owner ('handover'). Both raise the broker's balance and are
+      //    money the broker paid, so both settle what they owe.
       const [inflowRows] = await DBConnection.query(
         `SELECT BrokerId AS brokerId, ROUND(SUM(Amount), 2) AS amount
            FROM broker_balance_movements
-          WHERE Type = 'increase' AND Amount > 0 AND Deleted = 0
+          WHERE Type IN ('increase', 'handover') AND Amount > 0 AND Deleted = 0
             AND CreatedAt >= ? AND CreatedAt < ?
           GROUP BY BrokerId`,
         [fromParam, toParam]
