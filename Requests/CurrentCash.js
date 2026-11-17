@@ -66,6 +66,26 @@
 // NOT a sale of the day: no `total_cash_transactions` row is written, it is
 // excluded from Total daily cash and it never counts as an expense. See
 // "Expences / hand-overs" below.
+//
+// A HAND-OVER CAN BE UNDONE (admin only). The money comes back, and the admin
+// says where it went:
+//   - to the office drawer: `current_cash` grows again through a ledger row of
+//     Type = 'handover_return' (positive), so the drawer and its historical walk
+//     stay in step - but it is still NOT a sale, so it has no Total cash row and
+//     does not move Total daily cash;
+//   - straight to the company bank account: no drawer is touched at all. Only a
+//     row in `cash_handover_returns` is written, which lowers how much is still
+//     handed over.
+// Every return is recorded in `cash_handover_returns`, linked to the original
+// hand-over and (for a drawer return) to the ledger row that put the money back.
+// A hand-over may be returned in parts, so the statistics compare the hand-over
+// with the sum of its returns. A hand-over that was deleted instead of returned
+// is counted as "undone": its money went back to the drawer in full.
+//
+// Broker-balance hand-overs (Type = 'handover' in `broker_balance_movements`,
+// see Requests/Brokers.js) are tracked in the same statistics. They carry no
+// branch and are undone from the broker's history (which reverses the broker's
+// balance), so the drawer return route above only applies to cash hand-overs.
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
@@ -81,6 +101,16 @@ const CURRENCIES = ["EUR", "TRY"];
 // it is neither a sale (so it stays out of Total daily cash) nor money the
 // branch spent (so it stays out of the expenses).
 const HANDOVER_TYPE = "handover";
+
+// The ledger `Type` of money that was handed over and has now come back into
+// the drawer. It is a positive movement (like an increase) for the balance and
+// the historical walk, but - exactly like the hand-over it reverses - it is not
+// a sale, so it writes no Total cash row and stays out of Total daily cash.
+const HANDOVER_RETURN_TYPE = "handover_return";
+
+// Where returned hand-over money can go. "drawer" increases available cash;
+// "bank" leaves every drawer untouched and only lowers the handed-over total.
+const HANDOVER_RETURN_DESTINATIONS = ["drawer", "bank"];
 
 /**
  * Parse a money value into a number rounded to 2 decimals.
@@ -124,6 +154,16 @@ const normalizeBranch = (module.exports.normalizeBranch =
   function normalizeBranch(value) {
     return String(value || "").trim();
   });
+
+/**
+ * Round a money value to the two decimals the ledger stores.
+ *
+ * @param {unknown} value
+ * @returns {number}
+ */
+const roundMoney = (module.exports.roundMoney = function roundMoney(value) {
+  return Math.round((Number(value) || 0) * 100) / 100;
+});
 
 // ---------------------------------------------------------------------------
 // Transaction history by day.
@@ -369,14 +409,14 @@ const getCurrentCashAsOf = (module.exports.getCurrentCashAsOf =
     const b = normalizeBranch(branch);
     const live = await getCurrentCash(conn, b);
 
-    // Movements recorded after the requested day (increase + / expense -; a
-    // hand-over is not an 'increase', so it subtracts as well - it did leave
-    // the drawer). A soft-deleted movement no longer counts anywhere (its money
-    // was already given back when it was deleted), so it is skipped here as
-    // well.
+    // Movements recorded after the requested day (increase and a returned
+    // hand-over + / expense and a hand-over -; a hand-over is not an
+    // 'increase', so it subtracts as well - it did leave the drawer). A
+    // soft-deleted movement no longer counts anywhere (its money was already
+    // given back when it was deleted), so it is skipped here as well.
     const [laterMoves] = await conn.query(
       `SELECT Currency,
-         ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
+         ROUND(SUM(CASE WHEN Type IN ('increase', 'handover_return') THEN Amount ELSE -Amount END), 2) AS Net
        FROM cash_transactions
        WHERE Branch = ? AND CreatedAt >= ? AND Deleted = 0
        GROUP BY Currency`,
@@ -822,11 +862,23 @@ const isCashHandover = (module.exports.isCashHandover = function isCashHandover(
 });
 
 /**
+ * Whether a cash-ledger row is money coming BACK from a hand-over (Type =
+ * 'handover_return') instead of an increase or an expense.
+ *
+ * @param {string} type
+ * @returns {boolean}
+ */
+const isHandoverReturn = (module.exports.isHandoverReturn =
+  function isHandoverReturn(type) {
+    return String(type || "").trim().toLowerCase() === HANDOVER_RETURN_TYPE;
+  });
+
+/**
  * Split one day's `cash_transactions` rows into the branch's EXPENCES - the
  * manual reductions only - and their per-currency total. Refunds of annulled or
  * deleted insurances and the corrections of edited policies are left out: they
- * are policy movements, not money the branch spent. Hand-overs are a different
- * ledger type ('handover'), so they are left out as well.
+ * are policy movements, not money the branch spent. Hand-overs and their
+ * returns are different ledger types, so they are left out as well.
  *
  * @param {object[]} rows  The day's `cash_transactions` rows.
  * @returns {{ expences: object[], totalExpences: Record<string, number> }}
@@ -846,6 +898,328 @@ const splitExpences = (module.exports.splitExpences =
         Math.round((totalExpences[cur] + (Number(row.Amount) || 0)) * 100) / 100;
     }
     return { expences, totalExpences };
+  });
+
+// ---------------------------------------------------------------------------
+// Hand-over statistics and returns (admin only)
+//
+// The Current cash screen shows an admin how much money is out of the company
+// because it was handed to a person, and how much of it has come back:
+//
+//   cash.handedOver         live cash hand-overs (Type = 'handover')
+//   cash.undone             hand-overs that were DELETED (their money went
+//                           back to the drawer in full)
+//   cash.returnedToDrawer   returns whose Destination = 'drawer'
+//   cash.returnedToBank     returns whose Destination = 'bank'
+//   cash.outstanding        live hand-overs minus both kinds of return
+//   balance.handedOver      live broker-balance hand-overs ('handover' rows of
+//                           broker_balance_movements; these carry no branch)
+//   balance.undone          broker hand-overs deleted from the broker history
+//   balance.outstanding     live broker hand-overs (not returnable here)
+//
+// `handovers` lists only the live cash hand-overs that still have money out,
+// newest first, so the screen can offer "Undo" for each of them. The figures
+// are per currency and cover every branch (a broker hand-over has no branch).
+// ---------------------------------------------------------------------------
+
+const emptyCashTotals = () => {
+  const totals = {};
+  for (const currency of CURRENCIES) totals[currency] = 0;
+  return totals;
+};
+
+/**
+ * Sum one grouped-by-currency query into a { EUR, TRY } object.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {string} sql  Query returning `Currency` and `Total` columns.
+ * @param {unknown[]} [params]
+ * @returns {Promise<Record<string, number>>}
+ */
+async function sumHandoverTotals(conn, sql, params = []) {
+  const [rows] = await conn.query(sql, params);
+  const totals = emptyCashTotals();
+  for (const row of rows || []) {
+    const cur = normalizeCurrency(row.Currency);
+    totals[cur] = roundMoney(totals[cur] + (Number(row.Total) || 0));
+  }
+  return totals;
+}
+
+/**
+ * Read the company-wide hand-over statistics (see the block above).
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @returns {Promise<object>}
+ */
+const getHandoverStats = (module.exports.getHandoverStats =
+  async function getHandoverStats(conn) {
+    const [cashHandedOver, cashUndone, cashReturnedDrawer, cashReturnedBank] =
+      await Promise.all([
+        sumHandoverTotals(
+          conn,
+          `SELECT Currency, ROUND(SUM(Amount), 2) AS Total
+             FROM cash_transactions
+            WHERE Type = 'handover' AND Deleted = 0
+            GROUP BY Currency`
+        ),
+        sumHandoverTotals(
+          conn,
+          `SELECT Currency, ROUND(SUM(Amount), 2) AS Total
+             FROM cash_transactions
+            WHERE Type = 'handover' AND Deleted = 1
+            GROUP BY Currency`
+        ),
+        sumHandoverTotals(
+          conn,
+          `SELECT Currency, ROUND(SUM(Amount), 2) AS Total
+             FROM cash_handover_returns
+            WHERE HandoverType = 'cash' AND Destination = 'drawer'
+            GROUP BY Currency`
+        ),
+        sumHandoverTotals(
+          conn,
+          `SELECT Currency, ROUND(SUM(Amount), 2) AS Total
+             FROM cash_handover_returns
+            WHERE HandoverType = 'cash' AND Destination = 'bank'
+            GROUP BY Currency`
+        ),
+      ]);
+
+    const [balanceHandedOver, balanceUndone] = await Promise.all([
+      sumHandoverTotals(
+        conn,
+        `SELECT Currency, ROUND(SUM(Amount), 2) AS Total
+           FROM broker_balance_movements
+          WHERE Type = 'handover' AND Deleted = 0
+          GROUP BY Currency`
+      ),
+      sumHandoverTotals(
+        conn,
+        `SELECT Currency, ROUND(SUM(Amount), 2) AS Total
+           FROM broker_balance_movements
+          WHERE Type = 'handover' AND Deleted = 1
+          GROUP BY Currency`
+      ),
+    ]);
+
+    // Every live cash hand-over with the money already returned, so the screen
+    // can show the remaining amount and offer to return it. A hand-over that
+    // has been fully returned is left out: there is nothing left to undo.
+    const [handoverRows] = await conn.query(
+      `SELECT h.id, h.Branch, h.Amount, h.Currency, h.Username, h.Reason,
+              h.Recipient, h.CreatedAt, COALESCE(r.Returned, 0) AS Returned
+         FROM cash_transactions h
+         LEFT JOIN (
+           SELECT CashTransactionId, ROUND(SUM(Amount), 2) AS Returned
+             FROM cash_handover_returns
+            WHERE HandoverType = 'cash'
+            GROUP BY CashTransactionId
+         ) r ON r.CashTransactionId = h.id
+        WHERE h.Type = 'handover' AND h.Deleted = 0
+        ORDER BY h.id DESC`
+    );
+    const handovers = [];
+    for (const row of handoverRows || []) {
+      const amount = roundMoney(row.Amount);
+      const returned = roundMoney(row.Returned);
+      const remaining = roundMoney(amount - returned);
+      if (remaining <= 0) continue;
+      handovers.push({
+        id: Number(row.id),
+        Branch: row.Branch,
+        Amount: amount,
+        Currency: normalizeCurrency(row.Currency),
+        Username: row.Username,
+        Reason: row.Reason,
+        Recipient: row.Recipient,
+        CreatedAt: row.CreatedAt,
+        Returned: returned,
+        Remaining: remaining,
+      });
+    }
+
+    const cashOutstanding = emptyCashTotals();
+    for (const currency of CURRENCIES) {
+      cashOutstanding[currency] = roundMoney(
+        Math.max(
+          0,
+          cashHandedOver[currency] -
+            cashReturnedDrawer[currency] -
+            cashReturnedBank[currency]
+        )
+      );
+    }
+
+    return {
+      cash: {
+        handedOver: cashHandedOver,
+        undone: cashUndone,
+        returnedToDrawer: cashReturnedDrawer,
+        returnedToBank: cashReturnedBank,
+        outstanding: cashOutstanding,
+      },
+      balance: {
+        handedOver: balanceHandedOver,
+        undone: balanceUndone,
+        outstanding: { ...balanceHandedOver },
+      },
+      handovers,
+    };
+  });
+
+/**
+ * Return (part of) a cash hand-over: the money that was given to a person comes
+ * back. The admin chooses where it goes:
+ *
+ *   - destination 'drawer': the drawer is increased through a
+ *     `cash_transactions` row of Type = 'handover_return'. Like a hand-over it
+ *     writes NO Total cash row, so Total daily cash and the expenses stay
+ *     untouched, but the drawer's historical walk follows the money.
+ *   - destination 'bank': nothing but `cash_handover_returns` is written - no
+ *     drawer moves, the handed-over total simply falls.
+ *
+ * A hand-over can be returned in parts; the sum of its returns can never exceed
+ * the amount that was handed over.
+ *
+ * NOTE: runs inside the caller's transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {object} handover  The `cash_transactions` row being returned.
+ * @param {string} username
+ * @param {number|string} amount
+ * @param {"drawer"|"bank"} destination
+ * @param {string} [reason]  Optional note from the admin.
+ * @param {string} [createdAt]
+ * @returns {Promise<object>}
+ */
+const recordCashHandoverReturn = (module.exports.recordCashHandoverReturn =
+  async function recordCashHandoverReturn(
+    conn,
+    handover,
+    username,
+    amount,
+    destination,
+    reason,
+    createdAt
+  ) {
+    if (!handover || !isCashHandover(handover.Type)) {
+      const err = new Error("transaction is not a hand-over");
+      err.status = 400;
+      throw err;
+    }
+    if (Number(handover.Deleted)) {
+      const err = new Error("a deleted hand-over cannot be returned");
+      err.status = 400;
+      throw err;
+    }
+
+    const dest = String(destination || "")
+      .trim()
+      .toLowerCase();
+    if (!HANDOVER_RETURN_DESTINATIONS.includes(dest)) {
+      const err = new Error("destination must be 'drawer' or 'bank'");
+      err.status = 400;
+      throw err;
+    }
+
+    const decimal = toDecimal(amount);
+    if (decimal === null || decimal <= 0) {
+      const err = new Error("amount must be a positive number");
+      err.status = 400;
+      throw err;
+    }
+
+    const [returnedRows] = await conn.query(
+      `SELECT COALESCE(SUM(Amount), 0) AS Returned
+         FROM cash_handover_returns
+        WHERE HandoverType = 'cash' AND CashTransactionId = ?`,
+      [handover.id]
+    );
+    const returnedSoFar = roundMoney(
+      returnedRows && returnedRows[0] ? returnedRows[0].Returned : 0
+    );
+    const remaining = roundMoney(roundMoney(handover.Amount) - returnedSoFar);
+    if (remaining <= 0) {
+      const err = new Error("the hand-over has already been fully returned");
+      err.status = 400;
+      throw err;
+    }
+    if (decimal > remaining + 0.005) {
+      const err = new Error("amount exceeds the money still handed over");
+      err.status = 400;
+      throw err;
+    }
+
+    const b = normalizeBranch(handover.Branch);
+    const cur = normalizeCurrency(handover.Currency);
+    const ts =
+      typeof createdAt === "string" && createdAt.trim() !== ""
+        ? createdAt.trim()
+        : clientLocalDateTime(0);
+    const note = typeof reason === "string" ? reason.trim() : "";
+    const ledgerReason = (
+      `Return of hand over #${handover.id}` + (note ? `: ${note}` : "")
+    ).slice(0, 255);
+
+    let returnTransactionId = null;
+    if (dest === "drawer") {
+      await adjustBalance(conn, b, cur, "increase", decimal);
+      const [inserted] = await conn.query(
+        `INSERT INTO cash_transactions (Branch, Type, Amount, Currency, Username, Reason, Recipient, CreatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          b,
+          HANDOVER_RETURN_TYPE,
+          decimal,
+          cur,
+          username,
+          ledgerReason,
+          null,
+          ts,
+        ]
+      );
+      returnTransactionId =
+        inserted && inserted.insertId ? Number(inserted.insertId) : null;
+      // Deliberately no logTotalCash(): returning handed-over money is not a
+      // sale and not a payment through any channel.
+    }
+
+    const [insertedReturn] = await conn.query(
+      `INSERT INTO cash_handover_returns
+         (HandoverType, CashTransactionId, BrokerMovementId, CashReturnTransactionId,
+          Branch, BrokerId, Currency, Amount, Destination, Username, Reason, CreatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        "cash",
+        Number(handover.id),
+        null,
+        returnTransactionId,
+        b,
+        null,
+        cur,
+        decimal,
+        dest,
+        username,
+        note.slice(0, 255),
+        ts,
+      ]
+    );
+
+    return {
+      id: Number(handover.id),
+      amount: decimal,
+      currency: cur,
+      branch: b,
+      destination: dest,
+      returned: roundMoney(returnedSoFar + decimal),
+      remaining: roundMoney(remaining - decimal),
+      returnId:
+        insertedReturn && insertedReturn.insertId
+          ? Number(insertedReturn.insertId)
+          : null,
+      returnTransactionId,
+    };
   });
 
 /**
@@ -1571,7 +1945,7 @@ const planBranchAsOf = (module.exports.planBranchAsOf =
     }
     const [cashMoveRows] = await conn.query(
       `SELECT Currency,
-              ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount ELSE -Amount END), 2) AS Net
+              ROUND(SUM(CASE WHEN Type IN ('increase', 'handover_return') THEN Amount ELSE -Amount END), 2) AS Net
          FROM cash_transactions
         WHERE Branch = ? AND Deleted = 0 AND CreatedAt >= ?
         GROUP BY Currency`,
@@ -1929,7 +2303,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
       // read from the rows already fetched, so the list always matches the
       // Transactions table shown next to it on the same day.
       const { expences, totalExpences } = splitExpences(txs);
-      res.json({
+      const payload = {
         balances,
         cardBalance,
         brokerCash,
@@ -1942,7 +2316,14 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         brokerCashResets,
         cardInsurances,
         date: day.date,
-      });
+      };
+      // Hand-over statistics are for admins only. They are company-wide (every
+      // branch and every broker), so they do not change with the branch
+      // selector; the list of outstanding hand-overs names each branch.
+      if (String(req.user && req.user.role) === "1") {
+        payload.handoverStats = await getHandoverStats(DBConnection);
+      }
+      res.json(payload);
     } catch (err) {
       console.error("CurrentCash lookup failed:", err);
       res.status(500).json({ error: "Failed to fetch current cash" });
@@ -2322,6 +2703,85 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
     }
   );
 
+  // POST /currentcash/handover/:id/undo — admin-only "Undo hand over".
+  //   { Amount?, Destination: "drawer"|"bank", Reason?, CreatedAt? }
+  //
+  // Returns (part of) money that was handed to a person. `Destination` decides
+  // where it goes:
+  //   - "drawer" increases the branch's available cash (a 'handover_return'
+  //     ledger row, so the historical walk stays in step);
+  //   - "bank" touches no drawer at all: it only lowers the handed-over total.
+  // A hand-over may be returned in several parts; the server refuses more than
+  // the amount that is still out.
+  router.post(
+    "/currentcash/handover/:id/undo",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      const id = Number(req.params.id);
+      const body = req.body || {};
+      const destination = String(
+        body.Destination ?? body.destination ?? ""
+      )
+        .trim()
+        .toLowerCase();
+      if (!HANDOVER_RETURN_DESTINATIONS.includes(destination)) {
+        return res
+          .status(400)
+          .json({ error: "destination must be 'drawer' or 'bank'" });
+      }
+      const time = resolveRequestCreatedAt(body);
+      if (time.error) {
+        return res.status(400).json({ error: time.error });
+      }
+      try {
+        const result = await DBConnection.withTransaction(async (conn) => {
+          // Lock the hand-over row so two concurrent undos cannot both pass the
+          // "still handed over" check and return more than was handed over.
+          const [rows] = await conn.query(
+            "SELECT * FROM cash_transactions WHERE id = ? FOR UPDATE",
+            [id]
+          );
+          if (!Number.isInteger(id) || rows.length === 0) {
+            const err = new Error("Transaction not found");
+            err.status = 404;
+            throw err;
+          }
+          return recordCashHandoverReturn(
+            conn,
+            rows[0],
+            req.user.username,
+            body.Amount ?? body.amount,
+            destination,
+            reasonText(body.Reason ?? body.reason),
+            time.createdAt
+          );
+        });
+
+        res.json({
+          message: "Hand-over returned",
+          ...result,
+          author: req.user.username,
+        });
+      } catch (err) {
+        if (err && err.status) {
+          return res.status(err.status).json({ error: err.message });
+        }
+        const msg = (err && err.message) || "";
+        if (
+          msg.includes("amount") ||
+          msg.includes("destination") ||
+          msg.includes("hand-over") ||
+          msg.includes("Transaction")
+        ) {
+          return res.status(400).json({ error: msg });
+        }
+        console.error("CurrentCash handover return failed:", err);
+        res.status(500).json({ error: "Failed to return the handed over cash" });
+      }
+    }
+  );
+
   // POST /currentcash/reset — "Reset to 0": zero all currencies, the card
   // balance AND the cash from brokers of a branch, recording each reset.
   // Expects { branch } in the body.
@@ -2376,6 +2836,14 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         if (tx.Deleted) {
           return res.status(400).json({ error: "Transaction already deleted" });
         }
+        // A hand-over RETURN is a bookkeeping row created by the undo action.
+        // It has no editable fields; correcting it would detach it from the
+        // hand-over it belongs to.
+        if (isHandoverReturn(tx.Type)) {
+          return res
+            .status(400)
+            .json({ error: "a hand-over return cannot be edited or deleted" });
+        }
         if (String(tx.Username) !== String(req.user.username)) {
           return res.status(403).json({
             error: "Forbidden: you can only edit your own transactions",
@@ -2428,6 +2896,24 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         }
         if (newIsHandover && !newRecipient) {
           return res.status(400).json({ error: "recipient is required" });
+        }
+        // A hand-over that already has returns cannot be corrected below what
+        // has come back: the remaining amount would go negative.
+        if (oldIsHandover) {
+          const [returnRows] = await DBConnection.query(
+            `SELECT COALESCE(SUM(Amount), 0) AS Returned
+               FROM cash_handover_returns
+              WHERE HandoverType = 'cash' AND CashTransactionId = ?`,
+            [id]
+          );
+          const returnedAmount = roundMoney(
+            returnRows && returnRows[0] ? returnRows[0].Returned : 0
+          );
+          if (newAmount + 0.005 < returnedAmount) {
+            return res
+              .status(400)
+              .json({ error: "amount is below what was already returned" });
+          }
         }
 
         const oldType = tx.Type;
@@ -2564,6 +3050,10 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
   // A reduction whose money is no longer in the drawer (it was spent or reset
   // in between) cannot be undone: the drawer would have to go negative, so the
   // deletion is rejected and nothing changes.
+  //
+  // A hand-over with returns cannot be deleted either: its money was already
+  // partly (or fully) put back, and deleting the row would put the whole amount
+  // back again. Use "Undo hand over" for the remaining amount instead.
   router.delete(
     "/currentcash/transactions/:id",
     auth,
@@ -2582,6 +3072,29 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         const tx = rows[0];
         if (tx.Deleted) {
           return res.status(400).json({ error: "Transaction already deleted" });
+        }
+        // The bookkeeping row of an undo cannot be deleted: the hand-over it
+        // belongs to would keep counting the money as still out.
+        if (isHandoverReturn(tx.Type)) {
+          return res
+            .status(400)
+            .json({ error: "a hand-over return cannot be edited or deleted" });
+        }
+        if (isCashHandover(tx.Type)) {
+          const [returnRows] = await DBConnection.query(
+            `SELECT COALESCE(SUM(Amount), 0) AS Returned
+               FROM cash_handover_returns
+              WHERE HandoverType = 'cash' AND CashTransactionId = ?`,
+            [id]
+          );
+          const returnedAmount = roundMoney(
+            returnRows && returnRows[0] ? returnRows[0].Returned : 0
+          );
+          if (returnedAmount > 0) {
+            return res.status(400).json({
+              error: "a hand-over with returns cannot be deleted",
+            });
+          }
         }
 
         const txBranch = normalizeBranch(tx.Branch);

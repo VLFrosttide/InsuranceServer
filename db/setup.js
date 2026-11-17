@@ -583,6 +583,40 @@ async function runSetup(config = {}) {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
 
+  // Returns of money that was handed over to a person ("Undo hand over" on the
+  // Current cash screen). A hand-over can be returned in parts, either to the
+  // branch drawer - which increases available cash through a matching
+  // `cash_transactions` row of Type 'handover_return' - or straight to the
+  // company bank account, which touches no drawer and only lowers how much is
+  // still handed over. The original hand-over stays in its ledger, so the whole
+  // history is kept; this table links a return to it and to the ledger row that
+  // put the money back (when the destination was the drawer).
+  //
+  // `HandoverType` is 'cash' today ('broker' is reserved for broker-balance
+  // hand-overs; those carry no branch and are undone from the broker history).
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS cash_handover_returns (
+      id INT NOT NULL AUTO_INCREMENT,
+      HandoverType VARCHAR(20) NOT NULL,
+      CashTransactionId INT NULL,
+      BrokerMovementId INT NULL,
+      CashReturnTransactionId INT NULL,
+      Branch VARCHAR(45) NOT NULL DEFAULT '',
+      BrokerId INT NULL,
+      Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
+      Amount DECIMAL(15,2) NOT NULL,
+      Destination VARCHAR(20) NOT NULL,
+      Username VARCHAR(45) NOT NULL,
+      Reason VARCHAR(255) NOT NULL DEFAULT '',
+      CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_handover_returns_cash (CashTransactionId),
+      KEY idx_handover_returns_broker (BrokerMovementId),
+      KEY idx_handover_returns_branch_time (Branch, CreatedAt)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+    COMMENT='Returns/undos of handed-over money (office drawer or company bank)'
+  `);
+
   // CardBalance support.
   //
   // Card balance is a single running balance, separate from current cash. When
