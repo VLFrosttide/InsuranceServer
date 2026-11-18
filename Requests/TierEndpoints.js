@@ -31,6 +31,9 @@ const {
   loadOwnBrokerTariffs,
   attachSubBrokerStatus,
   computePolicyTariffPrice,
+  isHollowBlanc,
+  tagHollowBlanc,
+  ensureHollowTable,
 } = require("./Brokers.js");
 const { sendReply } = require("../Mail/SendReply.js");
 const mailStore = require("../Mail/mailStore.js");
@@ -185,6 +188,40 @@ async function rejectIfBlancOutsideBrokerBatches(
   res.status(422).json({
     error: "This blanc number is not in any of the broker's blanc batches",
     code: "BLANC_OUTSIDE_BROKER_BATCHES",
+  });
+  return true;
+}
+
+/**
+ * Reject an insurance whose blanc number was tagged as hollow (the form is
+ * faulty, so no policy can be written on it). A hollow blanc can never be used,
+ * by any role and regardless of the broker batches. Returns true when the
+ * response was sent and the create must be aborted.
+ *
+ * @param {import("express").Response} res
+ * @param {{query: Function}} conn
+ * @param {any} blancNumber
+ * @returns {Promise<boolean>}
+ */
+async function rejectIfBlancIsHollow(res, conn, blancNumber) {
+  const blanc = String(blancNumber ?? "").trim();
+  if (!blanc) return false;
+  let hollow = false;
+  try {
+    hollow =
+      typeof isHollowBlanc === "function"
+        ? await isHollowBlanc(conn, blanc)
+        : false;
+  } catch (err) {
+    // A database without the table yet must not block a sale: the tag is
+    // enforced again once the table exists.
+    console.warn("Could not check for a hollow blanc:", (err && err.message) || err);
+    return false;
+  }
+  if (!hollow) return false;
+  res.status(422).json({
+    error: "This blanc number was tagged as hollow and cannot be used",
+    code: "BLANC_IS_HOLLOW",
   });
   return true;
 }
@@ -879,6 +916,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
       }
 
+      // A blanc tagged as hollow can never be written on.
+      if (await rejectIfBlancIsHollow(res, DBConnection, blancNumber)) {
+        return;
+      }
+
       if (
         await rejectIfBlancOutsideBrokerBatches(
           res,
@@ -1379,6 +1421,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
       const priceDecimal = toDecimal(price);
 
+      // A blanc tagged as hollow can never be written on.
+      if (await rejectIfBlancIsHollow(res, DBConnection, blancNumber)) {
+        return;
+      }
+
       if (
         await rejectIfBlancOutsideBrokerBatches(
           res,
@@ -1864,6 +1911,219 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     } catch (err) {
       console.error("Insurance search lookup failed:", err);
       res.status(500).json({ error: "Failed to fetch insurances" });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Notes on an insurance
+  // ---------------------------------------------------------------------------
+  // A free-text note attached to a policy's blanc number, with the user who
+  // wrote it. Admins and workers may read and add notes (the same users who can
+  // view/edit the policy); nobody may edit or delete someone else's note, so
+  // there are no update/delete routes.
+
+  const INSURANCE_NOTE_COLUMNS = "id, BlancNumber, Note, Author, CreatedAt";
+
+  // GET /insurances/:blancNumber/notes — every note of one policy, oldest first.
+  router.get(
+    "/insurances/:blancNumber/notes",
+    auth,
+    requireRole(1, 2),
+    async (req, res) => {
+      try {
+        const blancNumber = String(req.params.blancNumber || "").trim();
+        if (!blancNumber) {
+          return res.status(400).json({ error: "BlancNumber is required" });
+        }
+        const [rows] = await DBConnection.query(
+          `SELECT ${INSURANCE_NOTE_COLUMNS} FROM insurance_notes
+            WHERE BlancNumber = ?
+            ORDER BY CreatedAt ASC, id ASC`,
+          [blancNumber]
+        );
+        res.json({ blancNumber, notes: rows || [] });
+      } catch (err) {
+        console.error("Insurance note lookup failed:", err);
+        res.status(500).json({ error: "Failed to fetch the notes" });
+      }
+    }
+  );
+
+  // POST /insurances/:blancNumber/notes — add one note.
+  // Body: { Note, CreatedAt? } — the author is always the authenticated user,
+  // so a client cannot write a note in someone else's name.
+  router.post(
+    "/insurances/:blancNumber/notes",
+    auth,
+    requireRole(1, 2),
+    async (req, res) => {
+      try {
+        const blancNumber = String(req.params.blancNumber || "").trim();
+        if (!blancNumber) {
+          return res.status(400).json({ error: "BlancNumber is required" });
+        }
+        const b = req.body || {};
+        const note = String(b.Note ?? b.note ?? "").trim();
+        if (!note) {
+          return res.status(400).json({ error: "The note cannot be empty" });
+        }
+        if (note.length > 4000) {
+          return res.status(400).json({ error: "The note is too long" });
+        }
+        const [policyRows] = await DBConnection.query(
+          "SELECT BlancNumber FROM insurance WHERE BlancNumber = ?",
+          [blancNumber]
+        );
+        if (!policyRows || policyRows.length === 0) {
+          return res.status(404).json({ error: "Insurance not found" });
+        }
+        // The client's own wall-clock time is stored as sent (the same rule the
+        // cash ledger uses), so a note written offline shows when it was typed.
+        const sent = b.CreatedAt ?? b.createdAt;
+        let createdAt = null;
+        if (sent !== undefined && sent !== null && String(sent).trim() !== "") {
+          const value = String(sent).trim();
+          if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)) {
+            return res
+              .status(400)
+              .json({ error: "CreatedAt must be in YYYY-MM-DD HH:MM:SS format" });
+          }
+          createdAt = value;
+        }
+        if (createdAt) {
+          await DBConnection.query(
+            `INSERT INTO insurance_notes (BlancNumber, Note, Author, CreatedAt)
+             VALUES (?, ?, ?, ?)`,
+            [blancNumber, note, req.user.username, createdAt]
+          );
+        } else {
+          await DBConnection.query(
+            `INSERT INTO insurance_notes (BlancNumber, Note, Author)
+             VALUES (?, ?, ?)`,
+            [blancNumber, note, req.user.username]
+          );
+        }
+        const [rows] = await DBConnection.query(
+          `SELECT ${INSURANCE_NOTE_COLUMNS} FROM insurance_notes
+            WHERE BlancNumber = ?
+            ORDER BY CreatedAt ASC, id ASC`,
+          [blancNumber]
+        );
+        res.status(201).json({
+          message: "Note added",
+          blancNumber,
+          author: req.user.username,
+          notes: rows || [],
+        });
+      } catch (err) {
+        console.error("Insurance note create failed:", err);
+        res.status(500).json({ error: "Failed to add the note" });
+      }
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Hollow blancs (admin only)
+  // ---------------------------------------------------------------------------
+  // A hollow blanc is a form that cannot be written on. Tagging it records it in
+  // `hollow_blancs` (not in `insurance`), which counts it as used-up in the
+  // broker's inactive-blanc summary, so it leaves the broker's current blancs
+  // immediately. The form only needs the blanc number - no policy, car or price.
+  router.post("/admin/blancs/hollow", auth, requireRole(1), async (req, res) => {
+    try {
+      const b = req.body || {};
+      const blancNumber = String(b.BlancNumber ?? b.blancNumber ?? "").trim();
+      if (!blancNumber) {
+        return res.status(400).json({ error: "BlancNumber is required" });
+      }
+      if (typeof tagHollowBlanc !== "function") {
+        return res.status(500).json({ error: "Hollow blancs are unavailable" });
+      }
+
+      let brokerId = null;
+      const rawBrokerId = b.BrokerId ?? b.brokerId;
+      if (rawBrokerId !== undefined && rawBrokerId !== null && rawBrokerId !== "") {
+        const parsed = Number(rawBrokerId);
+        brokerId = Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+      }
+
+      // The table is created outside the transaction: DDL commits implicitly in
+      // MySQL, so creating it inside would break the transaction's atomicity.
+      if (typeof ensureHollowTable === "function") {
+        try {
+          await ensureHollowTable(DBConnection);
+        } catch (err) {
+          console.warn("Could not create the hollow blanc table:", err);
+        }
+      }
+
+      const result = await DBConnection.withTransaction(async (conn) => {
+        // A blanc that is already a LIVE policy cannot become hollow: its price
+        // and the broker's balance are tied to it. A deleted policy gave its
+        // blanc back, so that blanc may be tagged.
+        const [existingRows] = await conn.query(
+          "SELECT BlancNumber, Deleted FROM insurance WHERE BlancNumber = ?",
+          [blancNumber]
+        );
+        const livePolicy =
+          Array.isArray(existingRows) &&
+          existingRows.some((row) => Number(row.Deleted) !== 1);
+        if (livePolicy) {
+          const err = new Error(
+            "This blanc is already used by an insurance and cannot be tagged as hollow"
+          );
+          err.status = 409;
+          throw err;
+        }
+        return tagHollowBlanc(conn, blancNumber, req.user.username, {
+          brokerId,
+          branch: b.Branch ?? b.branch ?? "",
+          skipEnsure: true,
+        });
+      });
+
+      if (!result || !result.ok) {
+        return res
+          .status(400)
+          .json({ error: (result && result.error) || "Failed to tag the blanc" });
+      }
+
+      // What the broker's current blancs look like now (the tagged blanc has
+      // left them), so the admin sees the change without a reload.
+      let broker = null;
+      const affectedBrokerId = Number(result.brokerId);
+      if (Number.isFinite(affectedBrokerId) && affectedBrokerId > 0) {
+        try {
+          const brokers = require("./Brokers.js");
+          const rows = await brokers.loadBlancBatchRows(
+            DBConnection,
+            affectedBrokerId
+          );
+          broker = brokers.applyBlancSummary(
+            { id: affectedBrokerId },
+            brokers.summarizeBlancBatches(rows)
+          );
+        } catch (err) {
+          console.warn("Could not reload the broker's blancs:", err);
+        }
+      }
+
+      res.status(201).json({
+        message: result.alreadyHollow
+          ? "This blanc was already tagged as hollow"
+          : "Blanc tagged as hollow",
+        blancNumber,
+        author: req.user.username,
+        alreadyHollow: Boolean(result.alreadyHollow),
+        brokerId: Number.isFinite(affectedBrokerId) ? affectedBrokerId : null,
+        broker,
+      });
+    } catch (err) {
+      if (err && err.status) {
+        return res.status(err.status).json({ error: err.message });
+      }
+      console.error("Hollow blanc tagging failed:", err);
+      res.status(500).json({ error: "Failed to tag the blanc" });
     }
   });
 

@@ -997,6 +997,55 @@ async function runSetup(config = {}) {
      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
      COMMENT='Resets of a branch Cash from Brokers (kept amount per currency)'
    `);
+  // Bi-weekly bills: what each broker owes for one payment period. The server
+  // creates the table on first use as well (db/brokerBills.js), so a database
+  // that has not been set up again after the update still works. Billing itself
+  // stays off until BILLING_ENABLED=1 (see Mail/brokerBilling.js).
+  const billSchema = require("./brokerBills.js");
+  await db.query(billSchema.BILL_TABLE_SQL);
+  // Columns added after the first version of the table (a deployment that
+  // already created it gets them here).
+  for (const [name, definition] of billSchema.BILL_EXTRA_COLUMNS) {
+    await db
+      .query(`ALTER TABLE broker_bills ADD COLUMN ${name} ${definition}`)
+      .catch(() => {});
+  }
+
+  // Blancs that turned out to be hollow/faulty (no policy can be written on
+  // them). A hollow blanc is not a policy: it is recorded here instead of in
+  // `insurance`, and it is counted as used-up when a broker's inactive blancs
+  // are calculated (Requests/Brokers.js), so it disappears from the broker's
+  // current blancs and can never be used for a policy
+  // (Requests/TierEndpoints.js rejects it).
+  await db.query(`
+     CREATE TABLE IF NOT EXISTS hollow_blancs (
+       BlancNumber VARCHAR(45) NOT NULL,
+       BrokerId INT NULL,
+       Branch VARCHAR(45) NOT NULL DEFAULT '',
+       Author VARCHAR(45) NOT NULL DEFAULT '',
+       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       PRIMARY KEY (BlancNumber),
+       KEY idx_hollow_blancs_broker (BrokerId)
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+     COMMENT='Blanc numbers tagged as hollow (cannot be used for a policy)'
+   `);
+
+  // Free-text notes on a policy, with the user who wrote each one. Keyed by the
+  // policy's BlancNumber (the insurance table's primary key); a note may also
+  // exist for a deleted policy (it is the record of why it was deleted).
+  await db.query(`
+     CREATE TABLE IF NOT EXISTS insurance_notes (
+       id INT NOT NULL AUTO_INCREMENT,
+       BlancNumber VARCHAR(45) NOT NULL,
+       Note TEXT NOT NULL,
+       Author VARCHAR(45) NOT NULL DEFAULT '',
+       CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       PRIMARY KEY (id),
+       KEY idx_insurance_notes_blanc (BlancNumber, CreatedAt)
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+     COMMENT='Notes added to an insurance (with the author of each note)'
+   `);
+
   // Global key/value settings (e.g. whether broker requests that would push a
   // broker balance negative are accepted). Keyed by `name` so future toggles
   // reuse the same table without another migration.

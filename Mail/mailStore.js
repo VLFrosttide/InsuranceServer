@@ -32,6 +32,70 @@ const releasedAt = new Map();
 const handled = new Set();
 const HANDLED_LIMIT = 5000;
 
+// ---------------------------------------------------------------------------
+// The day's archive
+// ---------------------------------------------------------------------------
+// Every email the server has seen today, kept after it leaves the pool so the
+// dashboards can still search it ("already completed" cards). Entries are
+// pruned after DAILY_ARCHIVE_MS, so the archive never grows beyond one day's
+// mail and a server restart does not re-surface anything older.
+//
+//   status: "waiting"   - still in the pool (unread) - not sent as archived
+//           "completed" - a worker finished the policy (or the reply)
+//           "dismissed" - a worker marked it irrelevant
+//           "read"      - it was read outside the app / evicted
+const dailyArchive = new Map(); // account\0messageId -> {email, seenAt, status, at}
+const DAILY_ARCHIVE_MS = 24 * 60 * 60 * 1000;
+
+function archiveKey(account, messageId) {
+  return key(account, messageId);
+}
+
+// Store (or refresh) one email in the day's archive. The email is copied, so a
+// later change of the live object cannot rewrite the archived card.
+function rememberInArchive(email, status) {
+  if (!email || !email.messageId) return;
+  const k = archiveKey(email.account, email.messageId);
+  const previous = dailyArchive.get(k);
+  dailyArchive.set(k, {
+    email: { ...email, attachments: Array.isArray(email.attachments) ? [...email.attachments] : email.attachments },
+    seenAt: previous ? previous.seenAt : Date.now(),
+    status: status || (previous ? previous.status : "waiting"),
+    at: Date.now(),
+  });
+}
+
+// Forget entries older than a day (called by the archive readers).
+function pruneArchive(now = Date.now()) {
+  for (const [k, entry] of dailyArchive) {
+    if (now - entry.seenAt > DAILY_ARCHIVE_MS) dailyArchive.delete(k);
+  }
+}
+
+/**
+ * The emails that left the pool today (completed or dismissed), newest first.
+ * A still-waiting email is not included: it is already on the dashboards as a
+ * live card.
+ *
+ * @param {number} [now]
+ * @returns {Array<{email: object, status: string, at: number, seenAt: number}>}
+ */
+module.exports.listDailyArchive = function listDailyArchive(now = Date.now()) {
+  pruneArchive(now);
+  const out = [];
+  for (const entry of dailyArchive.values()) {
+    if (entry.status === "waiting") continue;
+    out.push(entry);
+  }
+  out.sort((a, b) => b.at - a.at);
+  return out;
+};
+
+// Forget the whole archive (used by tests and a full reset).
+module.exports.clearDailyArchive = function clearDailyArchive() {
+  dailyArchive.clear();
+};
+
 const KEY_SEP = "\u0000";
 
 function key(account, messageId) {
@@ -143,6 +207,7 @@ module.exports.has = function has(account, messageId) {
 module.exports.add = function add(email) {
   applyAnsweredState(email);
   activeEmails.set(key(email.account, email.messageId), email);
+  rememberInArchive(email, "waiting");
   return email;
 };
 
@@ -288,7 +353,7 @@ module.exports.clearAnsweredForThread = function clearAnsweredForThread(
 };
 
 
-module.exports.remove = function remove(messageId) {
+module.exports.remove = function remove(messageId, status = "completed") {
   const email = findByMessageId(messageId);
   if (!email) return;
   const k = key(email.account, email.messageId);
@@ -296,6 +361,7 @@ module.exports.remove = function remove(messageId) {
   claimedBy.delete(k);
   releasedAt.delete(k);
   handled.add(k);
+  rememberInArchive(email, status);
   dropAnsweredIfThreadGone(email);
   if (handled.size > HANDLED_LIMIT) {
     handled.delete(handled.values().next().value);
@@ -314,6 +380,7 @@ module.exports.evict = function evict(messageId) {
   activeEmails.delete(k);
   claimedBy.delete(k);
   releasedAt.delete(k);
+  rememberInArchive(email, "read");
   dropAnsweredIfThreadGone(email);
   return { email, wasClaimed };
 };

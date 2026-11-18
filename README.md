@@ -249,6 +249,46 @@ branch and blocks the creation of new insurances through it. Every broker is
 now serviced by every available branch (email cards are no longer restricted by
 branch).
 
+### `broker_bills`
+
+One row per broker and payment period (two weeks, see
+`Requests/PaymentSchedule.js`): what the broker owes for the insurances created
+for them inside that period.
+
+| Column              | Type           | Notes                                              |
+| ------------------- | -------------- | -------------------------------------------------- |
+| `id`                | `INT`          | Auto-increment PK                                  |
+| `BrokerId`          | `INT`          | FK to `brokers.id`                                 |
+| `PeriodStart`       | `DATE`         | First day of the period                            |
+| `PeriodEnd`         | `DATE`         | Last day of the period (inclusive)                 |
+| `Currency`          | `VARCHAR(3)`   | Always `EUR` (the broker business is in euros)      |
+| `Charges`           | `DECIMAL(15,2)`| Policies summed (annulled at their annulled price) |
+| `Refund`            | `DECIMAL(15,2)`| Remaining cash of earlier, PAID policies annulled now |
+| `Amount`            | `DECIMAL(15,2)`| Due = `Charges - Refund` (charged price for a sub) |
+| `PolicyCount`       | `INT`          | Policies in the period                             |
+| `AnnulledCount`     | `INT`          | How many of them are annulled                      |
+| `CarriedOver`       | `DECIMAL(15,2)`| Balance owed when the period started (information) |
+| `CostToUs`/`Profit` | `DECIMAL(15,2)`| Sub-brokers: what the main broker pays us / keeps  |
+| `ParentBrokerId`    | `INT`          | Sub-brokers: the main broker the bill is mailed to |
+| `Status`            | `VARCHAR(20)`  | `open` / `paid`                                    |
+| `Breakdown`         | `LONGTEXT`     | JSON: by type, refund lines, sub-broker block      |
+| `EmailedAt`/`Emails`| `DATETIME`/`VARCHAR(1000)` | When and to whom the Excel file was sent |
+| `MailAttempts`/`MailError` | `INT`/`VARCHAR(255)` | Failed send attempts and the last error |
+| `PaidAt`/`PaidBy`   | `DATETIME`/`VARCHAR(45)` | Who confirmed the payment, when          |
+| `PaymentType`       | `VARCHAR(20)`  | `increase` (cash at a branch) / `handover` (owner) |
+| `PaymentCurrency`/`Branch` | `VARCHAR(3)`/`VARCHAR(45)` | Where the money was taken         |
+| `OriginalAmount`/`AdjustReason` | `DECIMAL(15,2)`/`VARCHAR(255)` | An admin corrected the bill |
+| `AdjustedBy`/`AdjustedAt` | `VARCHAR(45)`/`DATETIME` | Who corrected it, when                |
+
+`UNIQUE (BrokerId, PeriodStart)` makes closing a period twice harmless.
+
+Use case: bi-weekly broker billing. **The feature ships switched off**: no bill
+is created, mailed or paid until the server runs with `BILLING_ENABLED=1`, so
+every broker can be audited first with
+`GET /brokers/bills/audit?periodStart=YYYY-MM-DD` (read-only). See `billing.md`
+in the client repository for the mails, the audit steps and the open billing
+questions.
+
 ## Run the server
 
 ```bash
@@ -442,6 +482,49 @@ Admin-only (`role 1`) broker management:
   balance and blancs it kept) back into every list
 
 Each created insurance whose email sender is associated with a broker charges that broker a flat fee: the broker balance is reduced by the full Price (it may go infinitely negative, and this never touches current cash) and the broker InactivePolicies is decremented by 1.
+
+## Broker billing (bi-weekly bills)
+
+Every payment period (two weeks of `Requests/PaymentSchedule.js`) ends with one
+**bill per broker**: the insurances created for that broker inside the period,
+counted by vehicle type and summed. An annulled policy is billed at its annulled
+price (`AnnulFee`), never at its original `Price`; a deleted one is not billed.
+A policy that was billed and **paid** in an earlier period and is annulled now
+gives the remaining cash (`Price - AnnulFee`) back as a credit of the current
+period, so the amount due is `Charges - Refund`. Bills are in **euros only**.
+
+A **sub-broker is never mailed**: its bill is charged its display price (its own
+`broker_tariffs`) and sent to its main broker, together with what we receive
+(the stored `Price`) and the profit. The bill is stored in `broker_bills`,
+turned into an Excel file (`Mail/brokerBillExcel.js` + `Mail/xlsxWriter.js`) and
+mailed (`Mail/brokerBillMail.js`), with three selectable drafts
+(`BILL_EMAIL_VARIANT=a|b|c`, `a` is the live one).
+
+| Endpoint | Roles | Notes |
+| --- | --- | --- |
+| `GET /brokers/billing/settings` | 1, 2, 3 | `billingEnabled` + the current/closed period |
+| `GET /brokers/bills/audit?periodStart=` | 1 | read-only: what each broker would be billed |
+| `GET /brokers/bills?status=open\|paid` | 1 | all bills + the outstanding total |
+| `POST /brokers/bills/close` | 1 | close a period now and mail the bills |
+| `POST /brokers/bills/mail-pending` | 1 | retry the bills that were not delivered |
+| `GET /brokers/:id/bills` | 1, 2, 3 | a broker's bills, the last unpaid one and the total owed |
+| `POST /brokers/:id/bills/pay` | 1, 2 | confirm the payment of the unpaid bills |
+| `POST /brokers/:id/bills/:billId/pay` | 1, 2 | confirm one bill |
+| `PATCH /brokers/:id/bills/:billId` | 1 | `{ amount, reason?, sendMail? }` — correct a disputed bill and re-issue it |
+| `POST /brokers/:id/bills/:billId/resend` | 1 | mail one bill again |
+
+Paying a bill tags it `paid` and records the money in
+`broker_balance_movements`, like the manual buttons: `increase` with a `Branch`
+(cash at a branch, i.e. that branch's Cash from Brokers) or `handover` with no
+branch (the owner took it). Both are payments for the reports.
+
+**It ships switched off.** Nothing is billed, mailed or paid while the server
+runs without `BILLING_ENABLED=1`; every write endpoint answers `409`. The first
+run stores `app_settings.billing_auto_start` (the period current at that moment)
+so no older period is ever billed automatically. Optional variables:
+`BILLING_AUTO_START` (first period to bill), `BILL_EMAIL_VARIANT` (`a`, `b`, `c`),
+`BILLING_CHECK_INTERVAL_MS` (default 15 min), `BILL_MAX_MAIL_ATTEMPTS` (default
+3).
 
 ## Branches
 

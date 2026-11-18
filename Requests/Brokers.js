@@ -987,6 +987,107 @@ const BLANC_BATCH_TABLE_SQL = `CREATE TABLE IF NOT EXISTS broker_blanc_batches (
 COMMENT='Blanc number ranges handed to brokers (one row per batch)'`;
 module.exports.BLANC_BATCH_TABLE_SQL = BLANC_BATCH_TABLE_SQL;
 
+// Hollow blancs: a blanc an admin tagged as unusable (the form is faulty, so no
+// policy can be written on it). It is NOT an insurance row; it lives in its own
+// table and counts as used-up in the inactive-blanc calculation below, so the
+// blanc disappears from the broker's current blancs as soon as it is tagged.
+const HOLLOW_BLANC_TABLE_SQL = `CREATE TABLE IF NOT EXISTS hollow_blancs (
+  BlancNumber VARCHAR(45) NOT NULL,
+  BrokerId INT NULL,
+  Branch VARCHAR(45) NOT NULL DEFAULT '',
+  Author VARCHAR(45) NOT NULL DEFAULT '',
+  CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (BlancNumber),
+  KEY idx_hollow_blancs_broker (BrokerId)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+COMMENT='Blanc numbers tagged as hollow (cannot be used for a policy)'`;
+module.exports.HOLLOW_BLANC_TABLE_SQL = HOLLOW_BLANC_TABLE_SQL;
+
+// `hollow_blancs` is created by db/setup.js on start-up; this keeps the module
+// usable on a database that has not been restarted since the update. It needs a
+// connection (the router's pool) because this module has no global one.
+let hollowTableReady = null;
+const ensureHollowTable = (module.exports.ensureHollowTable =
+  function ensureHollowTable(conn) {
+    if (!conn || typeof conn.query !== "function") {
+      return Promise.reject(new Error("No database connection"));
+    }
+    if (!hollowTableReady) {
+      hollowTableReady = Promise.resolve(conn.query(HOLLOW_BLANC_TABLE_SQL)).catch(
+        (err) => {
+          hollowTableReady = null;
+          throw err;
+        }
+      );
+    }
+    return hollowTableReady;
+  });
+
+// Whether a blanc number was tagged as hollow.
+const isHollowBlanc = (module.exports.isHollowBlanc =
+  async function isHollowBlanc(conn, blancNumber) {
+    const blanc = String(blancNumber ?? "").trim();
+    if (!blanc) return false;
+    const [rows] = await conn.query(
+      "SELECT BlancNumber FROM hollow_blancs WHERE BlancNumber = ? LIMIT 1",
+      [blanc]
+    );
+    return Array.isArray(rows) && rows.length > 0;
+  });
+
+// The broker whose batch contains a blanc number, or null for a walk-in/number
+// that belongs to no batch. Used when an admin tags a blanc as hollow, so the
+// right broker's current blancs lose it.
+const findBrokerForBlanc = (module.exports.findBrokerForBlanc =
+  async function findBrokerForBlanc(conn, blancNumber) {
+    const numeric = parseInt(String(blancNumber ?? "").trim(), 10);
+    if (!Number.isFinite(numeric)) return null;
+    const [rows] = await conn.query(
+      `SELECT BrokerId AS id FROM broker_blanc_batches
+        WHERE RangeStart <= ? AND RangeEnd >= ?
+        LIMIT 1`,
+      [numeric, numeric]
+    );
+    const id = rows && rows.length ? Number(rows[0].id) : NaN;
+    return Number.isFinite(id) && id > 0 ? id : null;
+  });
+
+/**
+ * Tag a blanc as hollow. Returns `{ ok, error?, code?, alreadyHollow?,
+ * brokerId? }` - a second tag of the same number is not an error, so a repeated
+ * click cannot fail confusingly.
+ *
+ * @param {object} conn      transaction connection (or the pool)
+ * @param {any} blancNumber
+ * @param {string} author    username of the admin who tagged it
+ * @param {{brokerId?: number|null, branch?: string}} [meta]
+ */
+const tagHollowBlanc = (module.exports.tagHollowBlanc =
+  async function tagHollowBlanc(conn, blancNumber, author, meta = {}) {
+    const blanc = String(blancNumber ?? "").trim();
+    if (!blanc) return { ok: false, error: "BlancNumber is required" };
+    // The caller may have created the table already (outside its transaction:
+    // MySQL commits implicitly on DDL, so it must not run inside one).
+    if (!(meta && meta.skipEnsure)) await ensureHollowTable(conn);
+    const [existing] = await conn.query(
+      "SELECT BlancNumber, BrokerId FROM hollow_blancs WHERE BlancNumber = ? LIMIT 1",
+      [blanc]
+    );
+    if (Array.isArray(existing) && existing.length > 0) {
+      return { ok: true, alreadyHollow: true, brokerId: existing[0].BrokerId };
+    }
+    const brokerId =
+      meta && Number.isFinite(Number(meta.brokerId)) && Number(meta.brokerId) > 0
+        ? Number(meta.brokerId)
+        : await findBrokerForBlanc(conn, blanc);
+    await conn.query(
+      `INSERT INTO hollow_blancs (BlancNumber, BrokerId, Branch, Author, CreatedAt)
+       VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+      [blanc, brokerId, String((meta && meta.branch) || ""), String(author || "")]
+    );
+    return { ok: true, alreadyHollow: false, brokerId };
+  });
+
 /**
  * Validate one batch from a request body.
  *
@@ -1127,7 +1228,8 @@ const applyBlancSummary = (module.exports.applyBlancSummary =
  * their blancs are already used. A blanc counts as used when a non-deleted
  * insurance carries it as its (numeric) BlancNumber. Annulled policies still
  * count: an annulled policy keeps its blanc used up, only a deletion gives
- * the blanc back.
+ * the blanc back. A blanc tagged as hollow counts as used too: it cannot be
+ * written on, so it is no longer one of the broker's current (inactive) blancs.
  *
  * @param {{query: Function}} db
  * @param {number} [brokerId]
@@ -1143,7 +1245,12 @@ const loadBlancBatchRows = (module.exports.loadBlancBatchRows =
                 WHERE TRIM(i.BlancNumber) REGEXP '^[0-9]+$'
                   AND CAST(TRIM(i.BlancNumber) AS UNSIGNED)
                       BETWEEN b.RangeStart AND b.RangeEnd
-                  AND i.Deleted = 0) AS Used
+                  AND i.Deleted = 0)
+            + (SELECT COUNT(DISTINCT CAST(TRIM(h.BlancNumber) AS UNSIGNED))
+                 FROM hollow_blancs h
+                WHERE TRIM(h.BlancNumber) REGEXP '^[0-9]+$'
+                  AND CAST(TRIM(h.BlancNumber) AS UNSIGNED)
+                      BETWEEN b.RangeStart AND b.RangeEnd) AS Used
          FROM broker_blanc_batches b
         ${hasBroker ? "WHERE b.BrokerId = ?" : ""}
         ORDER BY b.BrokerId, b.RangeStart`,

@@ -32,6 +32,15 @@ function fmt(d) {
   return d.toISOString().slice(0, 10);
 }
 
+// Shift a "YYYY-MM-DD" date by a number of calendar days (UTC arithmetic, so
+// daylight-saving changes can never make a period one day shorter).
+function shiftDays(ymd, days) {
+  const [y, m, d] = String(ymd).split("-").map(Number);
+  const step = Number(days);
+  const day = Number.isFinite(step) ? d + step : d;
+  return new Date(Date.UTC(y, m - 1, day)).toISOString().slice(0, 10);
+}
+
 // The next cutoff date on or after `now`.
 function nextCutoff(now) {
   const t = (toDateOnly(now) || new Date()).getTime();
@@ -65,9 +74,93 @@ function getSchedule(now = new Date()) {
   };
 }
 
+/**
+ * The two-week period that a given day belongs to (inclusive last day), plus
+ * the cutoff that closes it.
+ *
+ * @param {string} periodStart  First day of the period ("YYYY-MM-DD").
+ * @returns {{periodStart: string, periodEnd: string, cutoff: string}}
+ */
+function periodFor(periodStart) {
+  return {
+    periodStart,
+    periodEnd: shiftDays(periodStart, PAYMENT_PERIOD_DAYS - 1),
+    cutoff: shiftDays(periodStart, PAYMENT_PERIOD_DAYS),
+  };
+}
+
+/**
+ * The period that has just been closed: the one before the current period.
+ *
+ * @param {Date} [now]
+ * @returns {{periodStart: string, periodEnd: string, cutoff: string}}
+ */
+function previousPeriod(now = new Date()) {
+  const current = getSchedule(now);
+  const start = shiftDays(current.periodStart, -PAYMENT_PERIOD_DAYS);
+  return {
+    periodStart: start,
+    periodEnd: shiftDays(current.periodStart, -1),
+    cutoff: current.periodStart,
+  };
+}
+
+/**
+ * The period whose two weeks are over and can therefore be billed.
+ *
+ * On the cutoff day itself `getSchedule` still reports the period that ends the
+ * day before (its cutoff), so that period is the one that just closed. On any
+ * other day it is the period before the current one. Examples with the default
+ * anchor: on 2026-11-29 -> 2026-11-02..2026-11-15; on 2026-11-30 (cutoff) ->
+ * 2026-11-16..2026-11-29; on 2026-12-01 -> 2026-11-16..2026-11-29 again.
+ *
+ * @param {Date|string} [now]
+ * @returns {{periodStart: string, periodEnd: string, cutoff: string}}
+ */
+function lastClosedPeriod(now = new Date()) {
+  const current = getSchedule(now);
+  const d = now instanceof Date ? now : new Date(now);
+  const valid = Number.isFinite(d.getTime()) ? d : new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  const today = `${valid.getFullYear()}-${p(valid.getMonth() + 1)}-${p(
+    valid.getDate()
+  )}`;
+  if (today >= current.cutoff) {
+    return {
+      periodStart: current.periodStart,
+      periodEnd: current.windowEnd,
+      cutoff: current.cutoff,
+    };
+  }
+  return previousPeriod(valid);
+}
+
+/**
+ * The first day of the payment period a given day belongs to.
+ *
+ * The bill window is [periodStart, cutoff): a policy created ON a cutoff day
+ * already belongs to the NEXT period (that is the day the new period starts).
+ *
+ * @param {Date|string} value
+ * @returns {string|null} "YYYY-MM-DD"
+ */
+function periodStartFor(value) {
+  const d = toDateOnly(value);
+  if (!d) return null;
+  const day = fmt(d);
+  const cutoff = fmt(nextCutoff(d));
+  if (day >= cutoff) return cutoff;
+  return shiftDays(cutoff, -PAYMENT_PERIOD_DAYS);
+}
+
 module.exports = {
   getSchedule,
   nextCutoff,
+  periodFor,
+  previousPeriod,
+  lastClosedPeriod,
+  periodStartFor,
+  shiftDays,
   PAYMENT_PERIOD_DAYS,
   PAYMENT_GRACE_DAYS,
   DAY_MS,

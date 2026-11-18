@@ -11,6 +11,7 @@ const { createTierRouter } = require("./Requests/TierEndpoints.js");
 const { createCurrentCashRouter } = require("./Requests/CurrentCash.js");
 const { createCardPaymentsRouter } = require("./Requests/CardPayments.js");
 const { createBrokerRouter } = require("./Requests/Brokers.js");
+const { createBrokerBillsRouter } = require("./Requests/BrokerBills.js");
 const { createTariffsRouter } = require("./Requests/Tariffs.js");
 const { createBranchesRouter } = require("./Requests/Branches.js");
 const { createReportsRouter } = require("./Requests/Reports.js");
@@ -374,6 +375,10 @@ async function start() {
   app.use(createTierRouter(DBConnection));
   app.use(createCurrentCashRouter(DBConnection));
   app.use(createCardPaymentsRouter(DBConnection));
+  // The bills router must come BEFORE the broker router: its literal paths
+  // (/brokers/bills, /brokers/billing/settings) would otherwise be swallowed by
+  // the broker router's /brokers/:id.
+  app.use(createBrokerBillsRouter(DBConnection));
   app.use(createBrokerRouter(DBConnection));
   app.use(createTariffsRouter(DBConnection));
   app.use(createBranchesRouter(DBConnection));
@@ -531,6 +536,21 @@ async function start() {
     // across restarts) instead of being silently lost.
     require("./Mail/emailOutbox.js").setDb(DBConnection);
     require("./Mail/emailOutbox.js").start();
+
+    // Bi-weekly broker billing. Registered but NOT started unless the feature
+    // was switched on: BILLING_ENABLED=1. Every broker is audited first (see
+    // GET /brokers/bills/audit), so a deployment bills nothing by accident.
+    const billing = require("./Mail/brokerBilling.js");
+    billing.setDb(DBConnection);
+    if (billing.isEnabled()) {
+      billing.startBillingScheduler();
+      console.log("Broker billing is enabled (bi-weekly bills + emails).");
+    } else {
+      console.log(
+        "Broker billing is disabled (BILLING_ENABLED is not 1): no bill is " +
+          "created or mailed and the Payment button stays hidden."
+      );
+    }
 
     console.log(`Server listening on http://${HOST}:${PORT}`);
   } catch (err) {

@@ -515,7 +515,21 @@ async function handleMessage(ws, data) {
       }
       data.push(email);
     }
-    safeSend(ws, { type: "list_emails", data });
+    // The emails that already left the pool today: the dashboard keeps them in
+    // memory and only shows them when the search matches one. They are never
+    // claimable (the email is no longer on the server), so they are sent apart.
+    const archived =
+      typeof mailStore.listDailyArchive === "function"
+        ? mailStore
+            .listDailyArchive()
+            .filter((entry) => entry.email && canSeeEmail(ws.branch, entry.email))
+            .map((entry) => ({
+              ...entry.email,
+              archivedAt: entry.at,
+              archivedStatus: entry.status,
+            }))
+        : [];
+    safeSend(ws, { type: "list_emails", data, archived });
   } else if (msg.type === "get_attachment") {
     if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
       return;
@@ -654,7 +668,7 @@ async function handleMessage(ws, data) {
     if (!email) return;
     if (!canSeeEmail(ws.branch, email)) return;
 
-    mailStore.remove(messageId);
+    mailStore.remove(messageId, "completed");
     ws.claimedEmails.delete(messageId);
     // Only now mark the Gmail message read (the worker finished the form).
     // Pass the account so the correct inbox's API client is used.
@@ -678,7 +692,7 @@ async function handleMessage(ws, data) {
 
     // Dismissed as irrelevant: drop it from the shared pool and mark the Gmail
     // message read so it never re-surfaces on a later poll or server restart.
-    mailStore.remove(messageId);
+    mailStore.remove(messageId, "dismissed");
     ws.claimedEmails.delete(messageId);
     try {
       await mailStore.syncReadState(email.account, messageId);
