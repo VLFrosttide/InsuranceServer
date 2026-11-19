@@ -1753,7 +1753,61 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // Shared insurance endpoints (roles 1 and 2)
   // ---------------------------------------------------------------------
 
-  // GET /insurances?author=&date=&policyNumber=&blancNumber=&carNumber=&broker=&annulled=&payment=
+  // GET /insurances/suggestions
+  // Distinct values for the lookup tab's autocomplete: the authors seen on
+  // policies and the broker names (with their human-readable codes) from the
+  // brokers table plus any legacy names that only survive on old policies.
+  // Roles 1/2 only, like the lookup itself.
+  router.get(
+    "/insurances/suggestions",
+    auth,
+    requireRole(1, 2),
+    async (req, res) => {
+      try {
+        const [authorRows] = await DBConnection.query(
+          `SELECT DISTINCT Author FROM insurance
+            WHERE Author IS NOT NULL AND TRIM(Author) <> ''
+            ORDER BY Author`
+        );
+        const [brokerRows] = await DBConnection.query(
+          `SELECT Name, Code FROM brokers
+            WHERE Deleted = 0 AND Name IS NOT NULL AND TRIM(Name) <> ''
+            ORDER BY Name`
+        );
+        // Older policies may name a broker that is no longer in the brokers
+        // table (renamed / legacy); keep those names suggestible too.
+        const [policyBrokerRows] = await DBConnection.query(
+          `SELECT DISTINCT Broker FROM insurance
+            WHERE Broker IS NOT NULL AND TRIM(Broker) <> ''
+            ORDER BY Broker`
+        );
+        const byName = new Map();
+        for (const b of brokerRows || []) {
+          const name = String(b.Name ?? "").trim();
+          if (name) byName.set(name, String(b.Code ?? "").trim());
+        }
+        for (const r of policyBrokerRows || []) {
+          const name = String(r.Broker ?? "").trim();
+          if (name && !byName.has(name)) byName.set(name, "");
+        }
+        const authors = Array.from(
+          new Set(
+            (authorRows || [])
+              .map((r) => String(r.Author ?? "").trim())
+              .filter(Boolean)
+          )
+        ).sort((a, b) => a.localeCompare(b));
+        const brokers = Array.from(byName, ([Name, Code]) => ({ Name, Code }))
+          .sort((a, b) => a.Name.localeCompare(b.Name));
+        res.json({ authors, brokers });
+      } catch (err) {
+        console.error("Insurance filter suggestions failed:", err);
+        res.status(500).json({ error: "Failed to fetch suggestions" });
+      }
+    }
+  );
+
+  // GET /insurances?author=&date=&policyNumber=&blancNumber=&carNumber=&broker=&brokerCode=&annulled=&payment=
   // Returns insurances matching any combination of the supplied filters.
   // At least one filter must be provided. Author/date match exactly (date
   // compares only the calendar day); policyNumber/blancNumber/carNumber use a
@@ -1761,7 +1815,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // broker is matched in JavaScript (not SQL) so it is insensitive to the
   // Cyrillic/Latin script difference: "Lesovo" finds the walk-in policies stored
   // under the "ГКПП Лесово" branch and "kap andreevo" finds "ГКПП Капитан
-  // Андреево". ?annulled=1 restricts the result to annulled policies only, and
+  // Андреево". ?brokerCode= filters by the human-readable broker ID (the table's
+  // "Broker ID" column) after it is resolved, also as a case-insensitive
+  // substring. ?annulled=1 restricts the result to annulled policies only, and
   // ?payment=Cash|Card|Broker restricts it to a single payment type.
   router.get("/insurances", auth, requireRole(1, 2), async (req, res) => {
     try {
@@ -1777,6 +1833,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         ? String(req.query.carNumber).trim()
         : "";
       const broker = req.query.broker ? String(req.query.broker).trim() : "";
+      const brokerCode = req.query.brokerCode
+        ? String(req.query.brokerCode).trim()
+        : "";
       const annulled = ["1", "true", "yes"].includes(
         String(req.query.annulled || "").toLowerCase()
       );
@@ -1801,12 +1860,13 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         !blancNumber &&
         !carNumber &&
         !broker &&
+        !brokerCode &&
         !annulled &&
         !payment
       ) {
         return res.status(400).json({
           error:
-            "At least one search parameter is required (author, date, policyNumber, blancNumber, carNumber, broker, payment or annulled)",
+            "At least one search parameter is required (author, date, policyNumber, blancNumber, carNumber, broker, brokerCode, payment or annulled)",
         });
       }
 
@@ -1924,9 +1984,21 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       // Broker filtering runs here (not in SQL) so the name match can be
       // script-insensitive: a Latin query such as "Lesovo" still finds the
       // walk-in policies whose Broker column holds the Cyrillic branch name.
-      const resultRows = broker
-        ? rows.filter((row) => brokerNameMatches(row.Broker, broker))
-        : rows;
+      // The broker ID is filtered here too, after the code was resolved above,
+      // so it matches exactly what the "Broker ID" column shows (an email
+      // policy's broker or the branch's broker for a walk-in).
+      const codeQuery = brokerCode.toLowerCase();
+      const resultRows = rows.filter((row) => {
+        if (
+          brokerCode &&
+          !String(row.BrokerCode ?? "")
+            .toLowerCase()
+            .includes(codeQuery)
+        ) {
+          return false;
+        }
+        return broker ? brokerNameMatches(row.Broker, broker) : true;
+      });
 
       res.json({ insurances: resultRows });
     } catch (err) {
