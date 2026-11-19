@@ -1702,6 +1702,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               ...r,
               Price: null,
               CurrencyType: null,
+              // The live annulled price and the original sale price are money
+              // too, so they are hidden with the rest of the pricing.
+              AnnulFee: null,
+              OriginalPrice: null,
             })),
           });
         }
@@ -1712,10 +1716,27 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         return res.json({
           insurances: rows.map((r) => {
             const displayPrice = computePolicyTariffPrice(r, subPricing);
+            // An annulled policy's price is its annulment tax, not the tariff.
+            const annulPrice =
+              Number(r.Annulled) === 1 ? toDecimal(r.AnnulFee) : null;
             return {
               ...r,
-              Price: displayPrice !== null ? String(displayPrice) : null,
-              CurrencyType: displayPrice === null ? null : r.CurrencyType,
+              Price:
+                annulPrice !== null
+                  ? String(annulPrice)
+                  : displayPrice !== null
+                  ? String(displayPrice)
+                  : null,
+              CurrencyType:
+                annulPrice !== null
+                  ? r.CurrencyType
+                  : displayPrice === null
+                  ? null
+                  : r.CurrencyType,
+              // Never expose the DB sale price (the main broker's price) to a
+              // sub-broker; for an annulled row that amount lives in
+              // OriginalPrice now.
+              OriginalPrice: null,
             };
           }),
         });
@@ -2221,7 +2242,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           : requestedPayment ?? resolvePaymentType(insurance.PaymentType);
         let cardFeeHandled = false;
 
+        // An annulled policy's Price mirrors its annulment tax (AnnulFee); it is
+        // never edited directly - changing the fee below updates both.
+        const isAnnulledBeforeEdit = Boolean(Number(insurance.Annulled));
         for (const [column, value] of editable) {
+          if (isAnnulledBeforeEdit && column === "Price") continue;
           if (value !== undefined && value !== null) {
             let v;
             if (column === "PaymentType") v = finalPayment;
@@ -2420,6 +2445,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         // it and correcting their fields must not move money a second time.
         // -------------------------------------------------------------------
         const oldPrice = toDecimal(insurance.Price) || 0;
+        // The price the policy was sold at. While annulled, Price already holds
+        // the annulment tax, so the original is kept in OriginalPrice (older
+        // rows fall back to Price).
+        const storedOriginalPrice = toDecimal(insurance.OriginalPrice);
+        const annulBasePrice =
+          storedOriginalPrice !== null ? storedOriginalPrice : oldPrice;
         const newPriceValue = b.Price ?? b.price;
         const newPrice =
           newPriceValue !== undefined && newPriceValue !== null
@@ -2532,11 +2563,19 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             ).fee;
           }
 
-          const oldRefund = Math.max(0, Math.round((newPrice - oldFee) * 100) / 100);
-          const newRefund = Math.max(0, Math.round((newPrice - newFee) * 100) / 100);
+          const oldRefund = Math.max(
+            0,
+            Math.round((annulBasePrice - oldFee) * 100) / 100
+          );
+          const newRefund = Math.max(
+            0,
+            Math.round((annulBasePrice - newFee) * 100) / 100
+          );
           const refundDelta = Math.round((newRefund - oldRefund) * 100) / 100;
-          const oldBrokerRefund = oldPayer === "broker" ? oldRefund : newPrice;
-          const newBrokerRefund = effectivePayer === "broker" ? newRefund : newPrice;
+          const oldBrokerRefund =
+            oldPayer === "broker" ? oldRefund : annulBasePrice;
+          const newBrokerRefund =
+            effectivePayer === "broker" ? newRefund : annulBasePrice;
           const brokerRefundDelta =
             Math.round((newBrokerRefund - oldBrokerRefund) * 100) / 100;
 
@@ -2549,6 +2588,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           sets.push("AnnulReason = ?");
           params.push(effectivePayer);
           sets.push("AnnulFee = ?");
+          params.push(newFee);
+          // The fee IS the policy's price while it is annulled; the original
+          // stays in OriginalPrice for refunds and un-annulling.
+          sets.push("OriginalPrice = ?");
+          params.push(annulBasePrice);
+          sets.push("Price = ?");
           params.push(newFee);
         }
 
@@ -2574,9 +2619,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           const oldFee = hasStoredFee
             ? toDecimal(insurance.AnnulFee) || 0
             : computeAnnulFee(insurance, new Date(), oldPayer).fee;
-          const refund =
-            Math.max(0, Math.round((oldPrice - oldFee) * 100) / 100);
-          const brokerRefund = oldPayer === "broker" ? refund : oldPrice;
+          const refund = Math.max(
+            0,
+            Math.round((annulBasePrice - oldFee) * 100) / 100
+          );
+          const brokerRefund =
+            oldPayer === "broker" ? refund : annulBasePrice;
           unannulPlan = { refund, brokerRefund };
 
           sets.push("Annulled = ?");
@@ -2584,6 +2632,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           sets.push("AnnulReason = ?");
           params.push(null);
           sets.push("AnnulFee = ?");
+          params.push(null);
+          // The annulment tax leaves the price again: the policy is back at the
+          // amount it was sold for.
+          sets.push("Price = ?");
+          params.push(annulBasePrice);
+          sets.push("OriginalPrice = ?");
           params.push(null);
           sets.push("AnnulDate = ?");
           params.push(null);
@@ -2815,6 +2869,14 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
 
         const price = toDecimal(insurance.Price) || 0;
+        // While the policy is annulled, Price already holds the previous
+        // annulment tax; the original sale price - which refunds are computed
+        // from - is kept in OriginalPrice (older rows fall back to Price).
+        const storedOriginalPrice = toDecimal(insurance.OriginalPrice);
+        const originalPrice =
+          alreadyAnnulled && storedOriginalPrice !== null
+            ? storedOriginalPrice
+            : price;
         const oldPayerRaw = String(insurance.AnnulReason ?? "")
           .trim()
           .toLowerCase();
@@ -2877,7 +2939,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         } else {
           fee = computed.fee;
         }
-        const refund = Math.max(0, Math.round((price - fee) * 100) / 100);
+        const refund = Math.max(
+          0,
+          Math.round((originalPrice - fee) * 100) / 100
+        );
 
         const moveTime = resolveMoveCreatedAt(req.body);
         if (moveTime.error) {
@@ -2886,7 +2951,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
         await DBConnection.withTransaction(async (conn) => {
           if (alreadyAnnulled) {
-            const oldRefund = Math.max(0, Math.round((price - oldFee) * 100) / 100);
+            const oldRefund = Math.max(
+              0,
+              Math.round((originalPrice - oldFee) * 100) / 100
+            );
             const refundDelta = Math.round((refund - oldRefund) * 100) / 100;
             if (refundDelta !== 0) {
               const payment = effectivePayment(insurance);
@@ -2921,8 +2989,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               }
             }
             if (isBrokerLinked(insurance)) {
-              const oldBrokerRefund = oldPayer === "broker" ? oldRefund : price;
-              const newBrokerRefund = payer === "broker" ? refund : price;
+              const oldBrokerRefund =
+                oldPayer === "broker" ? oldRefund : originalPrice;
+              const newBrokerRefund =
+                payer === "broker" ? refund : originalPrice;
               const brokerRefundDelta =
                 Math.round((newBrokerRefund - oldBrokerRefund) * 100) / 100;
               if (brokerRefundDelta !== 0) {
@@ -2982,7 +3052,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               // The broker gets the full price back unless the broker itself is
               // at fault, in which case the annulment fee is kept back and only
               // the partial refund (price - fee) returns to the broker's balance.
-              const brokerRefund = payer === "broker" ? refund : price;
+              const brokerRefund = payer === "broker" ? refund : originalPrice;
               await restoreBrokerForAnnulment(
                 conn,
                 insurance.BrokerId,
@@ -2999,9 +3069,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
           await conn.query(
             `UPDATE insurance
-                SET Annulled = 1, AnnulReason = ?, AnnulFee = ?, AnnulDate = NOW(), AnnulBy = ?
+                SET Annulled = 1, AnnulReason = ?, AnnulFee = ?,
+                    OriginalPrice = ?, Price = ?, AnnulDate = NOW(), AnnulBy = ?
               WHERE BlancNumber = ?`,
-            [payer, fee, req.user.username, blancNumber]
+            [payer, fee, originalPrice, fee, req.user.username, blancNumber]
           );
         });
 
@@ -3074,14 +3145,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
         const price = toDecimal(insurance.Price) || 0;
         // What the policy still contributes to its payment channel: the full
-        // price, or - after an annulment refunded `price - fee` - only the
-        // part of the fee that was kept.
-        let counted = price;
-        if (insurance.Annulled) {
-          const fee = toDecimal(insurance.AnnulFee) || 0;
-          const refunded = Math.max(0, Math.round((price - fee) * 100) / 100);
-          counted = Math.round((price - refunded) * 100) / 100;
-        }
+        // price, or - after an annulment - only the annulment tax that was kept
+        // (Price already equals it; AnnulFee is the explicit record).
+        const counted = insurance.Annulled
+          ? toDecimal(insurance.AnnulFee) || 0
+          : price;
         const brokerRefund =
           isBrokerLinked(insurance) && !insurance.Annulled ? price : 0;
 
@@ -3183,13 +3251,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const price = toDecimal(insurance.Price) || 0;
         // What the deletion removed from the payment channel: the full price,
         // or - for a policy that was annulled first - only the kept annulment
-        // fee (the annulment already refunded the rest).
-        let counted = price;
-        if (insurance.Annulled) {
-          const fee = toDecimal(insurance.AnnulFee) || 0;
-          const refunded = Math.max(0, Math.round((price - fee) * 100) / 100);
-          counted = Math.round((price - refunded) * 100) / 100;
-        }
+        // tax (Price already equals it; AnnulFee is the explicit record).
+        const counted = insurance.Annulled
+          ? toDecimal(insurance.AnnulFee) || 0
+          : price;
         // What the deletion refunded to the broker: the full price for a
         // non-annulled broker policy, nothing for an annulled one.
         const brokerCharge =

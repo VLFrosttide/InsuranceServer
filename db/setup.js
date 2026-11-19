@@ -139,6 +139,7 @@ async function runSetup(config = {}) {
       BlancNumber VARCHAR(45) NOT NULL,
       CarNumber VARCHAR(45) NOT NULL DEFAULT '',
       Price VARCHAR(45) NOT NULL,
+      OriginalPrice VARCHAR(45) NULL,
       CurrencyType VARCHAR(45) NOT NULL,
       Duration INT NOT NULL,
       Broker VARCHAR(100) NULL,
@@ -366,6 +367,28 @@ async function runSetup(config = {}) {
   if (!insColNames.has("AnnulBy")) {
     await db.query("ALTER TABLE insurance ADD COLUMN AnnulBy VARCHAR(45) NULL");
     console.log("Added insurance.AnnulBy column");
+  }
+  // The annulment tax becomes the policy's new price: Price holds the fee while
+  // Annulled = 1 and OriginalPrice keeps the price the policy was sold at, so
+  // refunds, un-annulling, deletes/restores and broker bills still work with
+  // the original amount. Existing annulled rows are converted once (the
+  // OriginalPrice guard keeps a restart from converting them twice).
+  if (!insColNames.has("OriginalPrice")) {
+    await db.query(
+      "ALTER TABLE insurance ADD COLUMN OriginalPrice VARCHAR(45) NULL"
+    );
+    console.log("Added insurance.OriginalPrice column");
+  }
+  const [converted] = await db.query(
+    `UPDATE insurance
+        SET OriginalPrice = Price,
+            Price = CAST(COALESCE(AnnulFee, 0) AS CHAR)
+      WHERE Annulled = 1 AND OriginalPrice IS NULL`
+  );
+  if (converted && converted.affectedRows > 0) {
+    console.log(
+      `Set the annulment fee as the price of ${converted.affectedRows} annulled insurance(s)`
+    );
   }
 
   // Soft-delete support: an admin can delete a policy from the admin panel.
@@ -1244,26 +1267,27 @@ async function runSetup(config = {}) {
     "SELECT COUNT(*) AS n FROM broker_balance_movements"
   );
   if (Number(movementCount) === 0) {
-    // Creation deducts the policy price from the broker's balance.
+    // Creation deducts the policy price from the broker's balance. An annulled
+    // policy's Price is its annulment tax, so the original sale price is used.
     await db.query(`
       INSERT INTO broker_balance_movements
         (BrokerId, Amount, Type, Reason, Author, BlancNumber, CreatedAt)
-      SELECT BrokerId, -CAST(Price AS DECIMAL(15,2)), 'policy',
+      SELECT BrokerId, -CAST(COALESCE(OriginalPrice, Price) AS DECIMAL(15,2)), 'policy',
              CONCAT('Insurance ', BlancNumber), COALESCE(Author, ''),
              BlancNumber, CreationDate
         FROM insurance
        WHERE BrokerId IS NOT NULL
     `);
-    // An annulment refunds the price (minus the fee when the broker was at
-    // fault, stored in AnnulReason = 'broker').
+    // An annulment refunds the original price (minus the fee when the broker was
+    // at fault, stored in AnnulReason = 'broker').
     await db.query(`
       INSERT INTO broker_balance_movements
         (BrokerId, Amount, Type, Reason, Author, BlancNumber, CreatedAt)
       SELECT BrokerId,
              ROUND(CASE WHEN AnnulReason = 'broker'
-                   THEN CAST(Price AS DECIMAL(15,2))
+                   THEN CAST(COALESCE(OriginalPrice, Price) AS DECIMAL(15,2))
                       - COALESCE(CAST(AnnulFee AS DECIMAL(15,2)), 0)
-                   ELSE CAST(Price AS DECIMAL(15,2)) END, 2),
+                   ELSE CAST(COALESCE(OriginalPrice, Price) AS DECIMAL(15,2)) END, 2),
              'annulment',
              CONCAT('Annul ', BlancNumber), COALESCE(AnnulBy, ''),
              BlancNumber, AnnulDate
@@ -1275,7 +1299,7 @@ async function runSetup(config = {}) {
     await db.query(`
       INSERT INTO broker_balance_movements
         (BrokerId, Amount, Type, Reason, Author, BlancNumber, CreatedAt)
-      SELECT BrokerId, CAST(Price AS DECIMAL(15,2)), 'deletion',
+      SELECT BrokerId, CAST(COALESCE(OriginalPrice, Price) AS DECIMAL(15,2)), 'deletion',
              CONCAT('Delete ', BlancNumber), COALESCE(DeletedBy, ''),
              BlancNumber, DeletedAt
         FROM insurance

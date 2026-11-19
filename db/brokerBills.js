@@ -8,14 +8,16 @@
 //
 //   * an active policy counts with its Price;
 //   * an annulled policy counts with its ANNULLED price (AnnulFee - the part of
-//     the price the company keeps), never with the original Price;
+//     the price the company keeps), never with the original sale price (kept in
+//     OriginalPrice once the tax becomes the price);
 //   * a deleted policy does not count at all.
 //
 // Two things are added to the period's charges:
 //
 //   * REFUNDS. A policy that was already billed and PAID in an earlier period
 //     and is annulled now gives the broker back the remaining cash
-//     (Price - AnnulFee). That money is a credit on the current period, so the
+//     (OriginalPrice - AnnulFee; older rows without OriginalPrice use Price).
+//     That money is a credit on the current period, so the
 //     bill shows it as its own section and the amount due is
 //     `Charges - Refund`. (The broker's balance is credited by the annulment
 //     itself - see Requests/Brokers.js - the bill only reports it.)
@@ -304,7 +306,8 @@ module.exports.summarizeLines = summarizeLines;
 async function loadBillLines(conn, brokerId, periodStart, periodEnd) {
   const [rows] = await conn.query(
     `SELECT PolicyNumber, BlancNumber, CarNumber, Otomobil, Duration, Price,
-            CurrencyType, CreationDate, Annulled, AnnulFee, AnnulReason, NonTurk
+            OriginalPrice, CurrencyType, CreationDate, Annulled, AnnulFee,
+            AnnulReason, NonTurk
        FROM insurance
       WHERE BrokerId = ? AND Deleted = 0
         AND CreationDate >= ? AND CreationDate < ?
@@ -333,8 +336,8 @@ module.exports.loadBillLines = loadBillLines;
 async function loadAnnulments(conn, brokerId, periodStart, periodEnd) {
   const [rows] = await conn.query(
     `SELECT PolicyNumber, BlancNumber, CarNumber, Otomobil, Duration, Price,
-            CurrencyType, CreationDate, AnnulDate, Annulled, AnnulFee,
-            AnnulReason, NonTurk
+            OriginalPrice, CurrencyType, CreationDate, AnnulDate, Annulled,
+            AnnulFee, AnnulReason, NonTurk
        FROM insurance
       WHERE BrokerId = ? AND Deleted = 0 AND Annulled = 1
         AND AnnulDate >= ? AND AnnulDate < ?
@@ -422,15 +425,22 @@ module.exports.priceLineForBroker = priceLineForBroker;
 
 /**
  * The refund of one annulled policy: the remaining cash the broker gets back,
- * i.e. the price minus the annulment tax.
+ * i.e. the original price minus the annulment tax. While a policy is annulled
+ * its `Price` already holds the tax, so `OriginalPrice` is the sale price;
+ * older rows without it fall back to `Price`.
  *
- * @param {{Price?: any, AnnulFee?: any}} row
+ * @param {{Price?: any, OriginalPrice?: any, AnnulFee?: any}} row
  * @param {number} [base]  Price to refund (a sub-broker's display price).
  * @returns {number} 0 when nothing is left to refund.
  */
 function refundAmount(row, base) {
+  const original =
+    row && row.OriginalPrice !== null && row.OriginalPrice !== undefined &&
+    String(row.OriginalPrice).trim() !== ""
+      ? row.OriginalPrice
+      : row && row.Price;
   const price =
-    base === undefined ? Number(row && row.Price) || 0 : Number(base) || 0;
+    base === undefined ? Number(original) || 0 : Number(base) || 0;
   const fee = Number(row && row.AnnulFee) || 0;
   return Math.max(0, round2(price - fee));
 }
@@ -513,7 +523,14 @@ async function computeBillFigures(conn, broker, periodStart, periodEnd) {
       carNumber: String(row.CarNumber ?? "").trim(),
       type: policyType(row),
       billedPeriod: ownPeriod,
-      price: displayPrice === null ? round2(row.Price) : round2(displayPrice),
+      price:
+        displayPrice === null
+          ? round2(
+              row.OriginalPrice !== null && row.OriginalPrice !== undefined
+                ? row.OriginalPrice
+                : row.Price
+            )
+          : round2(displayPrice),
       annulFee: round2(row.AnnulFee),
       amount,
       cost,

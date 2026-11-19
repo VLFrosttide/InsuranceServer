@@ -1611,8 +1611,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   async function recalculateBrokerPoliciesForPricing(conn, brokerId, pricing) {
     try {
       const [policies] = await conn.query(
-        `SELECT BlancNumber, Price, Duration, Otomobil, PaymentType,
-                NonTurk, CardFee, Annulled, AnnulReason, AnnulFee
+        `SELECT BlancNumber, Price, OriginalPrice, Duration, Otomobil,
+                PaymentType, NonTurk, CardFee, Annulled, AnnulReason, AnnulFee
            FROM insurance
           WHERE BrokerId = ? AND Deleted = 0`,
         [brokerId]
@@ -1635,13 +1635,31 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         let newPrice = basePrice;
         if (Number(row.NonTurk) === 1) newPrice += 5;
         newPrice = Math.round(newPrice * 100) / 100;
-        const oldPrice = Math.round((Number(row.Price) || 0) * 100) / 100;
+        // An annulled policy's Price is its annulment tax; the sale price this
+        // recalculation corrects lives in OriginalPrice. Older rows without it
+        // still carry the sale price in Price.
+        const annulled = Number(row.Annulled) === 1;
+        const storedOriginal =
+          row.OriginalPrice !== null && row.OriginalPrice !== undefined &&
+          String(row.OriginalPrice).trim() !== ""
+            ? row.OriginalPrice
+            : row.Price;
+        const oldPrice = Math.round((Number(storedOriginal) || 0) * 100) / 100;
         if (newPrice === oldPrice) continue;
 
-        await conn.query(
-          "UPDATE insurance SET Price = ? WHERE BlancNumber = ?",
-          [String(newPrice), row.BlancNumber]
-        );
+        if (annulled) {
+          // Keep Price equal to the tax; only the original sale price moves.
+          const fee = Math.round((Number(row.AnnulFee) || 0) * 100) / 100;
+          await conn.query(
+            "UPDATE insurance SET Price = ?, OriginalPrice = ? WHERE BlancNumber = ?",
+            [String(fee), String(newPrice), row.BlancNumber]
+          );
+        } else {
+          await conn.query(
+            "UPDATE insurance SET Price = ? WHERE BlancNumber = ?",
+            [String(newPrice), row.BlancNumber]
+          );
+        }
 
         const [policyMovs] = await conn.query(
           `SELECT id, Amount FROM broker_balance_movements
@@ -2230,6 +2248,16 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               : broker.CashBalance;
           sanitizedPolicies = policies.map(
             ({ Otomobil, NonTurk, CardFee, ...p }) => {
+              // An annulled policy's price is its annulment tax, not the
+              // sub-broker's display tariff.
+              if (Number(p.Annulled) === 1) {
+                const fee = Number(p.AnnulFee);
+                return {
+                  ...p,
+                  Price: Number.isFinite(fee) ? fee : null,
+                  CurrencyType: p.CurrencyType,
+                };
+              }
               const displayPrice = computePolicyTariffPrice(
                 { Otomobil, NonTurk, CardFee, ...p },
                 disp.subPricing
