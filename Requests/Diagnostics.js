@@ -16,6 +16,16 @@
 //   GET    /admin/diagnostics           - admin: list stored reports
 //   DELETE /admin/diagnostics           - admin: delete reports (ids or all)
 //   GET    /admin/diagnostics/context   - admin: how THIS server sees a request
+//   GET    /admin/diagnostics/settings  - admin: is data gathering switched on?
+//   PUT    /admin/diagnostics/settings  - admin: switch data gathering on/off
+//
+// COLLECTING IS SWITCHABLE. The switch sits in the Diagnostics tab itself: the
+// admin turns it on while an incident is investigated and off again afterwards.
+// While it is off, POST /diag/client still answers 200 (so clients drop their
+// queued reports instead of retrying forever) but stores nothing - the data is
+// not gathered at all, company-wide. The flag lives in the shared
+// `app_settings` key/value table (like the broker balance setting), so it
+// applies to every PC, and reports already stored stay readable.
 //
 // Reports are kept until an admin explicitly deletes them: nothing is pruned
 // automatically, so an incident can be investigated days later.
@@ -311,6 +321,40 @@ function normalizeReport(raw, meta) {
 }
 
 // ---------------------------------------------------------------------------
+// Is diagnostics COLLECTION switched on? A shared switch (see the file header).
+// It is stored in `app_settings` exactly like the broker balance setting, and
+// the default is ON so an existing deployment keeps collecting until an admin
+// turns it off. The switch itself is shown in the Diagnostics tab.
+// ---------------------------------------------------------------------------
+const DIAGNOSTICS_ENABLED_SETTING = "diagnostics_enabled";
+
+const getDiagnosticsEnabled = (module.exports.getDiagnosticsEnabled =
+  async function getDiagnosticsEnabled(conn) {
+    try {
+      const [rows] = await conn.query(
+        "SELECT value FROM app_settings WHERE name = ?",
+        [DIAGNOSTICS_ENABLED_SETTING]
+      );
+      if (!rows.length) return true;
+      return String(rows[0].value) !== "0";
+    } catch (err) {
+      // A missing table or a transient failure must never stop collection by
+      // accident, so fall back to the default (collecting).
+      return true;
+    }
+  });
+
+const setDiagnosticsEnabled = (module.exports.setDiagnosticsEnabled =
+  async function setDiagnosticsEnabled(conn, enabled) {
+    await conn.query(
+      `INSERT INTO app_settings (name, value) VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE value = VALUES(value)`,
+      [DIAGNOSTICS_ENABLED_SETTING, enabled ? "1" : "0"]
+    );
+    return Boolean(enabled);
+  });
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 /**
@@ -336,12 +380,27 @@ module.exports.createDiagnosticsRouter = function createDiagnosticsRouter(
 
   // -------------------------------------------------------------------------
   // POST /diag/client - receive a batch of reports.
+  //
+  // Answering 200 while collection is switched off is deliberate: a client
+  // treats a successful answer as "delivered" and drops the batch, so nothing
+  // stays queued on the PC and nothing is retried. The reports are simply not
+  // stored, which is exactly what turning gathering off means.
   // -------------------------------------------------------------------------
   router.post("/diag/client", async (req, res) => {
     try {
       const declaredBytes = Number(req.headers["content-length"]);
       if (Number.isFinite(declaredBytes) && declaredBytes > MAX_UPLOAD_BODY_BYTES) {
         return res.status(413).json({ error: "Diagnostic batch too large" });
+      }
+
+      // The admin switch in the Diagnostics tab: nothing is gathered while it
+      // is off, whoever uploads and whatever the batch contains.
+      if (!(await getDiagnosticsEnabled(DBConnection))) {
+        return res.status(200).json({
+          stored: 0,
+          disabled: true,
+          clientId: clip(req.body && req.body.clientId, MAX_ID_CHARS),
+        });
       }
 
       const ip = ipFromRequest(req, clientIp);
@@ -570,6 +629,58 @@ module.exports.createDiagnosticsRouter = function createDiagnosticsRouter(
         .json({ error: "Failed to delete client diagnostics" });
     }
   });
+
+  // -------------------------------------------------------------------------
+  // GET /admin/diagnostics/settings - whether data is being gathered.
+  //
+  // The Diagnostics tab shows the switch and its current value, so an admin can
+  // see at a glance whether failures are being recorded. Admin-only, like the
+  // rest of the tab; defaults to ON.
+  // -------------------------------------------------------------------------
+  router.get(
+    "/admin/diagnostics/settings",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      try {
+        res.json({ enabled: await getDiagnosticsEnabled(DBConnection) });
+      } catch (err) {
+        console.error("Diagnostics settings read failed:", err);
+        res.status(500).json({ error: "Failed to fetch diagnostics settings" });
+      }
+    }
+  );
+
+  // -------------------------------------------------------------------------
+  // PUT /admin/diagnostics/settings  { enabled: boolean }
+  //
+  // Switch data gathering on or off for every PC. Off means new uploads are
+  // discarded (nothing is stored); the reports already stored stay, and the
+  // switch itself remains reachable from the tab, so it can be turned back on.
+  // -------------------------------------------------------------------------
+  router.put(
+    "/admin/diagnostics/settings",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      try {
+        const raw = req.body ? req.body.enabled : undefined;
+        if (raw === undefined || raw === null) {
+          return res.status(400).json({ error: "enabled is required" });
+        }
+        const enabled =
+          typeof raw === "string"
+            ? !["0", "false", "off", "no", ""].includes(raw.trim().toLowerCase())
+            : Boolean(raw);
+        res.json({ enabled: await setDiagnosticsEnabled(DBConnection, enabled) });
+      } catch (err) {
+        console.error("Diagnostics settings update failed:", err);
+        res
+          .status(500)
+          .json({ error: "Failed to update diagnostics settings" });
+      }
+    }
+  );
 
   // -------------------------------------------------------------------------
   // GET /admin/diagnostics/context - the server's own view of a request.

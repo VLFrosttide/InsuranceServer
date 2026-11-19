@@ -1818,7 +1818,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // Андреево". ?brokerCode= filters by the human-readable broker ID (the table's
   // "Broker ID" column) after it is resolved, also as a case-insensitive
   // substring. ?annulled=1 restricts the result to annulled policies only, and
-  // ?payment=Cash|Card|Broker restricts it to a single payment type.
+  // ?payment=Cash|Card|Broker restricts it to one payment type - several can be
+  // combined with a comma or a plus ("Cash,Card", "card+cash"), which is what
+  // the screen's "Card + cash" option sends.
   router.get("/insurances", auth, requireRole(1, 2), async (req, res) => {
     try {
       const author = req.query.author ? String(req.query.author).trim() : "";
@@ -1839,19 +1841,38 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       const annulled = ["1", "true", "yes"].includes(
         String(req.query.annulled || "").toLowerCase()
       );
+      // ?payment= accepts one OR MORE payment types, so "Card + cash" finds
+      // both walk-in channels in one search. Accepted forms:
+      //   payment=Cash            payment=Cash,Card (or Card,Cash)
+      //   payment=Card+Broker     a repeated ?payment=Cash&payment=Card
+      //   payment=card+cash       (the "Card + cash" filter option)
       const PAYMENT_TYPES = { cash: "Cash", card: "Card", broker: "Broker" };
       const paymentRaw = req.query.payment
         ? String(req.query.payment).trim()
         : "";
-      const payment = paymentRaw
-        ? PAYMENT_TYPES[paymentRaw.toLowerCase()] || ""
-        : "";
-
-      if (paymentRaw && !payment) {
-        return res
-          .status(400)
-          .json({ error: "payment must be one of Cash, Card or Broker" });
+      const paymentTokens = Array.isArray(req.query.payment)
+        ? req.query.payment.flatMap((value) => String(value).split(/[,+]/))
+        : paymentRaw.split(/[,+]/);
+      const payments = [];
+      for (const token of paymentTokens) {
+        const text = String(token).trim();
+        if (!text) continue;
+        const resolved = PAYMENT_TYPES[text.toLowerCase()];
+        if (!resolved) {
+          return res.status(400).json({
+            error: "payment must be Cash, Card, Broker or a combination such as Cash,Card",
+          });
+        }
+        if (!payments.includes(resolved)) payments.push(resolved);
       }
+      // A stable order (Cash, Card, Broker) keeps the generated SQL identical
+      // whatever order the combination was typed in.
+      payments.sort(
+        (a, b) =>
+          ["Cash", "Card", "Broker"].indexOf(a) -
+          ["Cash", "Card", "Broker"].indexOf(b)
+      );
+      const payment = payments.join(",");
 
       if (
         !author &&
@@ -1912,8 +1933,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         conditions.push("Annulled = 1");
       }
       if (payment) {
-        conditions.push("PaymentType = ?");
-        params.push(payment);
+        // One type, or the IN list of a combined filter ("Cash,Card").
+        const list = payments;
+        conditions.push(
+          `PaymentType IN (${list.map(() => "?").join(", ")})`
+        );
+        params.push(...list);
       }
 
       const [rows] = await DBConnection.query(

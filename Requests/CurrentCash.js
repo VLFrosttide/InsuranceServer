@@ -385,70 +385,149 @@ const getCurrentCash = (module.exports.getCurrentCash =
     return balances;
   });
 
+// The amount of money a walk-in policy puts into the cash drawer: its price
+// while it stands, or just the annulment fee once it is annulled - the same
+// rule every other money figure of the day uses. A soft-deleted policy
+// contributes nothing (the callers filter it out).
+const INSURANCE_AMOUNT_SQL =
+  "ROUND(SUM(CASE WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2)) " +
+  "ELSE COALESCE(AnnulFee, 0) END), 2)";
+
+// Lower bound of "everything that ever happened", used when a currency has
+// never been reset.
+const DAWN_OF_TIME = "1970-01-01 00:00:00";
+
 /**
- * Read the current cash balance of a branch as it stood at the end of a given
- * day (inclusive). The live running balance is read first, then walked back
- * over every movement and reset recorded AFTER that day, so historical dates
- * show the amount the branch actually had available back then - not today's
- * balance.
+ * Read the cash a branch's drawer held at the end of a given day, DERIVED FROM
+ * THE POLICIES AND THE MANUAL MOVEMENTS instead of a running balance.
  *
- * The identity used here is:
- *     balance(as of D) = live
- *                        - signed movements with CreatedAt >= nextDate
- *                        + kept amounts of resets with CreatedAt >= nextDate
- * A reset zeroes the drawer, so its KeptAmount is added back when undoing a
- * reset that happened after the requested day.
+ *     availableCash(end of D) = the drawer of the branch's open shift
+ *                             (= 0 from its last reset before D)
+ *                             + cash of the walk-in policies created after that
+ *                               reset and before D
+ *                             + manual drawer movements of that window
+ *                               (increase +, expense -, hand-over -,
+ *                                returned hand-over +)
+ *
+ * Why it is computed and not stored:
+ *
+ *   - A policy's money is read LIVE from `insurance`, so correcting a policy
+ *     (price, payment type, currency, branch, annulment, deletion) changes the
+ *     figure by exactly the policy's new contribution: nothing has to be
+ *     reversed, and an edited policy stays on ITS creation date instead of
+ *     leaving a correction behind on the day it was edited.
+ *   - Corrections therefore never pile up wrongly, which is what made the old
+ *     running balance drift away from the physical drawer.
+ *
+ * The ledger rows the insurance flows write (the sale itself, "Edit <blanc>",
+ * "Annul <blanc>", "Delete <blanc>", "Restore <blanc>", "Price change <blanc>")
+ * are deliberately NOT counted: the policy they belong to is already counted
+ * above, so adding them would count the same money twice. Only the rows typed
+ * in by hand - and hand-overs - are added.
+ *
+ * A reset ("End shift") empties the drawer and records what was handed over in
+ * `KeptAmount`, so the latest reset before the requested day starts the window
+ * and the balance from there is 0 - exactly the drawer a new shift opens with.
  *
  * @param {import("mysql2/promise").Connection} conn
  * @param {string} branch
- * @param {string} nextDate  "YYYY-MM-DD" of the day AFTER the requested day.
+ * @param {string} nextDate  "YYYY-MM-DD" of the day AFTER the requested day
+ *                           (exclusive upper bound).
  * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, TRY: 0 }
  */
-const getCurrentCashAsOf = (module.exports.getCurrentCashAsOf =
-  async function getCurrentCashAsOf(conn, branch, nextDate) {
+const getAvailableCashAsOf = (module.exports.getAvailableCashAsOf =
+  async function getAvailableCashAsOf(conn, branch, nextDate) {
     const b = normalizeBranch(branch);
-    const live = await getCurrentCash(conn, b);
-
-    // Movements recorded after the requested day (increase and a returned
-    // hand-over + / expense and a hand-over -; a hand-over is not an
-    // 'increase', so it subtracts as well - it did leave the drawer). A
-    // soft-deleted movement no longer counts anywhere (its money was already
-    // given back when it was deleted), so it is skipped here as well.
-    const [laterMoves] = await conn.query(
-      `SELECT Currency,
-         ROUND(SUM(CASE WHEN Type IN ('increase', 'handover_return') THEN Amount ELSE -Amount END), 2) AS Net
-       FROM cash_transactions
-       WHERE Branch = ? AND CreatedAt >= ? AND Deleted = 0
-       GROUP BY Currency`,
-      [b, nextDate]
-    );
-
-    // Resets recorded after the requested day (they zeroed the drawer at the
-    // time, so undoing them adds their kept amount back).
-    const [laterResets] = await conn.query(
-      `SELECT Currency, ROUND(SUM(KeptAmount), 2) AS Kept
-       FROM cash_resets
-       WHERE Branch = ? AND CreatedAt >= ?
-       GROUP BY Currency`,
-      [b, nextDate]
-    );
-
     const balances = {};
+    const windowStart = {};
     for (const currency of CURRENCIES) {
-      balances[currency] = Number(live[currency]) || 0;
+      balances[currency] = 0;
+      windowStart[currency] = DAWN_OF_TIME;
     }
-    for (const row of laterMoves) {
+
+    // The last reset per currency before the end of the requested day. A reset
+    // hands the money over and leaves the drawer at 0, so it is both the
+    // starting balance and the start of the window the movements come from.
+    const [resets] = await conn.query(
+      `SELECT Currency, CreatedAt
+         FROM cash_resets
+        WHERE Branch = ? AND CreatedAt < ?
+        ORDER BY CreatedAt ASC, id ASC`,
+      [b, nextDate]
+    );
+    for (const row of resets || []) {
       const cur = normalizeCurrency(row.Currency);
-      balances[cur] =
-        Math.round((balances[cur] - (Number(row.Net) || 0)) * 100) / 100;
+      if (balances[cur] === undefined) continue;
+      balances[cur] = 0;
+      windowStart[cur] = row.CreatedAt || DAWN_OF_TIME;
     }
-    for (const row of laterResets) {
+
+    // Money the walk-in cash policies of the window brought in. Their price is
+    // read live, so an edited policy is counted at its corrected price on its
+    // own creation date, and an annulled one only at the annulment fee.
+    const insuranceClauses = [];
+    const insuranceParams = [];
+    for (const currency of CURRENCIES) {
+      insuranceClauses.push("(CurrencyType = ? AND CreationDate >= ?)");
+      insuranceParams.push(currency, windowStart[currency]);
+    }
+    const [insuranceRows] = await conn.query(
+      `SELECT CurrencyType AS Currency, ${INSURANCE_AMOUNT_SQL} AS Total
+         FROM insurance
+        WHERE Deleted = 0 AND Branch = ?
+          AND BrokerId IS NULL AND PaymentType = 'Cash'
+          AND (${insuranceClauses.join(" OR ")})
+          AND CreationDate < ?
+        GROUP BY CurrencyType`,
+      [b, ...insuranceParams, nextDate]
+    );
+    for (const row of insuranceRows || []) {
       const cur = normalizeCurrency(row.Currency);
-      balances[cur] =
-        Math.round((balances[cur] + (Number(row.Kept) || 0)) * 100) / 100;
+      if (balances[cur] === undefined) continue;
+      balances[cur] = roundMoney(balances[cur] + (Number(row.Total) || 0));
     }
+
+    // The drawer movements typed in by hand, plus hand-overs and their
+    // returns. Rows belonging to a policy are recognised by their reason (the
+    // "Annul "/"Edit "/... prefixes, or the policy's own blanc number) and are
+    // skipped - the policy itself is counted above.
+    const movementClauses = [];
+    const movementParams = [];
+    for (const currency of CURRENCIES) {
+      movementClauses.push("(ct.Currency = ? AND ct.CreatedAt >= ?)");
+      movementParams.push(currency, windowStart[currency]);
+    }
+    const [movements] = await conn.query(
+      `SELECT ct.Type, ct.Amount, ct.Currency, ct.Reason,
+              p.BlancNumber AS PolicyBlanc
+         FROM cash_transactions ct
+         LEFT JOIN insurance p ON p.BlancNumber = ct.Reason
+        WHERE ct.Branch = ? AND ct.Deleted = 0
+          AND (${movementClauses.join(" OR ")})
+          AND ct.CreatedAt < ?`,
+      [b, ...movementParams, nextDate]
+    );
+    for (const row of movements || []) {
+      const cur = normalizeCurrency(row.Currency);
+      if (balances[cur] === undefined) continue;
+      // A sale or a correction of a policy: already counted from `insurance`.
+      if (row.PolicyBlanc !== null && row.PolicyBlanc !== undefined) continue;
+      if (isPolicyMovementReason(row.Reason)) continue;
+      const amount = Number(row.Amount) || 0;
+      const type = String(row.Type || "").trim().toLowerCase();
+      if (type === "increase" || type === HANDOVER_RETURN_TYPE) {
+        balances[cur] = roundMoney(balances[cur] + amount);
+      } else if (type === "reduce" || type === HANDOVER_TYPE) {
+        balances[cur] = roundMoney(balances[cur] - amount);
+      }
+    }
+
     return balances;
   });
+
+// Kept under its historical name for the callers/tests that still use it.
+const getCurrentCashAsOf = (module.exports.getCurrentCashAsOf =
+  getAvailableCashAsOf);
 
 /**
  * Apply a movement (+increase / -reduce) to a branch/currency balance.
@@ -2192,23 +2271,38 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
   const recipientText = (recipient) =>
     typeof recipient === "string" ? recipient.trim() : "";
 
-  // GET /currentcash/branches — all branches with cash (branches that have any
-  // non-zero balance in any currency).
+  // GET /currentcash/branches — every branch with a non-zero drawer balance.
+  //
+  // The balance is the SAME derived figure the Current cash screen shows (see
+  // getAvailableCashAsOf): the cash policies of the open shift plus manual
+  // movements. Reading the stored `current_cash` here instead would let the
+  // dashboard and that screen disagree.
+  //   ?tzOffset=N  the client's UTC offset, used to work out "today"
   router.get(
     "/currentcash/branches",
     auth,
     requireCashRole,
     async (req, res) => {
       try {
+        const day = resolveHistoryDay("", req.query.tzOffset);
+        if (day.error) {
+          return res.status(400).json({ error: day.error });
+        }
+        // Every branch ever seen (a reset or a movement creates its rows), so a
+        // branch whose stored balance is 0 but whose policies still hold money
+        // is not missed.
         const [rows] = await DBConnection.query(
-          `SELECT DISTINCT Branch FROM current_cash WHERE CurrentCash != 0 ORDER BY Branch`
+          `SELECT DISTINCT Branch FROM current_cash ORDER BY Branch`
         );
-        const branches = rows.map((r) => r.Branch);
 
-        // Fetch balances for each branch
         const branchData = {};
-        for (const branch of branches) {
-          const balances = await getCurrentCash(DBConnection, branch);
+        for (const row of rows) {
+          const branch = row.Branch;
+          const balances = await getAvailableCashAsOf(
+            DBConnection,
+            branch,
+            day.nextDate
+          );
           const nonZero = Object.entries(balances).filter(
             ([, value]) => Number(value) !== 0
           );
@@ -2241,12 +2335,37 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
       const cardBalance = await getBranchCardBalance(DBConnection, branch);
       // Soft-deleted ledger rows are kept for the record but never listed: an
       // admin deleted them, so they no longer count as money of this branch.
+      //
+      // The LEFT JOIN tells a row written by an insurance apart from one typed
+      // in by hand: the sale of a policy and the corrections of an edited,
+      // annulled, deleted or restored one always carry the policy's blanc
+      // number as their reason (or one of the "Edit ..." / "Annul ..." prefixes
+      // recognised by isPolicyMovementReason). Those rows are bookkeeping of
+      // the POLICY, not transactions of the drawer - the policy is read live
+      // from `insurance` - so they never appear in the Transactions table and
+      // an edited policy never shows up on the day it was edited.
       const [txs] = await DBConnection.query(
-        `SELECT * FROM cash_transactions
-          WHERE Branch = ? AND Deleted = 0 AND CreatedAt >= ? AND CreatedAt < ?
-          ORDER BY id DESC`,
+        `SELECT ct.*, p.BlancNumber AS PolicyBlanc
+           FROM cash_transactions ct
+           LEFT JOIN insurance p ON p.BlancNumber = ct.Reason
+          WHERE ct.Branch = ? AND ct.Deleted = 0
+            AND ct.CreatedAt >= ? AND ct.CreatedAt < ?
+          ORDER BY ct.id DESC`,
         [branch, day.date, day.nextDate]
       );
+      // `PolicyBlanc` only told the filter above which rows belong to a policy;
+      // it is stripped from everything that leaves this endpoint.
+      const withoutPolicy = (row) => {
+        const { PolicyBlanc, ...rest } = row;
+        return rest;
+      };
+      const transactions = txs
+        .filter(
+          (row) =>
+            (row.PolicyBlanc === null || row.PolicyBlanc === undefined) &&
+            !isPolicyMovementReason(row.Reason)
+        )
+        .map(withoutPolicy);
       const [resets] = await DBConnection.query(
         `SELECT * FROM cash_resets
           WHERE Branch = ? AND CreatedAt >= ? AND CreatedAt < ?
@@ -2307,8 +2426,10 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         balances,
         cardBalance,
         brokerCash,
-        transactions: txs,
-        expences,
+        // Only the movements typed in by hand (and hand-overs): a policy's own
+        // ledger rows are not transactions of the drawer (see above).
+        transactions,
+        expences: expences.map(withoutPolicy),
         totalExpences,
         brokerCashTransactions,
         resets,
@@ -2333,14 +2454,23 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
   // GET /currentcash/daily — country-wide daily report for the day in the
   // query string. It is independent of the branch selector above: insurances
   // and cash movements are counted across ALL branches. When ?branch= is
-  // provided, the report becomes branch-scoped: `cardPayments`,
-  // `brokerBalance` and `cashFromBrokers` (the money brokers handed over that
-  // day) are restricted to that branch, and `availableCash` carries
-  // that branch's cash drawer balance at the end of the requested day (so
-  // walking the date back shows the amount it actually had then, not today's).
+  // provided, the report becomes branch-scoped: `cashPayments`,
+  // `cardPayments`, `brokerBalance`, `totalDailyBalance` and `cashFromBrokers`
+  // are restricted to that branch, and `availableCash` carries that branch's
+  // cash drawer at the end of the requested day (so walking the date back shows
+  // the amount it actually had then, not today's).
+  //
+  // Every money figure is the price of the policies CREATED on that day, split
+  // by the channel they were paid through:
+  //   cashPayments       walk-in cash policies (the drawer)
+  //   cardPayments       walk-in card policies (the card balance)
+  //   brokerBalance      policies funded from a broker's balance
+  //   totalDailyBalance  all of them together - the day's total insurance money
+  //   cashFromBrokers    broker balance top-ups (money handed over by brokers)
+  //   availableCash      the branch's drawer at the end of the day
   //   ?date=YYYY-MM-DD  day to report on (default: the client's today)
   //   ?tzOffset=N       client UTC offset in minutes, used to work out "today"
-  //   ?branch=...       branch the card/broker/available-cash figures belong to
+  //   ?branch=...       branch the figures above belong to
   router.get("/currentcash/daily", auth, requireCashRole, async (req, res) => {
     try {
       const day = resolveHistoryDay(req.query.date, req.query.tzOffset);
@@ -2415,61 +2545,62 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         countryWideRange.last = policyRef(lastRows && lastRows[0]);
       }
 
-      // Total daily cash: the net cash-drawer movement of the day across all
-      // branches. Walk-in cash payments and manual increases/expenses are all
-      // recorded as cash_transactions rows, so the net is their sum. A
-      // soft-deleted row is left out: its money was already reversed off the
-      // drawer, so counting it again would double the correction. A HAND-OVER is
-      // left out as well: the money did leave the drawer, but it was not a sale
-      // and not an expense, so it must not change what the day earned/spent.
-      const [cash] = await DBConnection.query(
-        `SELECT Currency,
-           ROUND(SUM(CASE WHEN Type = 'increase' THEN Amount
-                          WHEN Type = 'reduce' THEN -Amount
-                          ELSE 0 END), 2) AS Net
-         FROM cash_transactions
-         WHERE Deleted = 0 AND CreatedAt >= ? AND CreatedAt < ?
-         GROUP BY Currency`,
-        [day.date, day.nextDate]
-      );
-      const totalDailyCash = { EUR: 0, TRY: 0 };
-      for (const row of cash) {
-        totalDailyCash[normalizeCurrency(row.Currency)] = Number(row.Net) || 0;
-      }
-
-      // Card payments and broker-balance funding for the selected day, computed
-      // from the policies CREATED on that day (CreationDate, the client's local
-      // time). A policy's net contribution is its full price while active, or
-      // just the annul fee once annulled; deleted policies contribute nothing.
-      // Because everything is keyed on the policy's creation date, a later
-      // annulment/refund reduces the figure on the day the money originally came
-      // in - it never shows up as a negative on the annulment day. When a branch
-      // is supplied the figures are restricted to that branch (a worker's own
-      // branch, or the branch an admin selected).
+      // TOTAL DAILY BALANCE: the price of every insurance created on the day,
+      // whatever it was paid with - cash, card or a broker's balance. It is the
+      // day's total business figure and is deliberately NOT the net of the
+      // drawer ledger (manual increases and expenses are not insurance money,
+      // and an edit no longer changes the total because the policy is read at
+      // its current price).
+      //
+      // Every money figure of the day is computed from the policies created on
+      // that day (CreationDate, the client's local time). A policy's
+      // contribution is its full price while active, or just the annul fee once
+      // annulled; deleted policies contribute nothing. Because everything is
+      // keyed on the policy's creation date, a later annulment/refund reduces
+      // the figure on the day the money originally came in - it never shows up
+      // as a negative on the annulment day. When a branch is supplied the
+      // figures are restricted to that branch (a worker's own branch, or the
+      // branch an admin selected).
       const branchFilter = branch ? " AND Branch = ?" : "";
       const branchArg = branch ? [branch] : [];
-      const [cardRows] = await DBConnection.query(
+      const insuranceMoneySql = (where) =>
         `SELECT Branch, CurrencyType AS Currency,
-                ROUND(SUM(CASE WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2))
-                               ELSE COALESCE(AnnulFee, 0) END), 2) AS Net
+                ${INSURANCE_AMOUNT_SQL} AS Net
            FROM insurance
-          WHERE PaymentType = 'Card' AND BrokerId IS NULL AND Deleted = 0
+          WHERE ${where} AND Deleted = 0
             AND CreationDate >= ? AND CreationDate < ?${branchFilter}
           GROUP BY Branch, CurrencyType
-          ORDER BY Branch, CurrencyType`,
-        [day.date, day.nextDate, ...branchArg]
-      );
-      const [brokerRows] = await DBConnection.query(
-        `SELECT Branch, CurrencyType AS Currency,
-                ROUND(SUM(CASE WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2))
-                               ELSE COALESCE(AnnulFee, 0) END), 2) AS Net
-           FROM insurance
-          WHERE BrokerId IS NOT NULL AND Deleted = 0
-            AND CreationDate >= ? AND CreationDate < ?${branchFilter}
-          GROUP BY Branch, CurrencyType
-          ORDER BY Branch, CurrencyType`,
-        [day.date, day.nextDate, ...branchArg]
-      );
+          ORDER BY Branch, CurrencyType`;
+      // Walk-in policies paid into the drawer, walk-in policies paid by card,
+      // policies funded from a broker's balance, and all of them together.
+      const [[cashRows], [cardRows], [brokerRows], [allRows]] =
+        await Promise.all([
+          DBConnection.query(
+            insuranceMoneySql("PaymentType = 'Cash' AND BrokerId IS NULL"),
+            [day.date, day.nextDate, ...branchArg]
+          ),
+          DBConnection.query(
+            insuranceMoneySql("PaymentType = 'Card' AND BrokerId IS NULL"),
+            [day.date, day.nextDate, ...branchArg]
+          ),
+          DBConnection.query(insuranceMoneySql("BrokerId IS NOT NULL"), [
+            day.date,
+            day.nextDate,
+            ...branchArg,
+          ]),
+          DBConnection.query(insuranceMoneySql("1 = 1"), [
+            day.date,
+            day.nextDate,
+            ...branchArg,
+          ]),
+        ]);
+      const totalDailyBalance = { EUR: 0, TRY: 0 };
+      for (const row of allRows) {
+        const cur = normalizeCurrency(row.Currency);
+        totalDailyBalance[cur] = roundMoney(
+          (totalDailyBalance[cur] || 0) + (Number(row.Net) || 0)
+        );
+      }
       const byBranch = (rows) => {
         const out = [];
         const index = new Map();
@@ -2512,21 +2643,23 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         totalInsurances: Number(counts[0].total) || 0,
         brokerInsurances: Number(counts[0].broker) || 0,
         walkInInsurances: Number(counts[0].walkIn) || 0,
-        totalDailyCash,
+        // The day's insurance money, all payment types together.
+        totalDailyBalance,
         countryWideInsurances: Math.max(0, lastPolicy - firstPolicy),
         countryWideRange,
+        // The three channels that make up the total, one row per branch.
+        cashPayments: byBranch(cashRows),
         cardPayments: byBranch(cardRows),
         brokerBalance: byBranch(brokerRows),
         cashFromBrokers,
       };
 
-      // The selected branch's cash drawer balance at the end of the chosen day.
-      // The running balance is read live and then walked back over the
-      // movements/resets recorded after that day, so picking an older date shows
-      // how much cash that branch actually had available back then (not today's
-      // balance).
+      // The selected branch's cash drawer at the end of the chosen day, derived
+      // from its cash policies and manual movements (see
+      // getAvailableCashAsOf), so an older date shows the amount the branch
+      // actually had available then - not today's balance.
       if (branch) {
-        report.availableCash = await getCurrentCashAsOf(
+        report.availableCash = await getAvailableCashAsOf(
           DBConnection,
           branch,
           day.nextDate
