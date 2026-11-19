@@ -2498,10 +2498,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     }
   );
 
-  // GET /brokers/:id/history — the broker's balance movements for the last
-  // month (default), newest first, paginated (40 per page by default).
-  // Optional ?since / ?until (YYYY-MM-DD[ HH:MM:SS]) override the window and
-  // ?page / ?pageSize control pagination.
+  // GET /brokers/:id/history — the broker's balance movements, newest first,
+  // paginated (40 per page by default). With no ?since the history goes all the
+  // way back to the broker's first movement, so the whole balance can be walked
+  // back day by day. Optional ?since / ?until (YYYY-MM-DD[ HH:MM:SS]) narrow the
+  // window and ?page / ?pageSize control pagination.
   router.get(
     "/brokers/:id/history",
     auth,
@@ -2542,26 +2543,40 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
         const now = new Date();
         // The broker's movements are stamped in the client's local wall clock, so
-        // the default window ("last 30 days") must be resolved with the client's
-        // UTC offset; otherwise a movement made in the last couple of hours would
+        // the default upper bound ("now") must be resolved with the client's UTC
+        // offset; otherwise a movement made in the last couple of hours would
         // fall outside the window's upper bound. Explicit since/until are already
         // client-local calendar dates, so they are used as literals.
         const tzOffset = Number(req.query.tzOffset);
         let since;
         let until;
-        if (req.query.since === undefined || req.query.since === "") {
-          since = clientLocalDateTime(tzOffset, new Date(now.getTime() - 30 * DAY_MS));
-        } else {
-          since = parseLocalBound(String(req.query.since));
-          if (since === null) {
-            return res.status(400).json({ error: "Invalid date range" });
-          }
-        }
         if (req.query.until === undefined || req.query.until === "") {
           until = clientLocalDateTime(tzOffset, now);
         } else {
           until = parseLocalBound(String(req.query.until));
           if (until === null) {
+            return res.status(400).json({ error: "Invalid date range" });
+          }
+        }
+        if (req.query.since === undefined || req.query.since === "") {
+          // There is no default month: the history always goes all the way back
+          // to the broker's first live movement, so the oldest balance can be
+          // reached without narrowing the range by hand. An empty history starts
+          // at the upper bound, which keeps the reported range meaningful.
+          const [[first]] = await DBConnection.query(
+            `SELECT MIN(CreatedAt) AS FirstMovement FROM broker_balance_movements
+              WHERE BrokerId = ? AND Deleted = 0`,
+            [brokerId]
+          );
+          const firstAt = first && first.FirstMovement;
+          since = firstAt
+            ? firstAt instanceof Date
+              ? toLocalDateTime(firstAt)
+              : String(firstAt)
+            : until;
+        } else {
+          since = parseLocalBound(String(req.query.since));
+          if (since === null) {
             return res.status(400).json({ error: "Invalid date range" });
           }
         }
@@ -2582,6 +2597,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               total: 0,
               totalPages: 1,
               balanceAtStart: null,
+              balanceAtEnd: null,
               netChange: null,
               movements: [],
               includeDeleted: false,
@@ -2613,12 +2629,31 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
                 mappedAll.reduce((s, m) => s + m.DisplayAmount, 0) * 100
               ) / 100;
             const currentBalanceSub = disp.displayCashBalance;
+            // The display balance is as of NOW, so the balance at the end of the
+            // requested window is found by taking out every movement made after
+            // it. Without this a past window would repeat today's balance on
+            // every day instead of the balance the broker had back then.
+            const [afterMovs] = await DBConnection.query(
+              `SELECT id, Type, Amount, Reason, Author, BlancNumber, CreatedAt
+                 FROM broker_balance_movements
+                WHERE BrokerId = ? AND CreatedAt >= ? AND Deleted = 0`,
+              [brokerId, until]
+            );
+            const afterNetSub =
+              Math.round(
+                (afterMovs || []).reduce(
+                  (sum, m) => sum + disp.mapMovementAmount(m),
+                  0
+                ) * 100
+              ) / 100;
+            const balanceAtEndSub =
+              Math.round((currentBalanceSub - afterNetSub) * 100) / 100;
             const balanceAtStartSub =
-              Math.round((currentBalanceSub - netChangeSub) * 100) / 100;
+              Math.round((balanceAtEndSub - netChangeSub) * 100) / 100;
             const totalPagesSub = Math.max(1, Math.ceil(totalSub / pageSize));
             const offsetSub = (page - 1) * pageSize;
 
-            let runningAfter = currentBalanceSub;
+            let runningAfter = balanceAtEndSub;
             const withAfter = mappedAll.map((m) => {
               const balAfter = Math.round(runningAfter * 100) / 100;
               runningAfter -= m.DisplayAmount;
@@ -2650,6 +2685,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               total: totalSub,
               totalPages: totalPagesSub,
               balanceAtStart: balanceAtStartSub,
+              balanceAtEnd: balanceAtEndSub,
               netChange: netChangeSub,
               movements: withAfter.slice(offsetSub, offsetSub + pageSize),
               includeDeleted: false,
@@ -2671,8 +2707,23 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           Math.round((Number(stats.net) || 0) * 100) / 100;
         const currentBalance =
           Math.round((Number(broker.CashBalance) || 0) * 100) / 100;
+        // The stored CashBalance is the balance as of NOW, so the balance at the
+        // end of the requested window is today's balance without everything that
+        // happened after it. Seeding the running column with today's balance
+        // instead made every past window show the same (current) figure, so
+        // walking the date back never changed the balance.
+        const [[afterStats]] = await DBConnection.query(
+          `SELECT COALESCE(SUM(Amount), 0) AS net
+             FROM broker_balance_movements
+            WHERE BrokerId = ? AND CreatedAt >= ? AND Deleted = 0`,
+          [brokerId, until]
+        );
+        const balanceAtEnd =
+          Math.round(
+            (currentBalance - (Number(afterStats.net) || 0)) * 100
+          ) / 100;
         const balanceAtStart =
-          Math.round((currentBalance - netChange) * 100) / 100;
+          Math.round((balanceAtEnd - netChange) * 100) / 100;
         const totalPages = Math.max(1, Math.ceil(total / pageSize));
         const offset = (page - 1) * pageSize;
 
@@ -2694,7 +2745,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
              ) t
             ORDER BY t.CreatedAt DESC, t.id DESC
             LIMIT ? OFFSET ?`,
-          [currentBalance, brokerId, since, until, pageSize, offset]
+          [balanceAtEnd, brokerId, since, until, pageSize, offset]
         );
 
         const movements = movementRows.map((r) => ({
@@ -2750,6 +2801,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           total,
           totalPages,
           balanceAtStart,
+          balanceAtEnd,
           netChange,
           movements,
           includeDeleted,

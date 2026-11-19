@@ -2224,6 +2224,13 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // Modify an existing insurance. Admins (role 1) and workers (role 2) can
   // edit any policy.
   //
+  // Admins may additionally change the policy's Author and its broker
+  // (BrokerId; null/"" means a walk-in). Moving a policy to another broker
+  // refunds the previous broker's balance and charges the new one, and turns
+  // the policy into a broker-paid one (PaymentType "Broker"); dropping the
+  // broker turns it back into a walk-in paid in cash or by card. Workers that
+  // send either field are rejected.
+  //
   // The edit is also applied to the money the policy represents: a policy
   // contributes its price to current cash (PaymentType = "Cash") or to the card
   // balance (PaymentType = "Card"), so changing Price, PaymentType, Branch or
@@ -2278,29 +2285,136 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const hasNewPayment =
           newPaymentRaw !== undefined && newPaymentRaw !== null;
 
+        // -------------------------------------------------------------------
+        // Admin-only corrections: who authored the policy and which broker it
+        // belongs to.
+        //
+        // The author is a plain column, but the broker decides who PAYS for the
+        // policy: a broker-linked policy is funded from that broker's balance, a
+        // walk-in from current cash or the card balance. Reassigning one
+        // therefore moves the money too (see the broker balance step inside the
+        // transaction below), exactly like a price or payment-type correction.
+        // -------------------------------------------------------------------
+        const isAdmin = Number(req.user && req.user.role) === 1;
+
+        const authorValue = b.Author ?? b.author;
+        if (authorValue !== undefined && authorValue !== null) {
+          if (!isAdmin) {
+            return res.status(403).json({
+              error: "Only admins can change the author of an insurance",
+            });
+          }
+          const nextAuthor = String(authorValue).trim();
+          if (nextAuthor !== String(insurance.Author ?? "").trim()) {
+            if (!nextAuthor) {
+              return res.status(400).json({ error: "Author is required" });
+            }
+            // The author is credited with the policy, so it has to be a real
+            // (non-deleted) account - the same accounts the Users panel lists.
+            const [authorRows] = await DBConnection.query(
+              "SELECT Username FROM users WHERE Username = ? AND Deleted = 0",
+              [nextAuthor]
+            );
+            if (!Array.isArray(authorRows) || authorRows.length === 0) {
+              return res.status(404).json({ error: "Author not found" });
+            }
+            sets.push("Author = ?");
+            params.push(nextAuthor);
+          }
+        }
+
+        // Broker assignment. An empty/null BrokerId means "no broker" (a
+        // walk-in paid in cash or by card); a real id makes that broker the
+        // payer. Only admins may move a policy between brokers.
+        const brokerValue = b.BrokerId ?? b.brokerId;
+        const oldBrokerId = isBrokerLinked(insurance)
+          ? Number(insurance.BrokerId)
+          : null;
+        let nextBroker = null;
+        if (brokerValue !== undefined && brokerValue !== null) {
+          if (!isAdmin) {
+            return res.status(403).json({
+              error: "Only admins can change the broker of an insurance",
+            });
+          }
+          const rawBroker = String(brokerValue).trim();
+          if (rawBroker === "") {
+            nextBroker = { id: null, name: "" };
+          } else {
+            const parsedBrokerId = Number(rawBroker);
+            if (!Number.isInteger(parsedBrokerId) || parsedBrokerId <= 0) {
+              return res
+                .status(400)
+                .json({ error: "BrokerId must be a positive integer or null" });
+            }
+            if (parsedBrokerId === oldBrokerId) {
+              // Unchanged: nothing to look up and no money to move.
+              nextBroker = {
+                id: parsedBrokerId,
+                name: String(insurance.Broker ?? ""),
+              };
+            } else {
+              const [[broker]] = await DBConnection.query(
+                "SELECT id, Name FROM brokers WHERE id = ? AND Deleted = 0",
+                [parsedBrokerId]
+              );
+              if (!broker) {
+                return res.status(404).json({ error: "Broker not found" });
+              }
+              nextBroker = {
+                id: parsedBrokerId,
+                name: String(broker.Name ?? ""),
+              };
+            }
+          }
+        }
+        const newBrokerId = nextBroker ? nextBroker.id : oldBrokerId;
+        const brokerReassigned =
+          Boolean(nextBroker) && newBrokerId !== oldBrokerId;
+        // An annulled policy has already been refunded through its original
+        // channel and broker, so moving it now would refund the wrong party.
+        if (brokerReassigned && toFlag(insurance.Annulled)) {
+          return res.status(400).json({
+            error: "Cannot change the broker of an annulled insurance",
+          });
+        }
+
         // Email (broker-linked) policies are paid ONLY from the broker's
         // balance: their payment type is always "Broker" and cannot be changed
         // to Cash or Card. Walk-ins stay Cash/Card and can never become Broker.
+        // The link that counts is the one the policy has AFTER this edit: an
+        // admin may assign or drop a broker in the same save.
         const isEmailPolicy = isBrokerLinked(insurance);
+        const newBrokerLinked = newBrokerId !== null;
         const requestedPayment = hasNewPayment
           ? resolvePaymentType(newPaymentRaw)
           : null;
-        if (isEmailPolicy && hasNewPayment && requestedPayment !== "Broker") {
+        // Assigning a broker makes the broker the payer, so a Cash/Card value
+        // the form still carried (it was built for a walk-in) is overridden
+        // instead of rejected - one save can do both. A policy that keeps its
+        // broker still cannot be switched to Cash or Card.
+        if (
+          newBrokerLinked &&
+          !brokerReassigned &&
+          hasNewPayment &&
+          requestedPayment !== "Broker"
+        ) {
           return res.status(400).json({
             error: "Email policies are paid from the broker balance only",
           });
         }
-        if (!isEmailPolicy && requestedPayment === "Broker") {
+        if (!newBrokerLinked && requestedPayment === "Broker") {
           return res.status(400).json({
             error: "Only email policies can be paid from a broker balance",
           });
         }
-        // The non-Turk tax only applies to walk-ins, so an email policy can
-        // never be flagged with it. (Sending it as false is still accepted, so
-        // a legacy row that carries the flag can be cleared.)
+        // The non-Turk tax only applies to walk-ins, so a broker-linked policy
+        // can never be flagged with it. (Sending it as false is still accepted,
+        // so a legacy row that carries the flag can be cleared; a legacy row
+        // that is left alone keeps it.)
         const nonTurkValue = b.NonTurk ?? b.nonTurk;
         if (
-          isEmailPolicy &&
+          newBrokerLinked &&
           nonTurkValue !== undefined &&
           nonTurkValue !== null &&
           toFlag(nonTurkValue)
@@ -2309,9 +2423,14 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             error: "The non-Turk tax only applies to walk-in policies",
           });
         }
-        const finalPayment = isEmailPolicy
+        // A policy that just lost its broker falls back to cash unless the form
+        // chose cash or card: the stored "Broker" type is not a walk-in channel.
+        const finalPayment = newBrokerLinked
           ? "Broker"
-          : requestedPayment ?? resolvePaymentType(insurance.PaymentType);
+          : requestedPayment ??
+            (isEmailPolicy
+              ? "Cash"
+              : resolvePaymentType(insurance.PaymentType));
         let cardFeeHandled = false;
 
         // An annulled policy's Price mirrors its annulment tax (AnnulFee); it is
@@ -2349,6 +2468,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const editedBranch = b.Branch ?? b.branch;
         const storedBroker = String(insurance.Broker ?? "");
         if (
+          !brokerReassigned &&
           !isEmailPolicy &&
           editedBranch !== undefined &&
           editedBranch !== null &&
@@ -2358,6 +2478,26 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         ) {
           sets.push("Broker = ?");
           params.push(String(editedBranch));
+        }
+
+        // A reassignment rewrites both the id and the name the table shows. A
+        // policy moved back to "no broker" takes its branch's name, exactly
+        // like a freshly created walk-in. Its payment channel follows the new
+        // link even when the form did not send one (the email-policy form has
+        // no payment field): a broker pays, a walk-in goes back to cash/card.
+        if (brokerReassigned) {
+          const branchForBroker =
+            editedBranch !== undefined && editedBranch !== null
+              ? String(editedBranch)
+              : String(insurance.Branch ?? "");
+          sets.push("BrokerId = ?");
+          params.push(newBrokerId);
+          sets.push("Broker = ?");
+          params.push(newBrokerId === null ? branchForBroker : nextBroker.name);
+          if (!hasNewPayment) {
+            sets.push("PaymentType = ?");
+            params.push(finalPayment);
+          }
         }
 
         // Duration is stored as integer days, so parse it the same way the
@@ -2415,7 +2555,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         // stands as a normal policy again. Workers cannot change the fault or fee
         // once the policy has been annulled, and active (non-annulled) policies
         // must be annulled through POST /insurances/:blancNumber/annul first.
-        const isAdmin = Number(req.user && req.user.role) === 1;
+        // (`isAdmin` is resolved with the author/broker corrections above.)
         // Annulled arrives as a checkbox: unticking it (false/0) means "remove
         // the annulment". A truthy value is only meaningful on a policy that is
         // already annulled, where it is simply a no-op.
@@ -2573,7 +2713,13 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const currencyChanged =
           String(newCurrency ?? "") !== String(oldCurrency ?? "");
         const moneyChanged =
-          branchChanged || priceChanged || paymentChanged || currencyChanged;
+          branchChanged ||
+          priceChanged ||
+          paymentChanged ||
+          currencyChanged ||
+          // A broker-to-broker move keeps the payment channel ("Broker") but
+          // still has to move the money between the two broker balances.
+          brokerReassigned;
 
         // If an admin is changing the fault or the fee of an annulled insurance,
         // compute the old and new fees/refunds so the payment channel and (for
@@ -2765,11 +2911,34 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               }
             }
 
-            // 3) Keep the broker's own balance in step with the corrected price.
-            //    For an email policy that balance is the only record of the
-            //    payment, so a price correction has to move it too - without
+            // 3) Keep the brokers' balances in step with the policy's price and
+            //    owner. For an email policy that balance is the only record of
+            //    the payment, so a price correction has to move it too - without
             //    touching InactivePolicies, since the policy is still active.
-            if (isEmailPolicy && newPrice !== oldPrice) {
+            //
+            //    A reassignment refunds the previous broker in full (its charge
+            //    is being removed) and charges the new one for the policy at its
+            //    price after this edit. The movement types stay "price_change"
+            //    and "policy" so the existing reports and totals keep counting
+            //    them the same way (a broker move is never "cash from brokers").
+            if (brokerReassigned) {
+              if (oldBrokerId !== null && oldPrice > 0) {
+                await adjustBrokerForPriceChange(conn, oldBrokerId, -oldPrice, {
+                  reason: `Broker change ${newBlancNumber}`,
+                  author: req.user.username,
+                  blancNumber: newBlancNumber,
+                  createdAt: moveTime.createdAt,
+                });
+              }
+              if (newBrokerId !== null && newPrice > 0) {
+                await decreaseBrokerForInsurance(conn, newBrokerId, newPrice, {
+                  reason: newBlancNumber,
+                  author: req.user.username,
+                  blancNumber: newBlancNumber,
+                  createdAt: moveTime.createdAt,
+                });
+              }
+            } else if (isEmailPolicy && newPrice !== oldPrice) {
               await adjustBrokerForPriceChange(
                 conn,
                 insurance.BrokerId,
