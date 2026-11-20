@@ -630,8 +630,27 @@ const computeSubBrokerDisplayData = (module.exports.computeSubBrokerDisplayData 
       manualMovementsSum = 0;
     }
 
+    // The balance the broker had before its first insurance is the base of the
+    // displayed ledger too. Without it an admin's starting balance would be
+    // silently dropped from a sub-broker's history and from its balance in the
+    // broker list. The table is created on first use, so a missing one simply
+    // means no base has been set yet.
+    let startingAmount = 0;
+    try {
+      const [[startingRow]] = await conn.query(
+        "SELECT Amount FROM broker_starting_balances WHERE BrokerId = ?",
+        [brokerId]
+      );
+      const amount = Number(startingRow && startingRow.Amount) || 0;
+      startingAmount = Math.round(amount * 100) / 100;
+    } catch {
+      startingAmount = 0;
+    }
+
     const displayCashBalance =
-      Math.round((manualMovementsSum + netPoliciesImpact) * 100) / 100;
+      Math.round(
+        (startingAmount + manualMovementsSum + netPoliciesImpact) * 100
+      ) / 100;
 
     function mapMovementAmount(m) {
       if (!m) return 0;
@@ -3071,6 +3090,30 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           Math.round(
             windowRows.reduce((sum, m) => sum + m.DisplayAmount, 0) * 100
           ) / 100;
+        // A stored starting balance is the base of the WHOLE ledger: the
+        // balance is then read forward from it instead of being back-solved
+        // from the live CashBalance. Setting (or correcting) it therefore moves
+        // every row's balance after by the same amount, and the insurance that
+        // comes right after the starting point shows exactly that figure plus
+        // its own amount. Back-solving drifts from the starting balance whenever
+        // the ledger and the recalculated balance disagree (a legacy "reduce" or
+        // "adjust" row, a policy with no recorded movement, a hand-fixed
+        // balance), which made a new starting balance look like it had not been
+        // applied. Without a starting balance there is nothing to read forward
+        // from, so the live balance stays the anchor.
+        const startingAmount =
+          startingBalance === null || startingBalance === undefined
+            ? null
+            : Math.round((Number(startingBalance.amount) || 0) * 100) / 100;
+        // Every displayed amount that falls before a bound. The rows are newest
+        // first, so this is a plain sum - the running balance is walked below.
+        const displayedBefore = (bound) =>
+          Math.round(
+            displayed.reduce(
+              (sum, m) => (m.CreatedAt < bound ? sum + m.DisplayAmount : sum),
+              0
+            ) * 100
+          ) / 100;
         // The displayed balance is as of NOW too, so the balance at the end of
         // the window is today's figure without everything displayed after it.
         const afterNet =
@@ -3082,7 +3125,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             ) * 100
           ) / 100;
         const balanceAtEnd =
-          Math.round((currentBalance - afterNet) * 100) / 100;
+          startingAmount === null
+            ? Math.round((currentBalance - afterNet) * 100) / 100
+            : Math.round((startingAmount + displayedBefore(until)) * 100) / 100;
         const balanceAtStart =
           Math.round((balanceAtEnd - netChange) * 100) / 100;
         const totalPages = Math.max(1, Math.ceil(total / pageSize));
@@ -3419,9 +3464,16 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     }
   );
 
-  // POST /brokers/:id/increase  { amount, reason, currency, branch }
+  // POST /brokers/:id/increase  { amount, reason, currency, branch, date? }
   // The money is recorded as Cash from Brokers of `branch` (the branch that
   // took it); current cash is not touched.
+  //
+  // An admin may send `date` ("YYYY-MM-DD") to book the top-up on an earlier
+  // day - money the broker handed over before anyone could enter it - so that
+  // day's reports and Cash from Brokers include it. The time of day stays the
+  // client's wall-clock time, so the row still sorts last within that day.
+  // Only an admin may backdate: a worker's top-up is always "now", and the
+  // server refuses `date` from anyone else.
   router.post(
     "/brokers/:id/increase",
     auth,
@@ -3452,6 +3504,44 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           return res.status(400).json({ error: moveTime.error });
         }
 
+        // The day is an explicit choice (`date`) rather than something inferred
+        // from CreatedAt, which every client has always sent: only an admin may
+        // ask for it, it must be a real calendar day and it may not be in the
+        // future. The time of day is kept from the movement's own timestamp.
+        let createdAt = moveTime.createdAt;
+        const rawDate = req.body?.date ?? req.body?.Date;
+        if (
+          rawDate !== undefined &&
+          rawDate !== null &&
+          String(rawDate).trim()
+        ) {
+          if (String(req.user?.role ?? "") !== "1") {
+            return res.status(403).json({
+              error: "Only an admin can record an increase on an earlier date",
+            });
+          }
+          const day = String(rawDate).trim();
+          const parsed = new Date(`${day}T00:00:00`);
+          // A day that does not exist in that month (2026-02-31) fails the
+          // round-trip. No timezone conversion applies: it is a calendar day.
+          if (
+            !/^\d{4}-\d{2}-\d{2}$/.test(day) ||
+            Number.isNaN(parsed.getTime()) ||
+            toLocalDateTime(parsed).slice(0, 10) !== day
+          ) {
+            return res.status(400).json({ error: "Date must be YYYY-MM-DD" });
+          }
+          const today = clientLocalDateTime(
+            req.body?.TzOffset ?? req.body?.tzOffset ?? null
+          ).slice(0, 10);
+          if (day > today) {
+            return res
+              .status(400)
+              .json({ error: "Date cannot be in the future" });
+          }
+          createdAt = `${day} ${createdAt.slice(11)}`;
+        }
+
         // Money handed over by a broker is the branch's Cash from Brokers, never
         // current cash. The top-up is recorded once, as a broker balance
         // movement carrying the branch that took the money and its currency
@@ -3467,7 +3557,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             await recordBrokerMovement(conn, brokerId, amount, "increase", {
               reason,
               author: req.user.username,
-              createdAt: moveTime.createdAt,
+              createdAt,
               branch,
               currency,
             });
