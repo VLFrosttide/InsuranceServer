@@ -37,7 +37,11 @@ const {
   parseClientDateTime,
 } = require("./CurrentCash.js");
 const { getSchedule, lastClosedPeriod } = require("./PaymentSchedule.js");
-const { recordBrokerMovement } = require("./Brokers.js");
+const { refreshBrokerBalance } = require("./Brokers.js");
+const {
+  ensureBrokerPaymentsTable,
+  recordBrokerPayment,
+} = require("../db/brokerPayments.js");
 const bills = require("../db/brokerBills.js");
 const {
   sendPendingBills,
@@ -363,6 +367,8 @@ module.exports.createBrokerBillsRouter = function createBrokerBillsRouter(
 
       const paid = [];
       let total = 0;
+      // Created outside the transaction: a DDL would implicitly commit it.
+      await ensureBrokerPaymentsTable(DBConnection);
       await DBConnection.withTransaction(async (conn) => {
         for (const bill of selected) {
           // Only an open bill is tagged, so two confirmations at once cannot
@@ -378,7 +384,7 @@ module.exports.createBrokerBillsRouter = function createBrokerBillsRouter(
 
           const amount = round2(bill.amount);
           if (amount > 0) {
-            await recordBrokerMovement(conn, brokerId, amount, paymentType, {
+            await recordBrokerPayment(conn, brokerId, amount, paymentType, {
               reason: `Bill ${bill.periodStart} .. ${bill.periodEnd} (#${bill.id})`,
               author: (req.user && req.user.username) || "",
               createdAt: paidAt,
@@ -396,6 +402,10 @@ module.exports.createBrokerBillsRouter = function createBrokerBillsRouter(
             [total, brokerId]
           );
         }
+
+        // The payments above are money for the balance: rebuild it from them and
+        // the policies in this same transaction.
+        await refreshBrokerBalance(conn, brokerId);
       });
 
       const [[after]] = await DBConnection.query(

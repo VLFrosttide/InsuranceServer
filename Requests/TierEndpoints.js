@@ -28,6 +28,7 @@ const {
   restoreBrokerForAnnulment,
   restoreBrokerForDeletion,
   adjustBrokerForPriceChange,
+  refreshBrokerBalance,
   getBrokerAllowNegativeBalance,
   salePricingFor,
   loadOwnBrokerTariffs,
@@ -1071,6 +1072,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             blancNumber,
             createdAt: creationDate,
           });
+          // Rebuild the balance from the row just inserted, in this transaction:
+          // the insurances are the truth, the incremental update above is only
+          // the intermediate step.
+          await refreshBrokerBalance(conn, brokerId);
         }
       });
 
@@ -1650,6 +1655,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             blancNumber,
             createdAt: creationDate,
           });
+          await refreshBrokerBalance(conn, brokerId);
         }
       });
 
@@ -3156,6 +3162,15 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             `UPDATE insurance SET ${sets.join(", ")} WHERE BlancNumber = ?`,
             params
           );
+
+          // The policy has its final owner and price: rebuild BOTH brokers'
+          // balances from the insurance table (a move touches two of them).
+          const touchedBrokers = new Set();
+          if (oldBrokerId !== null) touchedBrokers.add(oldBrokerId);
+          if (newBrokerId !== null) touchedBrokers.add(newBrokerId);
+          for (const id of touchedBrokers) {
+            await refreshBrokerBalance(conn, id);
+          }
         });
 
         // Re-read under the (possibly changed) blank number.
@@ -3449,6 +3464,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               WHERE BlancNumber = ?`,
             [payer, fee, originalPrice, fee, req.user.username, blancNumber]
           );
+
+          if (isBrokerLinked(insurance)) {
+            await refreshBrokerBalance(conn, insurance.BrokerId);
+          }
         });
 
         const [rows] = await DBConnection.query(
@@ -3582,6 +3601,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               WHERE BlancNumber = ?`,
             [req.user.username, blancNumber]
           );
+
+          if (isBrokerLinked(insurance)) {
+            await refreshBrokerBalance(conn, insurance.BrokerId);
+          }
         });
 
         res.json({
@@ -3699,6 +3722,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
               WHERE BlancNumber = ?`,
             [0, null, null, blancNumber]
           );
+
+          if (isBrokerLinked(insurance)) {
+            await refreshBrokerBalance(conn, insurance.BrokerId);
+          }
         });
 
         res.json({

@@ -837,6 +837,45 @@ module.exports.sendToUser = function sendToUser(username, payload) {
 };
 
 /**
+ * Tell every connected client that one or more broker balances changed, so an
+ * open Brokers tab or balance history re-reads the figure instead of waiting for
+ * a manual reload. Sent to every authenticated socket (admins and workers); a
+ * broker-scoped website connection benefits too.
+ *
+ * @param {number[]|number} brokerIds  Broker id(s) whose balance moved.
+ * @returns {number} Number of clients the notification was delivered to.
+ */
+module.exports.notifyBrokerBalanceChanged = function notifyBrokerBalanceChanged(
+  brokerIds
+) {
+  if (!wss) return 0;
+
+  const ids = (Array.isArray(brokerIds) ? brokerIds : [brokerIds])
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id) && id > 0);
+  if (ids.length === 0) return 0;
+
+  const message = JSON.stringify({
+    type: "broker_balance_changed",
+    data: { brokers: ids },
+  });
+  let delivered = 0;
+
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN && client.username) {
+      try {
+        client.send(message);
+        delivered++;
+      } catch (err) {
+        console.error("Failed to broadcast a broker balance change:", err);
+      }
+    }
+  }
+
+  return delivered;
+};
+
+/**
  * Notify admins and workers that a reply email could not be sent (either it was
  * queued for retry or it gave up after retries), so a human knows the broker
  * never received their reply and can follow up.

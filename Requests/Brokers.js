@@ -80,6 +80,12 @@ const {
   parseClientDateTime,
 } = require("./CurrentCash.js");
 const { getSchedule } = require("./PaymentSchedule.js");
+const {
+  ensureBrokerPaymentsTable,
+  recordBrokerPayment,
+  syncBrokerPaymentFromMovement,
+  sumBrokerPayments,
+} = require("../db/brokerPayments.js");
 
 /**
  * Parse and validate a positive amount (returns null when invalid).
@@ -625,19 +631,12 @@ const computeSubBrokerDisplayData = (module.exports.computeSubBrokerDisplayData 
       }
     }
 
+    // The money the broker paid, from its own table (never from the history
+    // ledger, whose rows an admin can correct or delete).
     let manualMovementsSum = 0;
     try {
-      const [movRows] = await conn.query(
-        `SELECT Type, Amount
-           FROM broker_balance_movements
-          WHERE BrokerId = ? AND Deleted = 0
-            AND Type NOT IN ('policy', 'annulment', 'price_change', 'deletion',
-                             'reduce', 'adjust')`,
-        [brokerId]
-      );
-      for (const m of movRows || []) {
-        manualMovementsSum += Number(m.Amount) || 0;
-      }
+      await ensureBrokerPaymentsTable(conn);
+      manualMovementsSum = await sumBrokerPayments(conn, brokerId);
     } catch {
       manualMovementsSum = 0;
     }
@@ -1006,7 +1005,7 @@ module.exports.BROKER_STARTING_BALANCE_TABLE_SQL =
  * The balance is rebuilt from the source data instead of trusting the ledger:
  *
  *   CashBalance = StartingBalance
- *               + every manual payment on the ledger
+ *               + every payment in broker_payments
  *               - every live insurance of the broker
  *
  * An ACTIVE insurance is charged its price. An ANNULLED one is charged its
@@ -1018,12 +1017,14 @@ module.exports.BROKER_STARTING_BALANCE_TABLE_SQL =
  *
  * "Manual payment" means money the broker actually handed over: a branch
  * top-up ("increase", bill payments included) or a hand-over to the owner
- * ("handover"). Reductions ("reduce") and admin balance corrections ("adjust")
- * are NOT payments and are no longer part of the formula: the balance is the
- * starting point plus the policies, minus what the broker paid. The
- * policy-derived rows ("policy", "annulment", "deletion", "price_change") are
- * skipped for the same reason - the insurances above are the truth for those,
- * so a policy moved to another broker, an edited price or a soft-deleted
+ * ("handover"). They are read from `broker_payments` - the money table - not
+ * from the history ledger, so a corrected or soft-deleted history row can never
+ * move a balance. Reductions ("reduce") and admin balance corrections
+ * ("adjust") are NOT payments and are no longer part of the formula: the
+ * balance is the starting point plus the policies, minus what the broker paid.
+ * The policy-derived rows ("policy", "annulment", "deletion", "price_change")
+ * are skipped for the same reason - the insurances above are the truth for
+ * those, so a policy moved to another broker, an edited price or a soft-deleted
  * movement cannot leave a stale charge behind.
  *
  * Runs inside the caller's transaction.
@@ -1055,23 +1056,15 @@ const recalculateBrokerBalance = (module.exports.recalculateBrokerBalance =
       [brokerId]
     );
 
-    // The payments only: money the broker handed over, as a branch top-up
-    // ("increase") or straight to the owner ("handover"). A "reduce" or an
-    // "adjust" row is not a payment and must never shrink what the broker paid.
-    const [[paidRow]] = await conn.query(
-      `SELECT COALESCE(SUM(Amount), 0) AS Paid
-         FROM broker_balance_movements
-        WHERE BrokerId = ? AND Deleted = 0
-          AND Type IN ('increase', 'handover')`,
-      [brokerId]
-    );
-
+    // The payments only: money the broker actually handed over, as a branch
+    // top-up ("increase"), a paid bill, or straight to the owner ("handover").
+    // They live in their own table (db/brokerPayments.js) - NOT in the history
+    // ledger, whose rows an admin may correct or delete without moving money.
+    const payments = await sumBrokerPayments(conn, brokerId);
 
     const insuranceCharges =
       Math.round((toDecimal(chargedRow && chargedRow.Charged) || 0) * 100) /
       100;
-    const payments =
-      Math.round((toDecimal(paidRow && paidRow.Paid) || 0) * 100) / 100;
     const balance =
       Math.round((starting + payments - insuranceCharges) * 100) / 100;
 
@@ -1081,6 +1074,114 @@ const recalculateBrokerBalance = (module.exports.recalculateBrokerBalance =
     ]);
 
     return { balance, startingBalance: starting, insuranceCharges, payments };
+  });
+
+// The tables the balance formula reads are created by db/setup.js on start-up
+// and once when the router is built (see createBrokerRouter). Nothing is
+// created here: a DDL inside a transaction would implicitly commit it.
+const STARTING_BALANCE_TABLE = "broker_starting_balances";
+
+/**
+ * The broker's starting balance (its balance before the first insurance), or
+ * null when none has been set - there is then no base to rebuild from and the
+ * stored, incrementally maintained figure stays authoritative.
+ *
+ * Runs inside the caller's transaction so the recalculation sees the same
+ * snapshot. A database that has not run db/setup.js yet simply has no base.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @returns {Promise<number|null>}
+ */
+async function loadStartingAmount(conn, brokerId) {
+  try {
+    const [[row]] = await conn.query(
+      `SELECT Amount FROM ${STARTING_BALANCE_TABLE} WHERE BrokerId = ?`,
+      [brokerId]
+    );
+    if (!row) return null;
+    return Math.round((Number(row.Amount) || 0) * 100) / 100;
+  } catch (err) {
+    if (isMissingTableError(err)) return null;
+    throw err;
+  }
+}
+
+/** ER_NO_SUCH_TABLE / "Table ... doesn't exist". */
+function isMissingTableError(err) {
+  if (!err) return false;
+  if (Number(err.errno) === 1146 || err.code === "ER_NO_SUCH_TABLE") return true;
+  return /table .*doesn'?t exist/i.test(String(err.message || ""));
+}
+
+// Clients are told about a balance change once per tick, not once per write:
+// annulling a policy touches the broker three times (sale delta, refund, tax).
+const pendingBalanceNotifications = new Set();
+let balanceNotifyTimer = null;
+function queueBrokerBalanceNotification(brokerId) {
+  const id = Number(brokerId);
+  if (!Number.isInteger(id) || id <= 0) return;
+  pendingBalanceNotifications.add(id);
+  if (balanceNotifyTimer) return;
+  // No timer (a unit-test sandbox, a short script): there is nothing to push to.
+  if (typeof setTimeout !== "function") return;
+  balanceNotifyTimer = setTimeout(() => {
+    const ids = Array.from(pendingBalanceNotifications);
+    pendingBalanceNotifications.clear();
+    balanceNotifyTimer = null;
+    try {
+      // Lazy: Users/websocket.js pulls in the mail stack, and this module is
+      // loaded before the WebSocket server exists.
+      const { notifyBrokerBalanceChanged } = require("../Users/websocket.js");
+      if (typeof notifyBrokerBalanceChanged === "function") {
+        notifyBrokerBalanceChanged(ids);
+      }
+    } catch (err) {
+      // A missing socket server (tests, short scripts) must never fail a save.
+      console.warn("Could not announce a broker balance change:", err && err.message);
+    }
+  }, 20);
+  if (typeof balanceNotifyTimer.unref === "function") balanceNotifyTimer.unref();
+}
+
+/**
+ * Rebuild a broker's balance from the source data after ANY change that can
+ * move it (a policy created/edited/annulled/restored/deleted, a payment
+ * recorded, a payment corrected or removed).
+ *
+ * Must be called inside the same transaction as the change, so a rolled-back
+ * save can never leave a recalculated balance behind:
+ *
+ *   CashBalance = starting balance
+ *               + money the broker paid   (broker_payments)
+ *               - live insurances         (insurance, Price / annulment tax)
+ *
+ * Brokers without a starting balance are left alone (null): their stored figure
+ * is the only base they have, and it is maintained by the incremental updates
+ * the callers still run. Set a starting balance to move a broker onto the
+ * rebuilt figure.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @returns {Promise<{balance: number, startingBalance: number,
+ *                    insuranceCharges: number, payments: number}|null>}
+ */
+const refreshBrokerBalance = (module.exports.refreshBrokerBalance =
+  async function refreshBrokerBalance(conn, brokerId) {
+    const starting = await loadStartingAmount(conn, brokerId);
+    if (starting === null) return null;
+    let result;
+    try {
+      result = await recalculateBrokerBalance(conn, brokerId, starting);
+    } catch (err) {
+      // A database that has not run db/setup.js has no broker_payments table
+      // yet: skip the rebuild instead of failing the save (the incremental
+      // figure the caller already applied stays authoritative).
+      if (isMissingTableError(err)) return null;
+      throw err;
+    }
+    queueBrokerBalanceNotification(brokerId);
+    return result;
   });
 
 /**
@@ -1598,6 +1699,29 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     return movementTableReady;
   }
 
+  // The payments table is created on first use (and by db/setup.js). Like the
+  // tables above it is created OUTSIDE any request transaction: a DDL inside a
+  // transaction would implicitly commit it.
+  let paymentsTableReady = null;
+  function ensurePaymentsTable() {
+    if (!paymentsTableReady) {
+      paymentsTableReady = Promise.resolve(
+        ensureBrokerPaymentsTable(DBConnection)
+      ).catch((err) => {
+        paymentsTableReady = null;
+        throw err;
+      });
+    }
+    return paymentsTableReady;
+  }
+  // Prepare it now, never inside a request transaction.
+  ensurePaymentsTable().catch((err) => {
+    console.warn(
+      "Could not prepare broker_payments:",
+      (err && err.message) || err
+    );
+  });
+
   // The starting balance table is created on first use (and by db/setup.js), so
   // the server also works on a database that has not been set up again yet.
   let startingBalanceTableReady = null;
@@ -1982,6 +2106,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           [balanceDelta, brokerId]
         );
       }
+      // The tariff change rewrote the policies' prices: rebuild the figure from
+      // them (a no-op for brokers without a starting balance).
+      await refreshBrokerBalance(conn, brokerId);
     } catch {
       // Ignore if tables/columns are absent in minimal test mocks.
     }
@@ -3120,33 +3247,17 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           Math.round(
             windowRows.reduce((sum, m) => sum + balanceDelta(m), 0) * 100
           ) / 100;
-        // A stored starting balance is the base of the WHOLE ledger: the
-        // balance is then read forward from it instead of being back-solved
-        // from the live CashBalance. Setting (or correcting) it therefore moves
-        // every row's balance after by the same amount, and the insurance that
-        // comes right after the starting point shows exactly that figure plus
-        // its own amount. Back-solving drifts from the starting balance whenever
-        // the ledger and the recalculated balance disagree (a policy with no
-        // recorded movement, a hand-fixed balance), which made a new starting
-        // balance look like it had not been applied. Without a starting balance
-        // there is nothing to read forward from, so the live balance stays the
-        // anchor.
-        const startingAmount =
-          startingBalance === null || startingBalance === undefined
-            ? null
-            : Math.round((Number(startingBalance.amount) || 0) * 100) / 100;
-        // Every counted amount (retired rows contribute 0) that falls before a
-        // bound. The rows are newest first, so this is a plain sum - the running
-        // balance is walked below.
-        const displayedBefore = (bound) =>
-          Math.round(
-            displayed.reduce(
-              (sum, m) => (m.CreatedAt < bound ? sum + balanceDelta(m) : sum),
-              0
-            ) * 100
-          ) / 100;
-        // The displayed balance is as of NOW too, so the balance at the end of
-        // the window is today's figure without everything displayed after it.
+        // The balance of this page ALWAYS comes from the stored figure, never
+        // from a sum of the ledger: the server rebuilds that figure from the
+        // insurances + the payments the broker made inside every transaction
+        // (see refreshBrokerBalance), so the Brokers tab and this page cannot
+        // disagree. The starting balance above is shown for reference and is
+        // already part of that figure - it is not added to the rows again.
+        //
+        // The stored balance is as of NOW, so the figure at the end of the
+        // window is today's balance without everything that came after it. That
+        // keeps walking the date back meaningful (a past day shows the balance
+        // the broker had then) while staying on the single source of truth.
         const afterNet =
           Math.round(
             displayed.reduce(
@@ -3156,9 +3267,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             ) * 100
           ) / 100;
         const balanceAtEnd =
-          startingAmount === null
-            ? Math.round((currentBalance - afterNet) * 100) / 100
-            : Math.round((startingAmount + displayedBefore(until)) * 100) / 100;
+          Math.round((currentBalance - afterNet) * 100) / 100;
         const balanceAtStart =
           Math.round((balanceAtEnd - netChange) * 100) / 100;
         const totalPages = Math.max(1, Math.ceil(total / pageSize));
@@ -3265,9 +3374,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         }
 
         await ensureMovementTable();
+        await ensurePaymentsTable();
 
         const [[existing]] = await DBConnection.query(
-          `SELECT id, BrokerId, Amount, Type, Reason, Author, BlancNumber
+          `SELECT id, BrokerId, Amount, Type, Reason, Author, BlancNumber,
+                  CreatedAt, Branch, Currency
              FROM broker_balance_movements
             WHERE id = ? AND BrokerId = ? AND Deleted = 0`,
           [movementId, brokerId]
@@ -3379,6 +3490,22 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               [delta, brokerId]
             );
           }
+          // A corrected payment is money too: keep the payments table in step,
+          // then rebuild the balance (the payments + policies are the truth).
+          await syncBrokerPaymentFromMovement(conn, {
+            brokerId,
+            movementId,
+            type: nextType,
+            amount: nextAmount,
+            reason: rawReason === undefined ? existing.Reason : String(rawReason),
+            author: rawAuthor === undefined ? existing.Author : String(rawAuthor),
+            createdAt: existing.CreatedAt,
+            branch: existing.Branch,
+            currency: existing.Currency,
+            deleted: false,
+            deletedBy: req.user.username,
+          });
+          await refreshBrokerBalance(conn, brokerId);
         });
 
         const [[broker]] = await DBConnection.query(
@@ -3415,6 +3542,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         }
 
         await ensureMovementTable();
+        await ensurePaymentsTable();
 
         const [[existing]] = await DBConnection.query(
           `SELECT id, Amount, Type, Deleted FROM broker_balance_movements
@@ -3447,6 +3575,17 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               [reversal, brokerId]
             );
           }
+          // Deleting a payment from the history removes the money too, so the
+          // payments table and the rebuilt balance follow in the same step.
+          await syncBrokerPaymentFromMovement(conn, {
+            brokerId,
+            movementId,
+            type: existing.Type,
+            amount: existing.Amount,
+            deleted: true,
+            deletedBy: req.user.username,
+          });
+          await refreshBrokerBalance(conn, brokerId);
         });
 
         const [[broker]] = await DBConnection.query(
@@ -3482,6 +3621,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         }
 
         await ensureMovementTable();
+        await ensurePaymentsTable();
 
         const [[existing]] = await DBConnection.query(
           `SELECT id, Amount, Type, Deleted FROM broker_balance_movements
@@ -3512,6 +3652,14 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               [reapply, brokerId]
             );
           }
+          await syncBrokerPaymentFromMovement(conn, {
+            brokerId,
+            movementId,
+            type: existing.Type,
+            amount: existing.Amount,
+            deleted: false,
+          });
+          await refreshBrokerBalance(conn, brokerId);
         });
 
         const [[broker]] = await DBConnection.query(
@@ -3608,6 +3756,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         // current cash. The top-up is recorded once, as a broker balance
         // movement carrying the branch that took the money and its currency
         // (see "Cash from brokers, per branch" in CurrentCash.js).
+        await ensurePaymentsTable();
         const affectedRows = await DBConnection.withTransaction(
           async (conn) => {
             const [r] = await conn.query(
@@ -3616,13 +3765,17 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             );
             if (r.affectedRows === 0) return r.affectedRows;
 
-            await recordBrokerMovement(conn, brokerId, amount, "increase", {
+            await recordBrokerPayment(conn, brokerId, amount, "increase", {
               reason,
               author: req.user.username,
               createdAt,
               branch,
               currency,
             });
+
+            // Rebuild the figure from the payments + policies in the same
+            // transaction (brokers with a starting balance).
+            await refreshBrokerBalance(conn, brokerId);
 
             return r.affectedRows;
           }
@@ -3733,7 +3886,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
                                      UpdatedBy = VALUES(UpdatedBy)`,
             [brokerId, amount, date, author]
           );
-          return recalculateBrokerBalance(conn, brokerId, amount);
+          // Saving the base is a balance change too: recalculate from it and let
+          // the other clients know (queueBrokerBalanceNotification is batched).
+          const saved = await recalculateBrokerBalance(conn, brokerId, amount);
+          queueBrokerBalanceNotification(brokerId);
+          return saved;
         });
 
         res.json({
@@ -3797,6 +3954,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           return res.status(400).json({ error: moveTime.error });
         }
 
+        await ensurePaymentsTable();
         const affectedRows = await DBConnection.withTransaction(
           async (conn) => {
             const [r] = await conn.query(
@@ -3807,12 +3965,14 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
             // No `branch` on purpose: the owner took the money outside the
             // branches, so this must not become Cash from Brokers.
-            await recordBrokerMovement(conn, brokerId, amount, "handover", {
+            await recordBrokerPayment(conn, brokerId, amount, "handover", {
               reason,
               author: req.user.username,
               createdAt: moveTime.createdAt,
               currency,
             });
+
+            await refreshBrokerBalance(conn, brokerId);
 
             return r.affectedRows;
           }

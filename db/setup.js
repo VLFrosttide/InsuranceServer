@@ -9,6 +9,10 @@
 
 const mysql = require("mysql2/promise");
 const { separateBrokerCash } = require("./separateBrokerCash.js");
+const {
+  ensureBrokerPaymentsTable,
+  backfillBrokerPayments,
+} = require("./brokerPayments.js");
 
 /**
  * One-time split of the old global card balance into per-branch balances
@@ -1017,6 +1021,24 @@ async function runSetup(config = {}) {
      COMMENT='Every change to a broker CashBalance (signed Amount)'
    `);
 
+  // A broker's balance is rebuilt from the insurance table and the money the
+  // broker actually handed over, so those payments have their own table now
+  // (db/brokerPayments.js). The history ledger is only the audit trail; a
+  // correction or a soft delete there can no longer move a balance. Create the
+  // table and mirror the payments already in the ledger (idempotent).
+  try {
+    await ensureBrokerPaymentsTable(db);
+    const mirrored = await backfillBrokerPayments(db);
+    if (mirrored) {
+      console.log(`Mirrored ${mirrored} broker payment(s) into broker_payments`);
+    }
+  } catch (err) {
+    console.warn(
+      "Could not prepare the broker payments table:",
+      (err && err.message) || err
+    );
+  }
+
   // The balance a broker had BEFORE its first insurance (the base the balance
   // history page recalculates from, see recalculateBrokerBalance in
   // Requests/Brokers.js). One row per broker; a broker without a row has no
@@ -1347,7 +1369,7 @@ async function runSetup(config = {}) {
   // Requests/Brokers.js):
   //
   //   CashBalance = starting balance
-  //               + increase/handover payments
+  //               + payments from broker_payments
   //               - live policies (an annulled one at its tax ONLY when the
   //                 broker paid it, AnnulReason = 'broker')
   //
@@ -1363,11 +1385,12 @@ async function runSetup(config = {}) {
       SET b.CashBalance = ROUND(
         sb.Amount
         + COALESCE((
-            SELECT SUM(m.Amount)
-              FROM broker_balance_movements m
-             WHERE m.BrokerId = b.id AND m.Deleted = 0
-               AND m.Type IN ('increase', 'handover')
+            SELECT SUM(p.Amount)
+              FROM broker_payments p
+             WHERE p.BrokerId = b.id AND p.Deleted = 0
+               AND p.Type IN ('increase', 'handover')
           ), 0)
+
         - COALESCE((
             SELECT SUM(CASE
                          WHEN i.Annulled = 0

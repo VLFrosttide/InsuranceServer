@@ -198,6 +198,32 @@ Single running card balance (one row, `id = 1`).
 Use case: the single card-payment balance. Increased when an insurance policy is
 created with `PaymentType = "Card"`.
 
+### `broker_starting_balances` / `broker_payments`
+
+The two inputs of a broker's balance besides its policies.
+
+`broker_starting_balances` — one row per broker: the balance it had before its
+first insurance (`BrokerId` PK, `Amount`, `EffectiveDate`, `UpdatedBy`). A
+broker created with an opening balance gets its row at creation. Without a row
+the stored `brokers.CashBalance` is the only base and is maintained by the
+incremental updates; with one, the balance is rebuilt from the formula below
+after every change.
+
+`broker_payments` — money the broker actually handed over: a branch top-up
+(`increase`), a paid bill (`increase`) or a hand-over to the owner (`handover`).
+The balance formula reads **this** table, never the `broker_balance_movements`
+ledger, so correcting or soft-deleting a history row cannot silently move a
+balance. Each payment is also written to the ledger in the same transaction
+(`MovementId` ties the two rows) for the history page, Cash from Brokers and the
+reports; `db/setup.js` mirrors existing ledger payments once, idempotently.
+
+```
+CashBalance = starting balance
+            + SUM(broker_payments.Amount)          (live rows)
+            - SUM(live insurances.Price)           (annulled: the annulment tax,
+                                                    only when the broker paid it)
+```
+
 ### `brokers`
 
 Broker accounts.
@@ -428,11 +454,30 @@ A broker balance never moves current cash:
   blocked by how much cash happens to be available.
 - There is no manual reduction. The balance is
   `starting balance + payments - the broker's live policies` (an annulled policy
-  at its annulment tax only when the broker paid it), recalculated by
-  `PUT /brokers/:id/starting-balance`; a hand-typed reduction could not survive
-  that. Old `reduce`/`adjust` rows are kept as history: the balance history page
+  at its annulment tax only when the broker paid it). It is rebuilt from that
+  source data after EVERY change that can move it - a policy created, edited,
+  annulled, restored or deleted; a top-up, a hand-over or a paid bill; a
+  correction or delete of a payment from the history page; a starting balance
+  saved - inside the same transaction as the change (see
+  `refreshBrokerBalance` in `Requests/Brokers.js`), plus once on every start-up
+  for brokers that have a starting balance. So `GET /brokers`, the broker's
+  balance history and the bi-weekly figures all show the same figure.
+- The money is read from `broker_payments` (a broker's top-ups, hand-overs and
+  paid bills), never from `broker_balance_movements`: that ledger is the history
+  of who did what, when, and an admin may correct or soft-delete a row there
+  without silently changing a balance. Each payment is still written to both
+  tables in the same transaction (`MovementId` ties them), so the history page,
+  Cash from Brokers and the reports keep reading the ledger. `db/setup.js`
+  creates `broker_payments` and mirrors the payments already in the ledger once.
+- The balance history page shows the stored balance (walked back by the rows
+  recorded after the shown range), the same figure as the Brokers tab. The
+  stored starting balance is displayed for reference; it is not added to the
+  rows a second time. Old `reduce`/`adjust` rows are kept as history: the page
   tags them as retired, they never move the balance, and an admin can soft-delete
   them without changing it.
+- Every balance change is pushed to the connected clients (`broker_balance_changed`
+  over the WebSocket), so an open Brokers tab or balance history re-reads the
+  figure instead of showing a stale one.
 
 ### Cash from Brokers
 
