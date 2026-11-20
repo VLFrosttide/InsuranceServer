@@ -2,8 +2,8 @@
 // Broker balance support.
 //
 // Each broker has a cash balance that only admins (role 1) and workers
-// (role 2) can increase/reduce. Unlike daily current cash, a broker balance
-// may go infinitely negative.
+// (role 2) can raise, and only by recording money the broker actually paid.
+// Unlike daily current cash, a broker balance may go infinitely negative.
 //
 // A broker balance never moves current cash:
 //   - Increasing a broker's balance is money handed over by the broker. It
@@ -17,11 +17,14 @@
 //     branch) and it writes nothing to the cash drawer. It does count as a
 //     payment: the reports and the broker's last-payment date read the two
 //     types together.
-//   - Reducing a broker's balance (including the per-policy deduction made
-//     when an insurance is created from an email card, see
-//     decreaseBrokerForInsurance below) touches neither current cash nor
-//     Cash from Brokers, and is never blocked by how much cash happens to be
-//     available.
+//   - The balance FALLS when an insurance is created from an email card (the
+//     per-policy deduction, see decreaseBrokerForInsurance below). That touches
+//     neither current cash nor Cash from Brokers and is never blocked by how
+//     much cash happens to be available. There is no manual reduction: the
+//     whole balance is the starting balance plus the payments minus the
+//     broker's policies (see recalculateBrokerBalance), so a hand-typed
+//     reduction would be undone by the next recalculation. Old "reduce" and
+//     "adjust" rows are kept as history and ignored by that calculation.
 //
 // Creating an insurance whose email sender is associated with a broker
 // deducts a flat fee (the policy price) from that broker's balance. No
@@ -1051,10 +1054,11 @@ const recalculateBrokerBalance = (module.exports.recalculateBrokerBalance =
  * @param {number} brokerId
  * @param {number|string} amount  signed delta (positive = increase)
  * @param {string} type  e.g. "policy" | "annulment" | "deletion" |
- *                       "price_change" | "increase" | "reduce" | "handover".
- *                       "adjust" is legacy: the balance is calculated from the
- *                       starting balance and the policies, never corrected by
- *                       hand any more.
+ *                       "price_change" | "increase" | "handover". "reduce" and
+ *                       "adjust" are legacy types: the "Reduce" action and the
+ *                       hand-typed balance correction no longer exist, so the
+ *                       balance is never lowered by hand (old rows are kept as
+ *                       history and ignored by recalculateBrokerBalance).
  * @param {{reason?: string, author?: string, blancNumber?: string,
  *          createdAt?: string, branch?: string, currency?: string}} [meta]
  *          `createdAt` is an already-resolved client-local
@@ -3498,74 +3502,15 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     }
   );
 
-  // POST /brokers/:id/reduce  { amount, reason, currency } — balance may go
-  // infinitely negative. It touches neither current cash nor Cash from
-  // Brokers: reducing a broker balance must never decrease either of them or
-  // be blocked by how much cash happens to be available.
-  router.post(
-    "/brokers/:id/reduce",
-    auth,
-    requireBrokerRole,
-    async (req, res) => {
-      try {
-        const brokerId = parseBrokerId(req.params.id);
-        if (brokerId === null) {
-          return res.status(400).json({ error: "Invalid broker id" });
-        }
-        const amount = parsePositiveAmount(req.body?.amount);
-        if (amount === null) {
-          return res
-            .status(400)
-            .json({ error: "amount must be a positive number" });
-        }
-        const reason = (
-          typeof req.body?.reason === "string" ? req.body.reason : ""
-        ).trim();
-        if (!reason) {
-          return res.status(400).json({ error: "reason is required" });
-        }
-        const currency = normalizeCurrency(req.body?.currency);
-
-        const moveTime = resolveBrokerCreatedAt(req.body);
-        if (moveTime.error) {
-          return res.status(400).json({ error: moveTime.error });
-        }
-
-        const [r] = await DBConnection.query(
-          "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
-          [amount, brokerId]
-        );
-
-        if (r.affectedRows === 0) {
-          return res.status(404).json({ error: "Broker not found" });
-        }
-
-        await recordBrokerMovement(DBConnection, brokerId, -amount, "reduce", {
-          reason,
-          author: req.user.username,
-          createdAt: moveTime.createdAt,
-        });
-
-        const [[broker]] = await DBConnection.query(
-          `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
-          [brokerId]
-        );
-        res.json({
-          message: "Broker balance reduced",
-          amount,
-          currency,
-          broker,
-        });
-      } catch (err) {
-        const msg = (err && err.message) || "";
-        if (msg.includes("amount") || msg.includes("reason")) {
-          return res.status(400).json({ error: msg });
-        }
-        console.error("Broker reduce failed:", err);
-        res.status(500).json({ error: "Failed to reduce broker balance" });
-      }
-    }
-  );
+  // There is deliberately NO POST /brokers/:id/reduce any more.
+  //
+  // A broker balance may only grow through money the broker actually paid (a
+  // top-up or a hand-over). It falls by itself when a policy is created, and it
+  // is recalculated from the starting balance and the broker's policies, so a
+  // hand-typed reduction would only be undone by the next recalculation.
+  // Rows of type "reduce" that already exist stay in broker_balance_movements
+  // as history: the balance history page still lists them, and the
+  // recalculation ignores them (see recalculateBrokerBalance).
 
   // PUT /brokers/:id/starting-balance  { amount, date }
   //

@@ -423,10 +423,14 @@ A broker balance never moves current cash:
   `GET /reports/cash-inflow` and in the broker's last-payment date), but it
   carries no branch, so it is **never** Cash from Brokers and writes nothing to
   the cash drawer.
-- `POST /brokers/:id/reduce`, and the automatic per-policy deduction made when
-  an insurance is created from an email card, touch neither current cash nor
-  Cash from Brokers, and are never blocked by how much cash happens to be
-  available.
+- The automatic per-policy deduction made when an insurance is created from an
+  email card touches neither current cash nor Cash from Brokers, and is never
+  blocked by how much cash happens to be available.
+- There is no manual reduction. The balance is
+  `starting balance + payments - the broker's live policies` (an annulled policy
+  at its annulment tax), recalculated by
+  `PUT /brokers/:id/starting-balance`; a hand-typed reduction could not survive
+  that. Old `reduce`/`adjust` rows are kept as history and ignored by it.
 
 ### Cash from Brokers
 
@@ -464,7 +468,14 @@ is left exactly as it was. The run is marked in `app_settings` as
 - `GET /brokers/:id` — single broker
 - `POST /brokers/:id/increase` — body `{ "amount": 100, "branch": "..." }` (the money is the branch's Cash from Brokers; current cash is not touched)
 - `POST /brokers/:id/handover` — body `{ "amount": 100, "currency": "EUR", "reason": "..." }` (the broker paid the owner directly: the balance grows like a top-up and the reports count it as a payment, but no branch takes the money, so Cash from Brokers is untouched)
-- `POST /brokers/:id/reduce` — body `{ "amount": 50 }` (may go infinitely negative; touches neither current cash nor Cash from Brokers)
+
+There is **no `POST /brokers/:id/reduce`** any more. A balance is raised only by
+money the broker actually paid; it falls as policies are created and is
+recalculated from the starting balance and the broker's policies (see
+`PUT /brokers/:id/starting-balance`), so a hand-typed reduction would be undone
+by the next recalculation. `reduce` rows that already exist stay in
+`broker_balance_movements` as history: the balance history page still lists them
+and the recalculation ignores them.
 
 Admin-only (`role 1`) broker management:
 
