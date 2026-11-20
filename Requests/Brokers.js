@@ -2505,12 +2505,16 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   // window and ?page / ?pageSize control pagination.
   //
   // Each movement is returned with the live policy behind its BlancNumber (when
-  // there is one). An annulled policy's sale and refund rows are merged into the
-  // sale row, whose Amount becomes the annulment tax (the part kept), and the
-  // refund row is dropped - summing the two stored amounts keeps the balance and
-  // the net change unchanged. PolicyAnnulled / PolicyAnnulReason let the client
-  // tint that row exactly like the policy tables do. A movement with no live
-  // policy (manual top-ups, corrections) is untouched.
+  // there is one). A policy's "price_change" deltas are folded into its original
+  // sale row, so an edited price silently appears as the policy's current price;
+  // an annulled policy's refund is folded in the same way and the sale row shows
+  // the annulment tax (the part kept). The folded rows are dropped - summing the
+  // stored amounts keeps the balance and the net change unchanged. A policy that
+  // now belongs to another broker disappears from this broker's history: its
+  // sale and the cancellation written by the move are both dropped.
+  // PolicyAnnulled / PolicyAnnulReason let the client tint that row exactly like
+  // the policy tables do. A movement with no live policy (manual top-ups,
+  // corrections) is untouched.
   router.get(
     "/brokers/:id/history",
     auth,
@@ -2597,6 +2601,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         // already had to read all of its movements to price them.
         let allMovements;
         let currentBalance;
+        let isSubBrokerHistory = false;
 
         if (req.brokerScope !== null) {
           await attachSubBrokerStatus(DBConnection, [broker]);
@@ -2622,6 +2627,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             });
           }
           if (broker.IsSubBroker) {
+            isSubBrokerHistory = true;
             const disp = await computeSubBrokerDisplayData(
               DBConnection,
               brokerId
@@ -2653,6 +2659,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
                   ? Number(info.row.Annulled) === 1
                   : false,
                 PolicyAnnulReason: info ? info.row.AnnulReason ?? null : null,
+                // The display policy map only contains policies still owned by
+                // this sub-broker; a moved-away policy has no entry.
+                PolicyBrokerId: info ? brokerId : null,
               };
             });
             currentBalance = disp.displayCashBalance;
@@ -2664,7 +2673,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             `SELECT m.id, m.Type, m.Amount, m.Reason, m.Author,
                     m.BlancNumber, m.CreatedAt,
                     i.Annulled AS PolicyAnnulled,
-                    i.AnnulReason AS PolicyAnnulReason
+                    i.AnnulReason AS PolicyAnnulReason,
+                    i.BrokerId AS PolicyBrokerId
                FROM broker_balance_movements m
                LEFT JOIN insurance i
                  ON i.BlancNumber = m.BlancNumber AND i.Deleted = 0
@@ -2688,21 +2698,25 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               DisplayAmount: amount,
               PolicyAnnulled: Number(m.PolicyAnnulled) === 1,
               PolicyAnnulReason: m.PolicyAnnulReason ?? null,
+              PolicyBrokerId:
+                m.PolicyBrokerId === null || m.PolicyBrokerId === undefined
+                  ? null
+                  : Number(m.PolicyBrokerId),
             };
           });
           currentBalance =
             Math.round((Number(broker.CashBalance) || 0) * 100) / 100;
         }
 
-        // An annulled policy was charged in full when it was sold and then
-        // refunded when it was annulled. What the broker ultimately kept is the
-        // annulment tax, so its sale row is the one that should show it: add the
-        // refund to the sale and drop the refund row. Summing the two stored
-        // amounts (rather than reading AnnulFee) keeps any admin correction to
-        // either of them intact. The merged pair still adds up to exactly the
-        // same money as the two raw rows, so the final balance and the net
-        // change are unchanged - only the running balance is reinterpreted as
-        // the policy's effective cost.
+        // Price edits are stored as "price_change" deltas and an annulment as a
+        // separate refund. Neither is a movement the user wants to read: the
+        // original sale row should simply show the policy's current price (its
+        // annulment tax once annulled). Fold those deltas into the sale row and
+        // hide the rows, which keeps the money identical - only the running
+        // balance is reinterpreted as the policy's effective price.
+        // Summing the stored amounts (rather than reading Price/AnnulFee) keeps
+        // any admin correction to one of them intact. Manual increases, reduces,
+        // adjustments and hand-overs are never folded; they stay as they are.
         const hiddenMovements = new Set();
         const movementsByBlanc = new Map();
         for (const m of allMovements) {
@@ -2712,32 +2726,102 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           movementsByBlanc.get(key).push(m);
         }
         for (const group of movementsByBlanc.values()) {
-          // Only a policy that is annulled now is merged. If it was restored,
-          // or the refund was deleted from the history, the raw rows are the
-          // truth and must stay apart.
-          if (!group.some((m) => m.PolicyAnnulled)) continue;
           const policyRows = group.filter(
             (m) => String(m.Type ?? "").trim() === "policy"
           );
-          const annulmentRows = group.filter(
-            (m) => String(m.Type ?? "").trim() === "annulment"
-          );
-          if (policyRows.length === 0 || annulmentRows.length === 0) continue;
+          // Without a sale row there is nothing to fold into; leave the raw
+          // rows alone rather than losing their money.
+          if (policyRows.length === 0) continue;
 
-          const refund =
+          // A broker move writes a "Broker change ..." price_change on the OLD
+          // broker that cancels the sale. Once the policy belongs to another
+          // broker, its old rows are no longer part of this broker's history:
+          // drop them instead of leaving a zeroed sale behind. A move back keeps
+          // a later policy row here, so it is not treated as an old side.
+          const policyNet =
             Math.round(
-              annulmentRows.reduce((sum, m) => sum + m.DisplayAmount, 0) * 100
+              group.reduce((sum, m) => {
+                const type = String(m.Type ?? "").trim();
+                return type === "policy" ||
+                  type === "price_change" ||
+                  type === "annulment" ||
+                  type === "deletion"
+                  ? sum + m.DisplayAmount
+                  : sum;
+              }, 0) * 100
+            ) / 100;
+          const moveAwayRows = group.filter(
+            (m) =>
+              String(m.Type ?? "").trim() === "price_change" &&
+              String(m.Reason ?? "")
+                .trim()
+                .toLowerCase()
+                .startsWith("broker change")
+          );
+          if (moveAwayRows.length > 0) {
+            const ownedHere = group.some(
+              (m) =>
+                m.PolicyBrokerId !== null &&
+                m.PolicyBrokerId !== undefined &&
+                Number(m.PolicyBrokerId) === brokerId
+            );
+            const latestMoveAway = moveAwayRows.reduce((latest, m) => {
+              if (m.CreatedAt > latest.CreatedAt) return m;
+              if (m.CreatedAt === latest.CreatedAt && m.id > latest.id) return m;
+              return latest;
+            }, moveAwayRows[0]);
+            const laterPolicy = group.some(
+              (m) =>
+                String(m.Type ?? "").trim() === "policy" &&
+                m.CreatedAt > latestMoveAway.CreatedAt
+            );
+            // The display ledger of a sub-broker is derived from its current
+            // policy list, so hiding the old rows is what makes it add up; on a
+            // main broker only a net-zero policy group can disappear without
+            // changing the stored balance. Manual rows are never dropped.
+            const canDrop = isSubBrokerHistory || Math.abs(policyNet) < 0.005;
+            if (!ownedHere && !laterPolicy && canDrop) {
+              for (const m of group) {
+                const type = String(m.Type ?? "").trim();
+                if (
+                  type === "policy" ||
+                  type === "price_change" ||
+                  type === "annulment" ||
+                  type === "deletion"
+                ) {
+                  hiddenMovements.add(m);
+                }
+              }
+              continue;
+            }
+          }
+
+          // An annulled policy's refund is folded too, but a restored policy
+          // (Annulled = 0, with the historical refund still on the ledger) keeps
+          // its refund row - the raw rows are the truth again.
+          const annulled = group.some((m) => m.PolicyAnnulled);
+          const foldedRows = group.filter((m) => {
+            const type = String(m.Type ?? "").trim();
+            return (
+              type === "price_change" || (annulled && type === "annulment")
+            );
+          });
+          if (foldedRows.length === 0) continue;
+
+          const delta =
+            Math.round(
+              foldedRows.reduce((sum, m) => sum + m.DisplayAmount, 0) * 100
             ) / 100;
           // The original sale (oldest policy movement) is where the policy's
-          // effective price belongs.
+          // current price belongs.
           const target = policyRows.reduce((oldest, m) => {
             if (m.CreatedAt < oldest.CreatedAt) return m;
             if (m.CreatedAt === oldest.CreatedAt && m.id < oldest.id) return m;
             return oldest;
           }, policyRows[0]);
           target.DisplayAmount =
-            Math.round((target.DisplayAmount + refund) * 100) / 100;
-          for (const m of annulmentRows) hiddenMovements.add(m);
+            Math.round((target.DisplayAmount + delta) * 100) / 100;
+          for (const m of foldedRows) hiddenMovements.add(m);
         }
 
         const displayed = allMovements.filter((m) => !hiddenMovements.has(m));
