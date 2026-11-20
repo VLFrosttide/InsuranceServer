@@ -945,6 +945,104 @@ const BROKER_MOVEMENT_TABLE_SQL = `CREATE TABLE IF NOT EXISTS broker_balance_mov
 COMMENT='Every change to a broker CashBalance (signed Amount)'`;
 module.exports.BROKER_MOVEMENT_TABLE_SQL = BROKER_MOVEMENT_TABLE_SQL;
 
+// The balance a broker had BEFORE its first insurance was created. It is the
+// base of every figure on the balance history page: once an admin sets it, the
+// broker's CashBalance is recalculated from the insurances and the manual
+// movements that follow (see recalculateBrokerBalance below), so the stored
+// balance and the starting balance can never drift apart.
+//
+// One row per broker (BrokerId is the primary key); a broker without a row
+// simply has no starting balance yet. `EffectiveDate` is the date the starting
+// balance belongs to (normally the day before the broker's first insurance).
+const BROKER_STARTING_BALANCE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS broker_starting_balances (
+  BrokerId INT NOT NULL,
+  Amount DECIMAL(15,2) NOT NULL DEFAULT 0,
+  EffectiveDate DATE NOT NULL,
+  UpdatedBy VARCHAR(45) NOT NULL DEFAULT '',
+  UpdatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (BrokerId)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+COMMENT='The balance a broker had before its first insurance (recalculation base)'`;
+module.exports.BROKER_STARTING_BALANCE_TABLE_SQL =
+  BROKER_STARTING_BALANCE_TABLE_SQL;
+
+/**
+ * Recalculate a broker's CashBalance from its starting balance.
+ *
+ * The balance is rebuilt from the source data instead of trusting the ledger:
+ *
+ *   CashBalance = StartingBalance
+ *               + every manual payment on the ledger
+ *               - every live insurance of the broker
+ *
+ * An ACTIVE insurance is charged its price. An ANNULLED one is charged its
+ * annulment tax (`AnnulFee`; `Price` mirrors it since migration 018 and is the
+ * fallback for legacy rows without the mirror), because the refund gave the
+ * price back while the tax stayed on the broker.
+ *
+ * "Manual payment" means money the broker actually handed over: a branch
+ * top-up ("increase", bill payments included) or a hand-over to the owner
+ * ("handover"). Reductions ("reduce") and admin balance corrections ("adjust")
+ * are NOT payments and are no longer part of the formula: the balance is the
+ * starting point plus the policies, minus what the broker paid. The
+ * policy-derived rows ("policy", "annulment", "deletion", "price_change") are
+ * skipped for the same reason - the insurances above are the truth for those,
+ * so a policy moved to another broker, an edited price or a soft-deleted
+ * movement cannot leave a stale charge behind.
+ *
+ * Runs inside the caller's transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @param {number|string} startingAmount  the balance before the first insurance
+ * @returns {Promise<{balance: number, startingBalance: number,
+ *                    insuranceCharges: number, payments: number}>}
+ */
+const recalculateBrokerBalance = (module.exports.recalculateBrokerBalance =
+  async function recalculateBrokerBalance(conn, brokerId, startingAmount) {
+    const starting =
+      Math.round((toDecimal(startingAmount) || 0) * 100) / 100;
+
+    // Every live insurance of this broker, at its effective charge.
+    const [[chargedRow]] = await conn.query(
+      `SELECT COALESCE(SUM(
+                CASE WHEN Annulled = 1
+                     THEN CAST(COALESCE(AnnulFee, Price, 0) AS DECIMAL(15,2))
+                     ELSE CAST(COALESCE(Price, 0) AS DECIMAL(15,2))
+                END), 0) AS Charged
+         FROM insurance
+        WHERE BrokerId = ? AND Deleted = 0`,
+      [brokerId]
+    );
+
+    // The payments only: money the broker handed over, as a branch top-up
+    // ("increase") or straight to the owner ("handover"). A "reduce" or an
+    // "adjust" row is not a payment and must never shrink what the broker paid.
+    const [[paidRow]] = await conn.query(
+      `SELECT COALESCE(SUM(Amount), 0) AS Paid
+         FROM broker_balance_movements
+        WHERE BrokerId = ? AND Deleted = 0
+          AND Type IN ('increase', 'handover')`,
+      [brokerId]
+    );
+
+
+    const insuranceCharges =
+      Math.round((toDecimal(chargedRow && chargedRow.Charged) || 0) * 100) /
+      100;
+    const payments =
+      Math.round((toDecimal(paidRow && paidRow.Paid) || 0) * 100) / 100;
+    const balance =
+      Math.round((starting + payments - insuranceCharges) * 100) / 100;
+
+    await conn.query("UPDATE brokers SET CashBalance = ? WHERE id = ?", [
+      balance,
+      brokerId,
+    ]);
+
+    return { balance, startingBalance: starting, insuranceCharges, payments };
+  });
+
 /**
  * Insert one signed broker-balance movement. Runs inside the caller's
  * transaction (`conn`).
@@ -953,8 +1051,10 @@ module.exports.BROKER_MOVEMENT_TABLE_SQL = BROKER_MOVEMENT_TABLE_SQL;
  * @param {number} brokerId
  * @param {number|string} amount  signed delta (positive = increase)
  * @param {string} type  e.g. "policy" | "annulment" | "deletion" |
- *                       "price_change" | "increase" | "reduce" | "adjust" |
- *                       "handover"
+ *                       "price_change" | "increase" | "reduce" | "handover".
+ *                       "adjust" is legacy: the balance is calculated from the
+ *                       starting balance and the policies, never corrected by
+ *                       hand any more.
  * @param {{reason?: string, author?: string, blancNumber?: string,
  *          createdAt?: string, branch?: string, currency?: string}} [meta]
  *          `createdAt` is an already-resolved client-local
@@ -1455,6 +1555,51 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       });
     }
     return movementTableReady;
+  }
+
+  // The starting balance table is created on first use (and by db/setup.js), so
+  // the server also works on a database that has not been set up again yet.
+  let startingBalanceTableReady = null;
+  function ensureStartingBalanceTable() {
+    if (!startingBalanceTableReady) {
+      startingBalanceTableReady = Promise.resolve(
+        DBConnection.query(BROKER_STARTING_BALANCE_TABLE_SQL)
+      ).catch((err) => {
+        startingBalanceTableReady = null;
+        throw err;
+      });
+    }
+    return startingBalanceTableReady;
+  }
+
+  // A stored DATE comes back as a "YYYY-MM-DD" string (the pool sets
+  // dateStrings), but a Date is handled too so the shape never leaks out.
+  function toDateOnlyString(value) {
+    if (value === undefined || value === null || value === "") return null;
+    if (value instanceof Date) return toLocalDateTime(value).slice(0, 10);
+    return String(value).trim().slice(0, 10) || null;
+  }
+
+  // The broker's starting balance (the balance before its first insurance), or
+  // null when an admin has not set one yet. Shown on the balance history page.
+  async function loadStartingBalance(brokerId) {
+    await ensureStartingBalanceTable();
+    const [[row]] = await DBConnection.query(
+      `SELECT Amount, EffectiveDate, UpdatedBy, UpdatedAt
+         FROM broker_starting_balances
+        WHERE BrokerId = ?`,
+      [brokerId]
+    );
+    if (!row) return null;
+    return {
+      amount: Math.round((Number(row.Amount) || 0) * 100) / 100,
+      date: toDateOnlyString(row.EffectiveDate),
+      updatedBy: row.UpdatedBy || "",
+      updatedAt:
+        row.UpdatedAt instanceof Date
+          ? toLocalDateTime(row.UpdatedAt)
+          : row.UpdatedAt || null,
+    };
   }
 
   // Attach payment status to each broker row in place:
@@ -2624,6 +2769,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           return res.status(404).json({ error: "Broker not found" });
         }
 
+        // The balance before the broker's first insurance. Admins can set it on
+        // this page (PUT /brokers/:id/starting-balance); it is shown next to the
+        // movements so the whole history can be read from a known base.
+        const startingBalance = await loadStartingBalance(brokerId);
+
         const page = parsePositiveIntParam(req.query.page, 1);
         const pageSize = clampPageSize(
           parsePositiveIntParam(req.query.pageSize, 40)
@@ -2704,6 +2854,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               balanceAtStart: null,
               balanceAtEnd: null,
               netChange: null,
+              startingBalance: null,
               movements: [],
               includeDeleted: false,
               deleted: [],
@@ -2998,6 +3149,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           balanceAtStart,
           balanceAtEnd,
           netChange,
+          startingBalance,
           movements,
           includeDeleted,
           deleted,
@@ -3415,6 +3567,100 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     }
   );
 
+  // PUT /brokers/:id/starting-balance  { amount, date }
+  //
+  // Admin-only. Records the balance the broker had BEFORE its first insurance
+  // was created (the date says which day that balance belongs to; it defaults
+  // to today) and recalculates CashBalance from it:
+  //
+  //   CashBalance = starting balance
+  //               + manual payments (top-ups, hand-overs, expenses, corrections)
+  //               - every live insurance (an annulled one at its annulment tax)
+  //
+  // See recalculateBrokerBalance. Saving again simply replaces the stored
+  // starting balance and recalculates once more, so the figure can be repaired
+  // at any time. The history page shows it above the movements.
+  router.put(
+    "/brokers/:id/starting-balance",
+    auth,
+    requireRole(1),
+    async (req, res) => {
+      try {
+        const brokerId = parseBrokerId(req.params.id);
+        if (brokerId === null) {
+          return res.status(400).json({ error: "Invalid broker id" });
+        }
+
+        const rawAmount =
+          req.body?.amount ?? req.body?.Amount ?? req.body?.startingBalance;
+        const amount = toDecimal(rawAmount);
+        if (amount === null) {
+          return res.status(400).json({ error: "Amount must be a number" });
+        }
+
+        // The date is a plain calendar day: no timezone conversion applies, the
+        // client sends the day it means to record.
+        let date = toLocalDateTime(new Date()).slice(0, 10);
+        const rawDate = req.body?.date ?? req.body?.Date ?? req.body?.EffectiveDate;
+        if (rawDate !== undefined && rawDate !== null && String(rawDate).trim()) {
+          const s = String(rawDate).trim();
+          const parsed = new Date(`${s}T00:00:00`);
+          if (
+            !/^\d{4}-\d{2}-\d{2}$/.test(s) ||
+            Number.isNaN(parsed.getTime()) ||
+            // Rejects days that do not exist in that month (2026-02-31).
+            toLocalDateTime(parsed).slice(0, 10) !== s
+          ) {
+            return res.status(400).json({ error: "Date must be YYYY-MM-DD" });
+          }
+          date = s;
+        }
+
+        const [[broker]] = await DBConnection.query(
+          `SELECT ${BROKER_COLUMNS} FROM brokers WHERE id = ?`,
+          [brokerId]
+        );
+        if (!broker) {
+          return res.status(404).json({ error: "Broker not found" });
+        }
+
+        await ensureStartingBalanceTable();
+        const author = (req.user && req.user.username) || "";
+        const result = await DBConnection.withTransaction(async (conn) => {
+          await conn.query(
+            `INSERT INTO broker_starting_balances
+               (BrokerId, Amount, EffectiveDate, UpdatedBy)
+             VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE Amount = VALUES(Amount),
+                                     EffectiveDate = VALUES(EffectiveDate),
+                                     UpdatedBy = VALUES(UpdatedBy)`,
+            [brokerId, amount, date, author]
+          );
+          return recalculateBrokerBalance(conn, brokerId, amount);
+        });
+
+        res.json({
+          message: "Starting balance saved",
+          startingBalance: {
+            amount: result.startingBalance,
+            date,
+            updatedBy: author,
+          },
+          broker: {
+            id: brokerId,
+            Name: broker.Name,
+            CashBalance: result.balance,
+          },
+          insuranceCharges: result.insuranceCharges,
+          payments: result.payments,
+        });
+      } catch (err) {
+        console.error("Broker starting balance update failed:", err);
+        res.status(500).json({ error: "Failed to save the starting balance" });
+      }
+    }
+  );
+
   // POST /brokers/:id/handover  { amount, reason, currency, CreatedAt? }
   // The broker paid the OWNER directly. This is a payment on the broker's
   // account - their balance grows by the amount, exactly like a top-up - but
@@ -3546,6 +3792,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       const emails = parseBrokerEmails(req.body?.emails) || [];
 
       await ensureBatchTable();
+      // The balance a broker is created with IS its starting balance, so the
+      // row is written in the same transaction: the first recalculation
+      // (PUT /brokers/:id/starting-balance) then starts from the figure the
+      // admin created the broker with instead of from 0.
+      await ensureStartingBalanceTable();
 
       let brokerId;
       let conflict = null;
@@ -3580,6 +3831,24 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               [id, email]
             );
           }
+          // The creation balance becomes the starting balance, dated today (the
+          // server's local day - a broker has no client-stamped time of its
+          // own). A later PUT /brokers/:id/starting-balance replaces it and
+          // recalculates the balance.
+          await conn.query(
+            `INSERT INTO broker_starting_balances
+               (BrokerId, Amount, EffectiveDate, UpdatedBy)
+             VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE Amount = VALUES(Amount),
+                                     EffectiveDate = VALUES(EffectiveDate),
+                                     UpdatedBy = VALUES(UpdatedBy)`,
+            [
+              id,
+              cashBalance,
+              toLocalDateTime(new Date()).slice(0, 10),
+              (req.user && req.user.username) || "",
+            ]
+          );
           return id;
         });
       } catch (err) {
@@ -3614,40 +3883,36 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       }
 
       const [existing] = await DBConnection.query(
-        "SELECT id, CashBalance FROM brokers WHERE id = ?",
+        "SELECT id FROM brokers WHERE id = ?",
         [brokerId]
       );
       if (existing.length === 0) {
         return res.status(404).json({ error: "Broker not found" });
       }
-      const previousCashBalance = Number(existing[0].CashBalance);
 
       const b = req.body || {};
       const sets = [];
       const params = [];
-      let newCashBalance = null;
 
-      // Blanc ranges are no longer broker fields - they are managed as
+      // The balance is no longer a broker field: it is calculated from the
+      // starting balance, the broker's policies and the payments it made (see
+      // PUT /brokers/:id/starting-balance), so an admin cannot type one here
+      // and no "adjust" row is ever written. A CashBalance sent by an older
+      // client is ignored instead of failing the whole edit, so its Name, Code
+      // and emails still save.
+      //
+      // Blanc ranges are no longer broker fields either - they are managed as
       // batches (POST/PATCH/DELETE /brokers/:id/batches), and InactivePolicies
       // is calculated from them, so neither can be set here.
       const fieldMap = [
         ["Name", b.Name ?? b.name],
         ["Code", b.Code ?? b.code],
-        ["CashBalance", b.CashBalance ?? b.cashBalance],
       ];
 
       for (const [column, value] of fieldMap) {
         if (value === undefined || value === null) continue;
         let v;
-        if (column === "CashBalance") {
-          v = Number(value);
-          if (!Number.isFinite(v)) {
-            return res
-              .status(400)
-              .json({ error: "CashBalance must be a number" });
-          }
-          newCashBalance = v;
-        } else if (column === "Name") {
+        if (column === "Name") {
           v = String(value).trim();
           if (!v) {
             return res.status(400).json({ error: "Name cannot be empty" });
@@ -3705,10 +3970,6 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       }
 
       try {
-        const moveTime = resolveBrokerCreatedAt(req.body);
-        if (moveTime.error) {
-          return res.status(400).json({ error: moveTime.error });
-        }
         await DBConnection.withTransaction(async (conn) => {
           if (sets.length > 0) {
             params.push(brokerId);
@@ -3741,17 +4002,6 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               }
             } catch {
               // Ignore in minimal test mocks.
-            }
-          }
-          if (newCashBalance !== null) {
-            const delta =
-              Math.round((newCashBalance - previousCashBalance) * 100) / 100;
-            if (delta !== 0) {
-              await recordBrokerMovement(conn, brokerId, delta, "adjust", {
-                reason: "Balance adjusted",
-                author: req.user.username,
-                createdAt: moveTime.createdAt,
-              });
             }
           }
           if (emails !== null) {

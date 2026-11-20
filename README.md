@@ -470,8 +470,14 @@ Admin-only (`role 1`) broker management:
 
 - `GET /brokers/export?format=json|csv` — extract all brokers (with emails and
   linked insurance counts) as JSON or a downloadable CSV
-- `POST /brokers` — create a broker
-- `PATCH /brokers/:id` — update a broker's fields and/or its emails
+- `POST /brokers` — create a broker. The `CashBalance` it is created with is
+  stored as its starting balance (dated the creation day), so the first
+  recalculation starts from that figure instead of from 0
+- `PATCH /brokers/:id` — update a broker's fields and/or its emails. The balance
+  is NOT one of them any more: it is calculated (see
+  `PUT /brokers/:id/starting-balance`), so a `CashBalance` sent by an older
+  client is ignored instead of writing an `adjust` row, and its Name/Code/emails
+  still save
 - `DELETE /brokers/:id` — soft-delete a broker. The row is kept in `brokers`,
   flagged with `Deleted`/`DeletedAt`/`DeletedBy`, so its balance, blanc batches,
   emails, tariffs and linked policies are untouched; it is hidden from
@@ -480,6 +486,20 @@ Admin-only (`role 1`) broker management:
   are rejected, and its live email claims are evicted
 - `POST /brokers/:id/restore` — clear those flags, bringing the broker (with the
   balance and blancs it kept) back into every list
+- `PUT /brokers/:id/starting-balance` — body `{ "amount": 250, "date": "2026-01-31" }`.
+  Records the balance the broker had BEFORE its first insurance was created (the
+  `date` is the day that balance belongs to and defaults to today) and
+  recalculates `brokers.CashBalance` from the source data: the starting balance
+  plus every payment the broker made (a branch top-up, `increase`, and a
+  hand-over to the owner, `handover`) minus every live insurance of the broker,
+  an annulled one at its annulment tax. A `reduce` row (the retired "Reduce"
+  button) and a legacy `adjust` row are NOT payments and are ignored, as are the
+  policy-derived ledger rows - the insurances themselves are the truth for
+  those, so a policy moved to another broker, an edited price or a soft-deleted
+  movement cannot leave a stale charge behind. `GET /brokers/:id/history`
+  returns the stored figure as `startingBalance: { amount, date, updatedBy,
+  updatedAt }` (`null` until an admin sets one); the client shows it on the
+  balance history page and recalculates when it is saved.
 
 Each created insurance whose email sender is associated with a broker charges that broker a flat fee: the broker balance is reduced by the full Price (it may go infinitely negative, and this never touches current cash) and the broker InactivePolicies is decremented by 1.
 

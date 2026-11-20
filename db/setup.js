@@ -1017,6 +1017,23 @@ async function runSetup(config = {}) {
      COMMENT='Every change to a broker CashBalance (signed Amount)'
    `);
 
+  // The balance a broker had BEFORE its first insurance (the base the balance
+  // history page recalculates from, see recalculateBrokerBalance in
+  // Requests/Brokers.js). One row per broker; a broker without a row has no
+  // starting balance yet. The server creates it on first use as well, so a
+  // database that has not been set up again after the update still works.
+  await db.query(`
+     CREATE TABLE IF NOT EXISTS broker_starting_balances (
+       BrokerId INT NOT NULL,
+       Amount DECIMAL(15,2) NOT NULL DEFAULT 0,
+       EffectiveDate DATE NOT NULL,
+       UpdatedBy VARCHAR(45) NOT NULL DEFAULT '',
+       UpdatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+       PRIMARY KEY (BrokerId)
+     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+     COMMENT='The balance a broker had before its first insurance (recalculation base)'
+   `);
+
   // Cash from Brokers: the money brokers hand over when their balance is topped
   // up is kept apart from current cash (see Requests/CurrentCash.js). The
   // balance is computed from the top-ups in broker_balance_movements; this
