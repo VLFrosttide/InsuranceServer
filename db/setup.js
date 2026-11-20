@@ -968,6 +968,7 @@ async function runSetup(config = {}) {
        RangeStart BIGINT UNSIGNED NOT NULL,
        RangeEnd BIGINT UNSIGNED NOT NULL,
        CreatedBy VARCHAR(45) NOT NULL DEFAULT '',
+       AutoAdded TINYINT(1) NOT NULL DEFAULT 0,
        CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
        PRIMARY KEY (id),
        KEY idx_broker_blanc_batches_broker (BrokerId),
@@ -975,6 +976,22 @@ async function runSetup(config = {}) {
      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
      COMMENT='Blanc number ranges handed to brokers (one row per batch)'
    `);
+
+  // A blanc forced in outside every handed-out range joins the broker's batches
+  // as its own one-number batch; AutoAdded marks it, so the client paints it
+  // pink. Databases created before that column existed get it here.
+  {
+    const [batchCols] = await db.query(
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+      [DB_NAME, "broker_blanc_batches"]
+    );
+    if (!batchCols.some((c) => c.COLUMN_NAME === "AutoAdded")) {
+      await db.query(
+        "ALTER TABLE broker_blanc_batches ADD COLUMN AutoAdded TINYINT(1) NOT NULL DEFAULT 0"
+      );
+      console.log("Added broker_blanc_batches.AutoAdded column");
+    }
+  }
 
   // Ledger of every change to a broker's CashBalance (signed Amount), so the
   // website can show each broker's balance movement per bi-weekly period.

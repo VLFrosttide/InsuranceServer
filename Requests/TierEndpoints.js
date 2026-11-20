@@ -22,6 +22,8 @@ const { recordCardPayment, reduceCardBalance } = require("./CardPayments.js");
 const {
   resolveBrokerByEmail,
   blancInBrokerBatches,
+  findOtherBrokerWithBlanc,
+  addAutoBlancBatch,
   decreaseBrokerForInsurance,
   restoreBrokerForAnnulment,
   restoreBrokerForDeletion,
@@ -190,6 +192,67 @@ async function rejectIfBlancOutsideBrokerBatches(
     code: "BLANC_OUTSIDE_BROKER_BATCHES",
   });
   return true;
+}
+
+/**
+ * Reject a blanc that is already inside ANOTHER broker's blanc batches.
+ *
+ * A blanc belongs to exactly one broker: the batches never overlap, so a blanc
+ * handed to broker A cannot be written on for broker B (the blanc would be
+ * counted as used in A's batch and B would have no blanc left). Unlike a blanc
+ * that is in no batch at all, this is NOT overridable: the error names the
+ * broker that holds the blanc and the policy is not saved until the user
+ * changes the blanc number. Returns true when the response was sent and the
+ * create must be aborted.
+ *
+ * @param {import("express").Response} res
+ * @param {{query: Function}} conn
+ * @param {number|null} brokerId
+ * @param {any} blancNumber
+ * @returns {Promise<boolean>}
+ */
+async function rejectIfBlancBelongsToAnotherBroker(
+  res,
+  conn,
+  brokerId,
+  blancNumber
+) {
+  if (brokerId === null) return false;
+  if (typeof findOtherBrokerWithBlanc !== "function") return false;
+  const owner = await findOtherBrokerWithBlanc(conn, brokerId, blancNumber);
+  if (!owner) return false;
+  const name = owner.name || `#${owner.id}`;
+  res.status(422).json({
+    error: `This blanc number belongs to another broker's blanc batches (${name})`,
+    code: "BLANC_BELONGS_TO_ANOTHER_BROKER",
+    brokerId: owner.id,
+    brokerName: owner.name || "",
+  });
+  return true;
+}
+
+/**
+ * A broker-linked policy that the user chose to create anyway ("create
+ * anyway") may carry a blanc outside every handed-out range. That blanc is
+ * added to the broker's batches as its own one-number batch flagged AutoAdded,
+ * so it is no longer an invisible exception: the client paints such batches
+ * pink. Runs inside the caller's transaction; a blanc that is already covered
+ * (or is not a whole number) adds nothing.
+ *
+ * @param {{query: Function}} conn  transaction connection
+ * @param {number|null} brokerId
+ * @param {any} blancNumber
+ * @param {object} body             Request body (carries the force flag).
+ * @param {string} [author]         Username of the user forcing the policy.
+ * @returns {Promise<boolean>} true when a batch row was added.
+ */
+async function addForcedBlancToBrokerBatches(conn, brokerId, blancNumber, body, author) {
+  if (brokerId === null) return false;
+  if (!toFlag(body?.ForceOutsideBlancBatch ?? body?.forceOutsideBlancBatch)) {
+    return false;
+  }
+  if (typeof addAutoBlancBatch !== "function") return false;
+  return addAutoBlancBatch(conn, brokerId, blancNumber, author);
 }
 
 /**
@@ -921,6 +984,20 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         return;
       }
 
+      // A blanc that is already in ANOTHER broker's batches can never be used
+      // here, and "create anyway" does not override it: the error names that
+      // broker and the policy is not saved until the blanc is changed.
+      if (
+        await rejectIfBlancBelongsToAnotherBroker(
+          res,
+          DBConnection,
+          brokerId,
+          blancNumber
+        )
+      ) {
+        return;
+      }
+
       if (
         await rejectIfBlancOutsideBrokerBatches(
           res,
@@ -936,6 +1013,15 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       const priceDecimal = toDecimal(price);
 
       await DBConnection.withTransaction(async (conn) => {
+        // A blanc forced in outside the broker's batches (the user confirmed
+        // "create anyway") joins those batches, so it stays visible there.
+        await addForcedBlancToBrokerBatches(
+          conn,
+          brokerId,
+          blancNumber,
+          b,
+          req.user.username
+        );
         await conn.query(
           `INSERT INTO insurance
               (Author, CreationDate, PolicyNumber, BlancNumber, CarNumber, Price,
@@ -1426,6 +1512,20 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         return;
       }
 
+      // A blanc that is already in ANOTHER broker's batches can never be used
+      // here, and "create anyway" does not override it: the error names that
+      // broker and the policy is not saved until the blanc is changed.
+      if (
+        await rejectIfBlancBelongsToAnotherBroker(
+          res,
+          DBConnection,
+          brokerId,
+          blancNumber
+        )
+      ) {
+        return;
+      }
+
       if (
         await rejectIfBlancOutsideBrokerBatches(
           res,
@@ -1479,6 +1579,15 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
       let replyError = null;
       await DBConnection.withTransaction(async (conn) => {
+        // A blanc forced in outside the broker's batches (the worker confirmed
+        // "create anyway") joins those batches, so it stays visible there.
+        await addForcedBlancToBrokerBatches(
+          conn,
+          brokerId,
+          blancNumber,
+          b,
+          req.user.username
+        );
 
         await conn.query(
           `INSERT INTO insurance

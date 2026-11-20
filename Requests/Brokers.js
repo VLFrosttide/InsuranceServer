@@ -42,6 +42,15 @@
 // broker and not across brokers - so a blanc belongs to at most one batch.
 // The legacy brokers.PolicyRangeStart / PolicyRangeEnd / InactivePolicies
 // columns are no longer read or maintained.
+//
+// A blanc that a user chose to write on anyway, although it is outside every
+// handed-out batch, is added to that broker's batches as its own one-number
+// batch with AutoAdded = 1 (see addAutoBlancBatch). Such a batch was never
+// handed out by an admin, so the client paints it pink and it stands out in the
+// batch lists instead of the blanc silently living outside the batches. An
+// admin editing that batch's range adopts it: AutoAdded is cleared and the pink
+// goes away. A blanc that is already inside another broker's batch is never
+// adopted - the create is refused with a message naming that broker.
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
@@ -164,6 +173,75 @@ const blancInBrokerBatches = (module.exports.blancInBrokerBatches =
       [brokerId, numeric, numeric]
     );
     return rows.length > 0;
+  });
+
+/**
+ * The OTHER broker whose blanc batches already contain `blancNumber`, if any.
+ *
+ * A blanc may belong to only one broker: batches never overlap, and a blanc
+ * handed to broker A must never be written on for broker B. This lookup lets
+ * the create endpoints refuse such a blanc with a message naming the broker
+ * that holds it, instead of silently overlapping the two brokers' batches.
+ *
+ * @param {{query: Function}} conn
+ * @param {number} brokerId  The broker the policy is being written for.
+ * @param {any} blancNumber
+ * @returns {Promise<{id: number, name: string}|null>}
+ */
+const findOtherBrokerWithBlanc = (module.exports.findOtherBrokerWithBlanc =
+  async function findOtherBrokerWithBlanc(conn, brokerId, blancNumber) {
+    const numeric = parseInt(String(blancNumber ?? "").trim(), 10);
+    if (!Number.isFinite(numeric)) return null;
+    const [rows] = await conn.query(
+      `SELECT bb.BrokerId AS id, br.Name AS name
+         FROM broker_blanc_batches bb
+         LEFT JOIN brokers br ON br.id = bb.BrokerId
+        WHERE bb.BrokerId <> ? AND bb.RangeStart <= ? AND bb.RangeEnd >= ?
+        ORDER BY bb.id
+        LIMIT 1`,
+      [brokerId, numeric, numeric]
+    );
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    return {
+      id: Number(rows[0].id),
+      name: rows[0].name === undefined || rows[0].name === null ? "" : String(rows[0].name),
+    };
+  });
+
+/**
+ * Add ONE blanc to a broker's batches. Used when a policy is force-created with
+ * a blanc outside every handed-out batch ("create anyway"): the blanc becomes
+ * its own one-number batch flagged AutoAdded, so it is part of the broker's
+ * batches and the client can paint it pink to show it was never handed out.
+ *
+ * Nothing is written when the broker id is invalid, the blanc is not a whole
+ * number (a range can only hold numbers), the blanc already belongs to one of
+ * the broker's batches or it belongs to ANOTHER broker (that is a hard error
+ * reported by the create endpoints, never an automatic batch here).
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @param {any} blancNumber
+ * @param {string} [author] Username of the user who forced the policy.
+ * @returns {Promise<boolean>} true when a batch row was added.
+ */
+const addAutoBlancBatch = (module.exports.addAutoBlancBatch =
+  async function addAutoBlancBatch(conn, brokerId, blancNumber, author) {
+    const id = Number(brokerId);
+    if (!Number.isInteger(id) || id <= 0) return false;
+    const raw = String(blancNumber ?? "").trim();
+    if (!/^\d+$/.test(raw)) return false;
+    const numeric = Number(raw);
+    if (!Number.isSafeInteger(numeric)) return false;
+    if (await blancInBrokerBatches(conn, id, raw)) return false;
+    if (await findOtherBrokerWithBlanc(conn, id, raw)) return false;
+    await conn.query(
+      `INSERT INTO broker_blanc_batches
+         (BrokerId, RangeStart, RangeEnd, CreatedBy, AutoAdded)
+       VALUES (?, ?, ?, ?, 1)`,
+      [id, numeric, numeric, String(author || "")]
+    );
+    return true;
   });
 
 /**
@@ -979,6 +1057,7 @@ const BLANC_BATCH_TABLE_SQL = `CREATE TABLE IF NOT EXISTS broker_blanc_batches (
   RangeStart BIGINT UNSIGNED NOT NULL,
   RangeEnd BIGINT UNSIGNED NOT NULL,
   CreatedBy VARCHAR(45) NOT NULL DEFAULT '',
+  AutoAdded TINYINT(1) NOT NULL DEFAULT 0,
   CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_broker_blanc_batches_broker (BrokerId),
@@ -1181,6 +1260,9 @@ const summarizeBlancBatches = (module.exports.summarizeBlancBatches =
         RangeEnd: end,
         CreatedBy: r.CreatedBy ?? "",
         CreatedAt: r.CreatedAt ?? null,
+        // true when the blanc was forced in outside every handed-out range and
+        // joined the batches automatically (painted pink by the client).
+        AutoAdded: Boolean(Number(r.AutoAdded ?? 0)),
         Total: total,
         Used: used,
         Inactive: total - used,
@@ -1240,6 +1322,7 @@ const loadBlancBatchRows = (module.exports.loadBlancBatchRows =
     const hasBroker = brokerId !== undefined && brokerId !== null;
     const [rows] = await db.query(
       `SELECT b.id, b.BrokerId, b.RangeStart, b.RangeEnd, b.CreatedBy, b.CreatedAt,
+              b.AutoAdded,
               (SELECT COUNT(DISTINCT CAST(TRIM(i.BlancNumber) AS UNSIGNED))
                  FROM insurance i
                 WHERE TRIM(i.BlancNumber) REGEXP '^[0-9]+$'
@@ -3962,7 +4045,10 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             return;
           }
           await conn.query(
-            "UPDATE broker_blanc_batches SET RangeStart = ?, RangeEnd = ? WHERE id = ?",
+            // An admin correcting the range takes the batch over: it is no
+            // longer an automatically added one, so the client stops painting
+            // it pink.
+            "UPDATE broker_blanc_batches SET RangeStart = ?, RangeEnd = ?, AutoAdded = 0 WHERE id = ?",
             [batch.RangeStart, batch.RangeEnd, batchId]
           );
         });
