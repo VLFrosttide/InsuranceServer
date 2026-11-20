@@ -2503,6 +2503,14 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   // way back to the broker's first movement, so the whole balance can be walked
   // back day by day. Optional ?since / ?until (YYYY-MM-DD[ HH:MM:SS]) narrow the
   // window and ?page / ?pageSize control pagination.
+  //
+  // Each movement is returned with the live policy behind its BlancNumber (when
+  // there is one). An annulled policy's sale and refund rows are merged into the
+  // sale row, whose Amount becomes the annulment tax (the part kept), and the
+  // refund row is dropped - summing the two stored amounts keeps the balance and
+  // the net change unchanged. PolicyAnnulled / PolicyAnnulReason let the client
+  // tint that row exactly like the policy tables do. A movement with no live
+  // policy (manual top-ups, corrections) is untouched.
   router.get(
     "/brokers/:id/history",
     auth,
@@ -2581,6 +2589,15 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           }
         }
 
+        // Read the broker's whole live ledger first, not just the page or the
+        // requested window: an annulled policy's sale and refund rows have to be
+        // merged wherever they fall, so a window containing only one of them
+        // still shows the effective price and the running balance stays right.
+        // A broker's ledger is small enough for this, and the sub-broker path
+        // already had to read all of its movements to price them.
+        let allMovements;
+        let currentBalance;
+
         if (req.brokerScope !== null) {
           await attachSubBrokerStatus(DBConnection, [broker]);
           if (broker.hidePricing) {
@@ -2609,58 +2626,21 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               DBConnection,
               brokerId
             );
-            const [allMovs] = await DBConnection.query(
+            const [rows] = await DBConnection.query(
               `SELECT id, Type, Amount, Reason, Author, BlancNumber, CreatedAt
                  FROM broker_balance_movements
-                WHERE BrokerId = ?
-                  AND CreatedAt >= ?
-                  AND CreatedAt < ?
-                  AND Deleted = 0
+                WHERE BrokerId = ? AND Deleted = 0
                 ORDER BY CreatedAt DESC, id DESC`,
-              [brokerId, since, until]
+              [brokerId]
             );
-            const mappedAll = (allMovs || []).map((m) => ({
-              ...m,
-              DisplayAmount: disp.mapMovementAmount(m),
-            }));
-            const totalSub = mappedAll.length;
-            const netChangeSub =
-              Math.round(
-                mappedAll.reduce((s, m) => s + m.DisplayAmount, 0) * 100
-              ) / 100;
-            const currentBalanceSub = disp.displayCashBalance;
-            // The display balance is as of NOW, so the balance at the end of the
-            // requested window is found by taking out every movement made after
-            // it. Without this a past window would repeat today's balance on
-            // every day instead of the balance the broker had back then.
-            const [afterMovs] = await DBConnection.query(
-              `SELECT id, Type, Amount, Reason, Author, BlancNumber, CreatedAt
-                 FROM broker_balance_movements
-                WHERE BrokerId = ? AND CreatedAt >= ? AND Deleted = 0`,
-              [brokerId, until]
-            );
-            const afterNetSub =
-              Math.round(
-                (afterMovs || []).reduce(
-                  (sum, m) => sum + disp.mapMovementAmount(m),
-                  0
-                ) * 100
-              ) / 100;
-            const balanceAtEndSub =
-              Math.round((currentBalanceSub - afterNetSub) * 100) / 100;
-            const balanceAtStartSub =
-              Math.round((balanceAtEndSub - netChangeSub) * 100) / 100;
-            const totalPagesSub = Math.max(1, Math.ceil(totalSub / pageSize));
-            const offsetSub = (page - 1) * pageSize;
-
-            let runningAfter = balanceAtEndSub;
-            const withAfter = mappedAll.map((m) => {
-              const balAfter = Math.round(runningAfter * 100) / 100;
-              runningAfter -= m.DisplayAmount;
+            allMovements = (rows || []).map((m) => {
+              const info = disp.policyByBlanc.get(
+                String(m.BlancNumber ?? "").trim()
+              );
               return {
                 id: m.id,
                 Type: m.Type,
-                Amount: m.DisplayAmount,
+                Amount: Math.round((Number(m.Amount) || 0) * 100) / 100,
                 Reason: m.Reason,
                 Author: m.Author,
                 BlancNumber: m.BlancNumber,
@@ -2668,97 +2648,145 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
                   m.CreatedAt instanceof Date
                     ? toLocalDateTime(m.CreatedAt)
                     : m.CreatedAt,
-                BalanceAfter: balAfter,
+                DisplayAmount: disp.mapMovementAmount(m),
+                PolicyAnnulled: info
+                  ? Number(info.row.Annulled) === 1
+                  : false,
+                PolicyAnnulReason: info ? info.row.AnnulReason ?? null : null,
               };
             });
-
-            return res.json({
-              broker: {
-                id: broker.id,
-                Name: broker.Name,
-                CashBalance: currentBalanceSub,
-              },
-              since,
-              until,
-              page,
-              pageSize,
-              total: totalSub,
-              totalPages: totalPagesSub,
-              balanceAtStart: balanceAtStartSub,
-              balanceAtEnd: balanceAtEndSub,
-              netChange: netChangeSub,
-              movements: withAfter.slice(offsetSub, offsetSub + pageSize),
-              includeDeleted: false,
-              deleted: [],
-            });
+            currentBalance = disp.displayCashBalance;
           }
         }
 
-        const [[stats]] = await DBConnection.query(
-          `SELECT COUNT(*) AS total, COALESCE(SUM(Amount), 0) AS net
-             FROM broker_balance_movements
-            WHERE BrokerId = ? AND CreatedAt >= ? AND CreatedAt < ?
-              AND Deleted = 0`,
-          [brokerId, since, until]
-        );
+        if (!allMovements) {
+          const [rows] = await DBConnection.query(
+            `SELECT m.id, m.Type, m.Amount, m.Reason, m.Author,
+                    m.BlancNumber, m.CreatedAt,
+                    i.Annulled AS PolicyAnnulled,
+                    i.AnnulReason AS PolicyAnnulReason
+               FROM broker_balance_movements m
+               LEFT JOIN insurance i
+                 ON i.BlancNumber = m.BlancNumber AND i.Deleted = 0
+              WHERE m.BrokerId = ? AND m.Deleted = 0
+              ORDER BY m.CreatedAt DESC, m.id DESC`,
+            [brokerId]
+          );
+          allMovements = (rows || []).map((m) => {
+            const amount = Math.round((Number(m.Amount) || 0) * 100) / 100;
+            return {
+              id: m.id,
+              Type: m.Type,
+              Amount: amount,
+              Reason: m.Reason,
+              Author: m.Author,
+              BlancNumber: m.BlancNumber,
+              CreatedAt:
+                m.CreatedAt instanceof Date
+                  ? toLocalDateTime(m.CreatedAt)
+                  : m.CreatedAt,
+              DisplayAmount: amount,
+              PolicyAnnulled: Number(m.PolicyAnnulled) === 1,
+              PolicyAnnulReason: m.PolicyAnnulReason ?? null,
+            };
+          });
+          currentBalance =
+            Math.round((Number(broker.CashBalance) || 0) * 100) / 100;
+        }
 
-        const total = Number(stats.total) || 0;
-        const netChange =
-          Math.round((Number(stats.net) || 0) * 100) / 100;
-        const currentBalance =
-          Math.round((Number(broker.CashBalance) || 0) * 100) / 100;
-        // The stored CashBalance is the balance as of NOW, so the balance at the
-        // end of the requested window is today's balance without everything that
-        // happened after it. Seeding the running column with today's balance
-        // instead made every past window show the same (current) figure, so
-        // walking the date back never changed the balance.
-        const [[afterStats]] = await DBConnection.query(
-          `SELECT COALESCE(SUM(Amount), 0) AS net
-             FROM broker_balance_movements
-            WHERE BrokerId = ? AND CreatedAt >= ? AND Deleted = 0`,
-          [brokerId, until]
+        // An annulled policy was charged in full when it was sold and then
+        // refunded when it was annulled. What the broker ultimately kept is the
+        // annulment tax, so its sale row is the one that should show it: add the
+        // refund to the sale and drop the refund row. Summing the two stored
+        // amounts (rather than reading AnnulFee) keeps any admin correction to
+        // either of them intact. The merged pair still adds up to exactly the
+        // same money as the two raw rows, so the final balance and the net
+        // change are unchanged - only the running balance is reinterpreted as
+        // the policy's effective cost.
+        const hiddenMovements = new Set();
+        const movementsByBlanc = new Map();
+        for (const m of allMovements) {
+          const key = String(m.BlancNumber ?? "").trim();
+          if (!key) continue;
+          if (!movementsByBlanc.has(key)) movementsByBlanc.set(key, []);
+          movementsByBlanc.get(key).push(m);
+        }
+        for (const group of movementsByBlanc.values()) {
+          // Only a policy that is annulled now is merged. If it was restored,
+          // or the refund was deleted from the history, the raw rows are the
+          // truth and must stay apart.
+          if (!group.some((m) => m.PolicyAnnulled)) continue;
+          const policyRows = group.filter(
+            (m) => String(m.Type ?? "").trim() === "policy"
+          );
+          const annulmentRows = group.filter(
+            (m) => String(m.Type ?? "").trim() === "annulment"
+          );
+          if (policyRows.length === 0 || annulmentRows.length === 0) continue;
+
+          const refund =
+            Math.round(
+              annulmentRows.reduce((sum, m) => sum + m.DisplayAmount, 0) * 100
+            ) / 100;
+          // The original sale (oldest policy movement) is where the policy's
+          // effective price belongs.
+          const target = policyRows.reduce((oldest, m) => {
+            if (m.CreatedAt < oldest.CreatedAt) return m;
+            if (m.CreatedAt === oldest.CreatedAt && m.id < oldest.id) return m;
+            return oldest;
+          }, policyRows[0]);
+          target.DisplayAmount =
+            Math.round((target.DisplayAmount + refund) * 100) / 100;
+          for (const m of annulmentRows) hiddenMovements.add(m);
+        }
+
+        const displayed = allMovements.filter((m) => !hiddenMovements.has(m));
+        const windowRows = displayed.filter(
+          (m) => m.CreatedAt >= since && m.CreatedAt < until
         );
-        const balanceAtEnd =
+        const total = windowRows.length;
+        const netChange =
           Math.round(
-            (currentBalance - (Number(afterStats.net) || 0)) * 100
+            windowRows.reduce((sum, m) => sum + m.DisplayAmount, 0) * 100
           ) / 100;
+        // The displayed balance is as of NOW too, so the balance at the end of
+        // the window is today's figure without everything displayed after it.
+        const afterNet =
+          Math.round(
+            displayed.reduce(
+              (sum, m) =>
+                m.CreatedAt >= until ? sum + m.DisplayAmount : sum,
+              0
+            ) * 100
+          ) / 100;
+        const balanceAtEnd =
+          Math.round((currentBalance - afterNet) * 100) / 100;
         const balanceAtStart =
           Math.round((balanceAtEnd - netChange) * 100) / 100;
         const totalPages = Math.max(1, Math.ceil(total / pageSize));
         const offset = (page - 1) * pageSize;
 
-        const [movementRows] = await DBConnection.query(
-          `SELECT t.id, t.Type, t.Amount, t.Reason, t.Author,
-                  t.BlancNumber, t.CreatedAt, t.BalanceAfter
-             FROM (
-               SELECT m.id, m.Amount, m.Type, m.Reason, m.Author,
-                      m.BlancNumber, m.CreatedAt,
-                      (? - COALESCE(SUM(m.Amount) OVER (
-                         ORDER BY m.CreatedAt DESC, m.id DESC
-                         ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-                       ), 0)) AS BalanceAfter
-                 FROM broker_balance_movements m
-                WHERE m.BrokerId = ?
-                  AND m.CreatedAt >= ?
-                  AND m.CreatedAt < ?
-                  AND m.Deleted = 0
-             ) t
-            ORDER BY t.CreatedAt DESC, t.id DESC
-            LIMIT ? OFFSET ?`,
-          [balanceAtEnd, brokerId, since, until, pageSize, offset]
+        let running = balanceAtEnd;
+        const movementsWithBalance = windowRows.map((m) => {
+          const balAfter = Math.round(running * 100) / 100;
+          running = Math.round((running - m.DisplayAmount) * 100) / 100;
+          return {
+            id: m.id,
+            Type: m.Type,
+            Amount: m.DisplayAmount,
+            Reason: m.Reason,
+            Author: m.Author,
+            BlancNumber: m.BlancNumber,
+            CreatedAt: m.CreatedAt,
+            BalanceAfter: balAfter,
+            PolicyAnnulled: m.PolicyAnnulled,
+            PolicyAnnulReason: m.PolicyAnnulReason,
+          };
+        });
+        const movements = movementsWithBalance.slice(
+          offset,
+          offset + pageSize
         );
-
-        const movements = movementRows.map((r) => ({
-          id: r.id,
-          Type: r.Type,
-          Amount: Math.round((Number(r.Amount) || 0) * 100) / 100,
-          Reason: r.Reason,
-          Author: r.Author,
-          BlancNumber: r.BlancNumber,
-          CreatedAt:
-            r.CreatedAt instanceof Date ? toLocalDateTime(r.CreatedAt) : r.CreatedAt,
-          BalanceAfter: Math.round((Number(r.BalanceAfter) || 0) * 100) / 100,
-        }));
 
         // Soft-deleted movements are excluded from the live running balance but
         // kept in the database, so an admin can still list and restore them.
