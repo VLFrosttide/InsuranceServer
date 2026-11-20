@@ -3494,9 +3494,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   //     it is removed from the Broker part of Total cash, and the blanc is
   //     given back to the broker (a deleted policy no longer counts as using
   //     a blanc of its batch).
-  // If the policy was annulled first, the annulment already refunded part of
-  // the money; only what is still counted (the kept annulment fee) is removed,
-  // and the broker is not refunded a second time - but the blanc is restored.
+  // If the policy was annulled first, the annulment already refunded its price;
+  // only what is still counted (the kept annulment fee) is removed, and the
+  // broker gets that fee back when the broker had paid it - so a deleted policy
+  // never leaves a charge behind. The blanc is restored.
   router.delete(
     "/insurances/:blancNumber",
     auth,
@@ -3525,8 +3526,20 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const counted = insurance.Annulled
           ? toDecimal(insurance.AnnulFee) || 0
           : price;
-        const brokerRefund =
-          isBrokerLinked(insurance) && !insurance.Annulled ? price : 0;
+        // What the deletion refunded to the broker. A live policy gives back its
+        // full price. An annulled policy already refunded its price; only the
+        // annulment fee it kept is still charged, and only when the BROKER paid
+        // it (a worker/no-fault annulment refunded the full price already).
+        const annulReason = String(insurance.AnnulReason ?? "")
+          .trim()
+          .toLowerCase();
+        const brokerRefund = isBrokerLinked(insurance)
+          ? insurance.Annulled
+            ? annulReason === "broker"
+              ? toDecimal(insurance.AnnulFee) || price
+              : 0
+            : price
+          : 0;
 
         const moveTime = resolveMoveCreatedAt(req.body);
         if (moveTime.error) {
@@ -3599,8 +3612,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   //   - Walk-in (Cash/Card): the amount the deletion removed is added back to
   //     current cash / the card balance and to Total cash.
   //   - Broker (email): the price the deletion refunded is charged back to the
-  //     broker's balance, it is added back to the Broker part of Total cash,
-  //     and the policy's blanc counts as used again (Deleted = 0).
+  //     broker's balance (for an annulled policy, only the annulment fee the
+  //     deletion refunded, when the broker had paid it), it is added back to the
+  //     Broker part of Total cash, and the policy's blanc counts as used again
+  //     (Deleted = 0).
   // Admin-only; a policy can only be restored while it is deleted.
   router.post(
     "/insurances/:blancNumber/restore",
@@ -3630,10 +3645,19 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const counted = insurance.Annulled
           ? toDecimal(insurance.AnnulFee) || 0
           : price;
-        // What the deletion refunded to the broker: the full price for a
-        // non-annulled broker policy, nothing for an annulled one.
-        const brokerCharge =
-          isBrokerLinked(insurance) && !insurance.Annulled ? price : 0;
+        // What restoring charges the broker: the full price for a live policy,
+        // or - for a policy annulled before it was deleted - the annulment fee
+        // the deletion refunded, and only when the BROKER paid it.
+        const annulReason = String(insurance.AnnulReason ?? "")
+          .trim()
+          .toLowerCase();
+        const brokerCharge = isBrokerLinked(insurance)
+          ? insurance.Annulled
+            ? annulReason === "broker"
+              ? toDecimal(insurance.AnnulFee) || price
+              : 0
+            : price
+          : 0;
 
         const moveTime = resolveMoveCreatedAt(req.body);
         if (moveTime.error) {

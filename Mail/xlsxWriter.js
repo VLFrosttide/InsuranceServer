@@ -13,7 +13,7 @@
 //                string                            -> text cell
 //                { value: number, style: "money" } -> number shown as 0.00
 //                { value: number, style: "date" }  -> Excel date serial shown
-//                                                     as dd.mm.yyyy hh:mm
+//                                                     as dd-mm-yyyy hh:mm
 //
 // The bills are the only user of this: a broker gets a real .xlsx file that
 // Excel, LibreOffice and Google Sheets open without a format warning.
@@ -269,11 +269,11 @@ function buildXlsxFile({ sheetName: name, columns, rows, widths } = {}) {
 
 
   // cellXfs indexes must match XLSX_STYLE: 1 = bold header, 2 = "0.00",
-  // 3 = "dd.mm.yyyy hh:mm".
+  // 3 = "dd-mm-yyyy hh:mm".
   const stylesXml =
     XML_HEAD +
     `<styleSheet xmlns="${NS_MAIN}">` +
-    `<numFmts count="1"><numFmt numFmtId="164" formatCode="dd.mm.yyyy hh:mm"/></numFmts>` +
+    `<numFmts count="1"><numFmt numFmtId="164" formatCode="dd-mm-yyyy hh:mm"/></numFmts>` +
     `<fonts count="2">` +
     `<font><sz val="11"/><name val="Calibri"/><family val="2"/></font>` +
     `<font><b/><sz val="11"/><name val="Calibri"/><family val="2"/></font>` +

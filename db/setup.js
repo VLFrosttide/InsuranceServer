@@ -1342,12 +1342,57 @@ async function runSetup(config = {}) {
     console.log("Backfilled broker_balance_movements from existing insurances");
   }
 
-  // ---------------------------------------------------------------------------
-  // Client diagnostics: failed requests captured on the PCs (403s and the first
-  // recovery after them), uploaded when the client can reach the API again.
-  // Rows are kept until an admin explicitly deletes them from the Diagnostics
-  // tab, so an incident can be investigated days later.
-  // ---------------------------------------------------------------------------
+  // Re-apply the broker balance formula on every start for every broker that
+  // has a starting balance (see recalculateBrokerBalance in
+  // Requests/Brokers.js):
+  //
+  //   CashBalance = starting balance
+  //               + increase/handover payments
+  //               - live policies (an annulled one at its tax ONLY when the
+  //                 broker paid it, AnnulReason = 'broker')
+  //
+  // This makes a corrected rule reach brokers whose balance was stored under an
+  // older one (e.g. the annulment tax charged even when the worker paid it).
+  // Brokers without a starting balance keep their stored figure: that is the
+  // only base they have. The statement is idempotent and runs only on brokers
+  // with a stored starting balance.
+  try {
+    const [recalculated] = await db.query(`
+      UPDATE brokers b
+      JOIN broker_starting_balances sb ON sb.BrokerId = b.id
+      SET b.CashBalance = ROUND(
+        sb.Amount
+        + COALESCE((
+            SELECT SUM(m.Amount)
+              FROM broker_balance_movements m
+             WHERE m.BrokerId = b.id AND m.Deleted = 0
+               AND m.Type IN ('increase', 'handover')
+          ), 0)
+        - COALESCE((
+            SELECT SUM(CASE
+                         WHEN i.Annulled = 0
+                         THEN CAST(COALESCE(i.Price, 0) AS DECIMAL(15,2))
+                         WHEN LOWER(TRIM(COALESCE(i.AnnulReason, ''))) = 'broker'
+                         THEN CAST(COALESCE(i.AnnulFee, i.Price, 0) AS DECIMAL(15,2))
+                         ELSE 0
+                       END)
+              FROM insurance i
+             WHERE i.BrokerId = b.id AND i.Deleted = 0
+          ), 0), 2)
+    `);
+    if (recalculated && recalculated.affectedRows) {
+      console.log(
+        `Re-applied the starting-balance formula to ${recalculated.affectedRows} broker(s)`
+      );
+    }
+  } catch (err) {
+    console.warn(
+      "Could not re-apply the broker starting-balance formula:",
+      (err && err.message) || err
+    );
+  }
+
+
   await db.query(`
     CREATE TABLE IF NOT EXISTS client_diagnostics (
       id BIGINT NOT NULL AUTO_INCREMENT,

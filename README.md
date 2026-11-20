@@ -428,9 +428,11 @@ A broker balance never moves current cash:
   blocked by how much cash happens to be available.
 - There is no manual reduction. The balance is
   `starting balance + payments - the broker's live policies` (an annulled policy
-  at its annulment tax), recalculated by
+  at its annulment tax only when the broker paid it), recalculated by
   `PUT /brokers/:id/starting-balance`; a hand-typed reduction could not survive
-  that. Old `reduce`/`adjust` rows are kept as history and ignored by it.
+  that. Old `reduce`/`adjust` rows are kept as history: the balance history page
+  tags them as retired, they never move the balance, and an admin can soft-delete
+  them without changing it.
 
 ### Cash from Brokers
 
@@ -473,9 +475,10 @@ There is **no `POST /brokers/:id/reduce`** any more. A balance is raised only by
 money the broker actually paid; it falls as policies are created and is
 recalculated from the starting balance and the broker's policies (see
 `PUT /brokers/:id/starting-balance`), so a hand-typed reduction would be undone
-by the next recalculation. `reduce` rows that already exist stay in
-`broker_balance_movements` as history: the balance history page still lists them
-and the recalculation ignores them.
+by the next recalculation. `reduce` and `adjust` rows that already exist stay in
+`broker_balance_movements` as history: the balance history page tags them as
+retired, they are left out of the total and the running balance, and soft
+deleting/restoring one leaves `brokers.CashBalance` untouched.
 
 Admin-only (`role 1`) broker management:
 
@@ -503,14 +506,17 @@ Admin-only (`role 1`) broker management:
   recalculates `brokers.CashBalance` from the source data: the starting balance
   plus every payment the broker made (a branch top-up, `increase`, and a
   hand-over to the owner, `handover`) minus every live insurance of the broker,
-  an annulled one at its annulment tax. A `reduce` row (the retired "Reduce"
-  button) and a legacy `adjust` row are NOT payments and are ignored, as are the
+  an annulled one at its annulment tax only when the broker paid that fee
+  (`AnnulReason = 'broker'`). A `reduce` row (the retired "Reduce" button) and a
+  legacy `adjust` row are NOT payments and are ignored, as are the
   policy-derived ledger rows - the insurances themselves are the truth for
   those, so a policy moved to another broker, an edited price or a soft-deleted
-  movement cannot leave a stale charge behind. `GET /brokers/:id/history`
-  returns the stored figure as `startingBalance: { amount, date, updatedBy,
-  updatedAt }` (`null` until an admin sets one); the client shows it on the
-  balance history page and recalculates when it is saved.
+  movement cannot leave a stale charge behind. The same formula is re-applied to
+  every broker with a stored starting balance when the server starts, so a
+  corrected rule reaches figures that were stored under an older one.
+  `GET /brokers/:id/history` returns the stored figure as `startingBalance: {
+  amount, date, updatedBy, updatedAt }` (`null` until an admin sets one); the
+  client shows it on the balance history page and recalculates when it is saved.
 
 Each created insurance whose email sender is associated with a broker charges that broker a flat fee: the broker balance is reduced by the full Price (it may go infinitely negative, and this never touches current cash) and the broker InactivePolicies is decremented by 1.
 

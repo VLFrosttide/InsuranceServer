@@ -92,6 +92,17 @@ function parsePositiveAmount(value) {
   return n;
 }
 
+// Movement types kept only as history. The balance rule (see
+// recalculateBrokerBalance) never counts them, so the history ledger, the
+// per-sub-broker display balance and the edit/delete/restore paths must not let
+// them move CashBalance either. The client tags these rows as retired.
+const RETIRED_MOVEMENT_TYPES = new Set(["reduce", "adjust"]);
+function isRetiredMovementType(type) {
+  return RETIRED_MOVEMENT_TYPES.has(String(type ?? "").trim().toLowerCase());
+}
+module.exports.isRetiredMovementType = isRetiredMovementType;
+
+
 /**
  * Resolve the CreatedAt for a new broker-balance movement from a request body:
  * the client's own wall-clock time is stored as sent, otherwise the server
@@ -620,7 +631,8 @@ const computeSubBrokerDisplayData = (module.exports.computeSubBrokerDisplayData 
         `SELECT Type, Amount
            FROM broker_balance_movements
           WHERE BrokerId = ? AND Deleted = 0
-            AND Type NOT IN ('policy', 'annulment', 'price_change', 'deletion')`,
+            AND Type NOT IN ('policy', 'annulment', 'price_change', 'deletion',
+                             'reduce', 'adjust')`,
         [brokerId]
       );
       for (const m of movRows || []) {
@@ -999,8 +1011,10 @@ module.exports.BROKER_STARTING_BALANCE_TABLE_SQL =
  *
  * An ACTIVE insurance is charged its price. An ANNULLED one is charged its
  * annulment tax (`AnnulFee`; `Price` mirrors it since migration 018 and is the
- * fallback for legacy rows without the mirror), because the refund gave the
- * price back while the tax stayed on the broker.
+ * fallback for legacy rows without the mirror) ONLY when the broker was the one
+ * at fault (`AnnulReason = 'broker'`): that is the case where the refund kept
+ * the fee back. When the worker or nobody paid it, the broker was refunded the
+ * full price, so its net charge is 0.
  *
  * "Manual payment" means money the broker actually handed over: a branch
  * top-up ("increase", bill payments included) or a hand-over to the owner
@@ -1029,7 +1043,11 @@ const recalculateBrokerBalance = (module.exports.recalculateBrokerBalance =
     const [[chargedRow]] = await conn.query(
       `SELECT COALESCE(SUM(
                 CASE WHEN Annulled = 1
-                     THEN CAST(COALESCE(AnnulFee, Price, 0) AS DECIMAL(15,2))
+                     THEN CASE
+                            WHEN LOWER(TRIM(COALESCE(AnnulReason, ''))) = 'broker'
+                            THEN CAST(COALESCE(AnnulFee, Price, 0) AS DECIMAL(15,2))
+                            ELSE 0
+                          END
                      ELSE CAST(COALESCE(Price, 0) AS DECIMAL(15,2))
                 END), 0) AS Charged
          FROM insurance
@@ -1636,6 +1654,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       `SELECT BrokerId, COALESCE(SUM(Amount), 0) AS since
          FROM broker_balance_movements
         WHERE CreatedAt >= ? AND Deleted = 0
+          AND Type NOT IN ('reduce', 'adjust')
         GROUP BY BrokerId`,
       [`${schedule.periodStart} 00:00:00`]
     );
@@ -2064,7 +2083,12 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
       }
       const buckets = movementByBroker.get(r.BrokerId);
       const disp = subDisplayByBroker.get(r.BrokerId);
-      const amt = disp ? disp.mapMovementAmount(r) : Number(r.Amount || 0);
+      let amt = Number(r.Amount || 0);
+      if (isRetiredMovementType(r.Type)) {
+        amt = 0;
+      } else if (disp) {
+        amt = disp.mapMovementAmount(r);
+      }
       buckets.set(key, (buckets.get(key) || 0) + amt);
       if (disp && String(r.Type || "").trim() === "policy" && r.BlancNumber) {
         if (!seenPolicyBlancsByBroker.has(r.BrokerId)) {
@@ -2912,6 +2936,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
                     ? toLocalDateTime(m.CreatedAt)
                     : m.CreatedAt,
                 DisplayAmount: disp.mapMovementAmount(m),
+                Retired: isRetiredMovementType(m.Type),
                 PolicyAnnulled: info
                   ? Number(info.row.Annulled) === 1
                   : false,
@@ -2953,6 +2978,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
                   ? toLocalDateTime(m.CreatedAt)
                   : m.CreatedAt,
               DisplayAmount: amount,
+              Retired: isRetiredMovementType(m.Type),
               PolicyAnnulled: Number(m.PolicyAnnulled) === 1,
               PolicyAnnulReason: m.PolicyAnnulReason ?? null,
               PolicyBrokerId:
@@ -3086,9 +3112,13 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           (m) => m.CreatedAt >= since && m.CreatedAt < until
         );
         const total = windowRows.length;
+        // A retired row (reduce/adjust) is listed so it can be reviewed and
+        // deleted, but it never moves the balance: the balance rule ignores it,
+        // and this walk does too. Its Amount is still shown.
+        const balanceDelta = (m) => (m.Retired ? 0 : m.DisplayAmount);
         const netChange =
           Math.round(
-            windowRows.reduce((sum, m) => sum + m.DisplayAmount, 0) * 100
+            windowRows.reduce((sum, m) => sum + balanceDelta(m), 0) * 100
           ) / 100;
         // A stored starting balance is the base of the WHOLE ledger: the
         // balance is then read forward from it instead of being back-solved
@@ -3096,21 +3126,22 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         // every row's balance after by the same amount, and the insurance that
         // comes right after the starting point shows exactly that figure plus
         // its own amount. Back-solving drifts from the starting balance whenever
-        // the ledger and the recalculated balance disagree (a legacy "reduce" or
-        // "adjust" row, a policy with no recorded movement, a hand-fixed
-        // balance), which made a new starting balance look like it had not been
-        // applied. Without a starting balance there is nothing to read forward
-        // from, so the live balance stays the anchor.
+        // the ledger and the recalculated balance disagree (a policy with no
+        // recorded movement, a hand-fixed balance), which made a new starting
+        // balance look like it had not been applied. Without a starting balance
+        // there is nothing to read forward from, so the live balance stays the
+        // anchor.
         const startingAmount =
           startingBalance === null || startingBalance === undefined
             ? null
             : Math.round((Number(startingBalance.amount) || 0) * 100) / 100;
-        // Every displayed amount that falls before a bound. The rows are newest
-        // first, so this is a plain sum - the running balance is walked below.
+        // Every counted amount (retired rows contribute 0) that falls before a
+        // bound. The rows are newest first, so this is a plain sum - the running
+        // balance is walked below.
         const displayedBefore = (bound) =>
           Math.round(
             displayed.reduce(
-              (sum, m) => (m.CreatedAt < bound ? sum + m.DisplayAmount : sum),
+              (sum, m) => (m.CreatedAt < bound ? sum + balanceDelta(m) : sum),
               0
             ) * 100
           ) / 100;
@@ -3120,7 +3151,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           Math.round(
             displayed.reduce(
               (sum, m) =>
-                m.CreatedAt >= until ? sum + m.DisplayAmount : sum,
+                m.CreatedAt >= until ? sum + balanceDelta(m) : sum,
               0
             ) * 100
           ) / 100;
@@ -3136,11 +3167,12 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         let running = balanceAtEnd;
         const movementsWithBalance = windowRows.map((m) => {
           const balAfter = Math.round(running * 100) / 100;
-          running = Math.round((running - m.DisplayAmount) * 100) / 100;
+          running = Math.round((running - balanceDelta(m)) * 100) / 100;
           return {
             id: m.id,
             Type: m.Type,
             Amount: m.DisplayAmount,
+            Retired: m.Retired,
             Reason: m.Reason,
             Author: m.Author,
             BlancNumber: m.BlancNumber,
@@ -3172,6 +3204,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             id: r.id,
             Type: r.Type,
             Amount: Math.round((Number(r.Amount) || 0) * 100) / 100,
+            Retired: isRetiredMovementType(r.Type),
             Reason: r.Reason,
             Author: r.Author,
             BlancNumber: r.BlancNumber,
@@ -3211,10 +3244,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   );
 
   // PATCH /brokers/:id/history/:movementId — admin-only correction of a single
-  // balance movement. `amount` is the only field that changes the balance: the
-  // stored CashBalance is shifted by (new - old) so the ledger and the balance
-  // stay consistent. `type`, `reason`, `author` and `blancNumber` are cosmetic
-  // and are stored verbatim.
+  // balance movement. `amount` changes the balance by the movement's
+  // contribution difference; `type` can too, because a retired type
+  // ("reduce"/"adjust") contributes 0 while any other type contributes its
+  // amount. `reason`, `author` and `blancNumber` are cosmetic and are stored
+  // verbatim.
   router.patch(
     "/brokers/:id/history/:movementId",
     auth,
@@ -3315,9 +3349,23 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         }
 
         const previousAmount = Number(existing.Amount) || 0;
+        const nextAmount = newAmount === null ? previousAmount : newAmount;
+        const nextType =
+          rawType === undefined || String(rawType).trim() === ""
+            ? existing.Type
+            : String(rawType).trim();
+        // A retired row contributes nothing to the balance, so editing its
+        // amount (or another cosmetic field) must not move CashBalance. Moving
+        // it in or out of a retired type does move it, by the contribution the
+        // row gains or loses.
+        const contribution = (type, amount) =>
+          isRetiredMovementType(type) ? 0 : Number(amount) || 0;
         const delta =
-          Math.round(((newAmount ?? previousAmount) - previousAmount) * 100) /
-          100;
+          Math.round(
+            (contribution(nextType, nextAmount) -
+              contribution(existing.Type, previousAmount)) *
+              100
+          ) / 100;
 
         await DBConnection.withTransaction(async (conn) => {
           params.push(movementId);
@@ -3348,7 +3396,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   // DELETE /brokers/:id/history/:movementId — admin-only removal of a single
   // movement. The row is NEVER physically deleted: it is tied off as
   // (Deleted = 1, DeletedAt, DeletedBy) so it stays recoverable, and its
-  // effect on the broker's CashBalance is reversed. POST …/restore undoes it.
+  // effect on the broker's CashBalance is reversed. A retired row
+  // (reduce/adjust) has no effect on the balance, so deleting it leaves
+  // CashBalance untouched. POST …/restore undoes it.
   router.delete(
     "/brokers/:id/history/:movementId",
     auth,
@@ -3367,7 +3417,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         await ensureMovementTable();
 
         const [[existing]] = await DBConnection.query(
-          `SELECT id, Amount, Deleted FROM broker_balance_movements
+          `SELECT id, Amount, Type, Deleted FROM broker_balance_movements
             WHERE id = ? AND BrokerId = ?`,
           [movementId, brokerId]
         );
@@ -3378,7 +3428,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           return res.status(400).json({ error: "Movement already deleted" });
         }
 
-        const reversal = Math.round(Number(existing.Amount) * -100) / 100;
+        // A retired row is history only and contributes nothing to the balance,
+        // so hiding it must not add its amount back.
+        const reversal = isRetiredMovementType(existing.Type)
+          ? 0
+          : Math.round(Number(existing.Amount) * -100) / 100;
 
         await DBConnection.withTransaction(async (conn) => {
           await conn.query(
@@ -3387,10 +3441,12 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               WHERE id = ?`,
             [1, new Date(), req.user.username, movementId]
           );
-          await conn.query(
-            "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
-            [reversal, brokerId]
-          );
+          if (reversal !== 0) {
+            await conn.query(
+              "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
+              [reversal, brokerId]
+            );
+          }
         });
 
         const [[broker]] = await DBConnection.query(
@@ -3407,7 +3463,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
   // POST /brokers/:id/history/:movementId/restore — admin-only undo of a soft
   // delete. Re-applies the movement's amount to the broker's CashBalance and
-  // clears Deleted/DeletedAt/DeletedBy, putting the row back as it was.
+  // clears Deleted/DeletedAt/DeletedBy, putting the row back as it was. A
+  // retired row (reduce/adjust) never affected the balance, so restoring it
+  // leaves CashBalance untouched.
   router.post(
     "/brokers/:id/history/:movementId/restore",
     auth,
@@ -3426,7 +3484,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         await ensureMovementTable();
 
         const [[existing]] = await DBConnection.query(
-          `SELECT id, Amount, Deleted FROM broker_balance_movements
+          `SELECT id, Amount, Type, Deleted FROM broker_balance_movements
             WHERE id = ? AND BrokerId = ?`,
           [movementId, brokerId]
         );
@@ -3437,7 +3495,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           return res.status(400).json({ error: "Movement is not deleted" });
         }
 
-        const reapply = Math.round((Number(existing.Amount) || 0) * 100) / 100;
+        const reapply = isRetiredMovementType(existing.Type)
+          ? 0
+          : Math.round((Number(existing.Amount) || 0) * 100) / 100;
 
         await DBConnection.withTransaction(async (conn) => {
           await conn.query(
@@ -3446,10 +3506,12 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               WHERE id = ?`,
             [0, null, null, movementId]
           );
-          await conn.query(
-            "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
-            [reapply, brokerId]
-          );
+          if (reapply !== 0) {
+            await conn.query(
+              "UPDATE brokers SET CashBalance = CashBalance + ? WHERE id = ?",
+              [reapply, brokerId]
+            );
+          }
         });
 
         const [[broker]] = await DBConnection.query(

@@ -94,13 +94,15 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
 
       // "Total broker balance" for the report = the sum of the net value of
       // broker-attributed policies created within the range. It mirrors the
-      // walk-in net-value convention above (full price while active, annul fee
-      // once annulled, deleted policies contribute nothing) and is keyed on the
-      // policy's creation date.
+      // walk-in net-value convention above (full price while active, the
+      // annulment tax once annulled ONLY when the broker paid it, deleted
+      // policies contribute nothing) and is keyed on the policy's creation date.
       const [[brokerAgg]] = await DBConnection.query(
         `SELECT ROUND(SUM(CASE
                   WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2))
-                  ELSE COALESCE(AnnulFee, 0)
+                  WHEN LOWER(TRIM(COALESCE(AnnulReason, ''))) = 'broker'
+                  THEN COALESCE(AnnulFee, 0)
+                  ELSE 0
                 END), 2) AS Net
            FROM insurance
           WHERE BrokerId IS NOT NULL AND Deleted = 0
@@ -149,8 +151,8 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
   // Returns, for every broker with activity in the range (or a balance carried
   // into it), four whole-number figures:
   //   totalOwed      — net value of the insurances the broker made in the period
-  //                    (full price while active, the annul fee once annulled,
-  //                    nothing once deleted).
+  //                    (full price while active, the annulment tax once annulled
+  //                    only when the broker paid it, nothing once deleted).
   //   amount         — cash actually received from the broker (a top-up taken
   //                    by a branch plus a hand-over paid to the owner, i.e.
   //                    "increase" and "handover" movements on the ledger).
@@ -202,7 +204,9 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
         `SELECT BrokerId AS brokerId,
                 ROUND(SUM(CASE
                   WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2))
-                  ELSE COALESCE(AnnulFee, 0)
+                  WHEN LOWER(TRIM(COALESCE(AnnulReason, ''))) = 'broker'
+                  THEN COALESCE(AnnulFee, 0)
+                  ELSE 0
                 END), 2) AS totalOwed
            FROM insurance
           WHERE BrokerId IS NOT NULL AND Deleted = 0
@@ -213,11 +217,13 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
 
       // 3) Leftover: the ledger balance before the period start. The ledger is
       //    signed (negative = owes), so negate it to express "owed" (positive =
-      //    still owes).
+      //    still owes). Retired reduce/adjust rows are history only and are not
+      //    part of the balance, so they are left out here too.
       const [leftoverRows] = await DBConnection.query(
         `SELECT BrokerId AS brokerId, ROUND(SUM(Amount), 2) AS balanceBefore
            FROM broker_balance_movements
           WHERE Deleted = 0 AND CreatedAt < ?
+            AND Type NOT IN ('reduce', 'adjust')
           GROUP BY BrokerId`,
         [fromParam]
       );
