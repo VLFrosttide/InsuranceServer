@@ -2400,6 +2400,48 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
           ORDER BY CreationDate DESC, BlancNumber DESC`,
         [branch, day.date, day.nextDate]
       );
+      // Walk-in policies paid in CASH. The Available cash card opens this list,
+      // and the combined Transactions table reads it together with the card
+      // list so a day's walk-in sales are visible even though a policy writes
+      // no row to cash_transactions (its money is read live from `insurance`).
+      const [cashInsurances] = await DBConnection.query(
+        `SELECT * FROM insurance
+          WHERE Deleted = 0
+            AND PaymentType = 'Cash'
+            AND BrokerId IS NULL
+            AND Branch = ?
+            AND CreationDate >= ? AND CreationDate < ?
+          ORDER BY CreationDate DESC, BlancNumber DESC`,
+        [branch, day.date, day.nextDate]
+      );
+      // Policies funded from a broker's balance on the picked day. They are the
+      // "broker transactions" of the combined list; the broker's name is joined
+      // so the row says which broker paid.
+      const [brokerInsurances] = await DBConnection.query(
+        `SELECT i.*, b.Name AS BrokerName
+           FROM insurance i
+           LEFT JOIN brokers b ON b.id = i.BrokerId
+          WHERE i.Deleted = 0
+            AND i.BrokerId IS NOT NULL
+            AND i.Branch = ?
+            AND i.CreationDate >= ? AND i.CreationDate < ?
+          ORDER BY i.CreationDate DESC, i.BlancNumber DESC`,
+        [branch, day.date, day.nextDate]
+      );
+      // Broker hand-overs of the picked day. They carry no branch (the owner
+      // took the money directly), so they are not part of the branch's cash from
+      // brokers; the combined Transactions table lists them as money the broker
+      // paid.
+      const [brokerHandovers] = await DBConnection.query(
+        `SELECT m.id, m.BrokerId, b.Name AS BrokerName, m.Amount, m.Currency,
+                m.Author AS Username, m.Reason, m.Recipient, m.CreatedAt
+           FROM broker_balance_movements m
+           LEFT JOIN brokers b ON b.id = m.BrokerId
+          WHERE m.Type = 'handover' AND m.Deleted = 0
+            AND m.CreatedAt >= ? AND m.CreatedAt < ?
+          ORDER BY m.id DESC`,
+        [day.date, day.nextDate]
+      );
       // Cash from Brokers: the branch's balance, the top-ups it received on the
       // requested day, and the resets that cleared it that day.
       const brokerCash = await getBrokerCash(DBConnection, branch);
@@ -2436,6 +2478,9 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         cardResets,
         brokerCashResets,
         cardInsurances,
+        cashInsurances,
+        brokerInsurances,
+        brokerHandovers,
         date: day.date,
       };
       // Hand-over statistics are for admins only. They are company-wide (every

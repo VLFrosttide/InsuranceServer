@@ -9,6 +9,7 @@ const { createRegRouter } = require("./Requests/RegReq.js");
 const { createAccountRouter } = require("./Requests/Account.js");
 const { createTierRouter } = require("./Requests/TierEndpoints.js");
 const { createCurrentCashRouter } = require("./Requests/CurrentCash.js");
+const { createBankRouter } = require("./Requests/Bank.js");
 const { createCardPaymentsRouter } = require("./Requests/CardPayments.js");
 const { createBrokerRouter } = require("./Requests/Brokers.js");
 const { createBrokerBillsRouter } = require("./Requests/BrokerBills.js");
@@ -381,6 +382,7 @@ async function start() {
   app.use(createAccountRouter(DBConnection));
   app.use(createTierRouter(DBConnection));
   app.use(createCurrentCashRouter(DBConnection));
+  app.use(createBankRouter(DBConnection));
   app.use(createCardPaymentsRouter(DBConnection));
   // The bills router must come BEFORE the broker router: its literal paths
   // (/brokers/bills, /brokers/billing/settings) would otherwise be swallowed by
