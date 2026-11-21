@@ -108,6 +108,27 @@ function isRetiredMovementType(type) {
 }
 module.exports.isRetiredMovementType = isRetiredMovementType;
 
+// Rows the server writes from the insurance itself: the sale (`policy`), a
+// price correction (`price_change`), the refund of an annulment (`annulment`)
+// and the refund of a deletion (`deletion`). They are the history of a charge
+// the balance takes from the insurance table, so the server keeps them in step
+// with the policy on every change (create, price edit, annul/restore,
+// delete/restore, blanc correction, broker move). Deleting one VOIDS it (the
+// broker is no longer charged, and the balance follows); its amount is not
+// rewritten by hand, because the amount has to keep matching the insurance the
+// sum is taken from.
+const POLICY_MOVEMENT_TYPES = new Set([
+  "policy",
+  "price_change",
+  "annulment",
+  "deletion",
+]);
+function isPolicyDerivedMovementType(type) {
+  return POLICY_MOVEMENT_TYPES.has(String(type ?? "").trim().toLowerCase());
+}
+module.exports.isPolicyDerivedMovementType = isPolicyDerivedMovementType;
+
+
 
 /**
  * Resolve the CreatedAt for a new broker-balance movement from a request body:
@@ -1007,6 +1028,7 @@ module.exports.BROKER_STARTING_BALANCE_TABLE_SQL =
  *   CashBalance = StartingBalance
  *               + every payment in broker_payments
  *               - every live insurance of the broker
+ *               - every VOIDED policy charge (a hidden policy-derived row)
  *
  * An ACTIVE insurance is charged its price. An ANNULLED one is charged its
  * annulment tax (`AnnulFee`; `Price` mirrors it since migration 018 and is the
@@ -1015,6 +1037,16 @@ module.exports.BROKER_STARTING_BALANCE_TABLE_SQL =
  * the fee back. When the worker or nobody paid it, the broker was refunded the
  * full price, so its net charge is 0.
  *
+ * A policy-derived row (`policy`, `price_change`, `annulment`, `deletion`) that
+ * an admin soft-deleted from the history is a VOID: "do not charge the broker
+ * for this" (hiding a refund means the refund is not given, i.e. the charge
+ * stays). Its amount is therefore removed from the insurances' charges above.
+ * Only rows of a policy that still exists count: a soft-deleted insurance is
+ * charged nothing at all and NONE of its rows may move the balance (the refund
+ * the deletion wrote may itself have been hidden). This is the only way the
+ * ledger may touch a balance, and it is what makes the figure agree with the
+ * visible history the balance history page walks.
+ *
  * "Manual payment" means money the broker actually handed over: a branch
  * top-up ("increase", bill payments included) or a hand-over to the owner
  * ("handover"). They are read from `broker_payments` - the money table - not
@@ -1022,10 +1054,9 @@ module.exports.BROKER_STARTING_BALANCE_TABLE_SQL =
  * move a balance. Reductions ("reduce") and admin balance corrections
  * ("adjust") are NOT payments and are no longer part of the formula: the
  * balance is the starting point plus the policies, minus what the broker paid.
- * The policy-derived rows ("policy", "annulment", "deletion", "price_change")
- * are skipped for the same reason - the insurances above are the truth for
- * those, so a policy moved to another broker, an edited price or a soft-deleted
- * movement cannot leave a stale charge behind.
+ * The policy-derived rows are otherwise skipped for the same reason - the
+ * insurances above are the truth for those, so a policy moved to another broker,
+ * an edited price or a retired movement cannot leave a stale charge behind.
  *
  * Runs inside the caller's transaction.
  *
@@ -1062,18 +1093,45 @@ const recalculateBrokerBalance = (module.exports.recalculateBrokerBalance =
     // ledger, whose rows an admin may correct or delete without moving money.
     const payments = await sumBrokerPayments(conn, brokerId);
 
+    // Charges the admin removed from the history. A hidden policy-derived row is
+    // a void, so its amount comes off the insurances' charges: hiding a sale row
+    // stops that policy being charged at all, and hiding a refund keeps the
+    // money with the broker (the charge stays). Only a policy that still exists
+    // can be charged, so only its rows are considered: a deleted insurance
+    // contributes nothing, whatever its rows say (the refund the deletion wrote
+    // may itself be hidden). Retired rows (reduce/adjust) never touched the
+    // balance, so they are not voids either.
+    const [[voidedRow]] = await conn.query(
+      `SELECT COALESCE(SUM(m.Amount), 0) AS Voided
+         FROM broker_balance_movements m
+         JOIN insurance i
+           ON i.BrokerId = m.BrokerId AND i.BlancNumber = m.BlancNumber
+          AND i.Deleted = 0
+        WHERE m.BrokerId = ? AND m.Deleted = 1
+          AND m.Type IN ('policy', 'price_change', 'annulment', 'deletion')`,
+      [brokerId]
+    );
+    const voided =
+      Math.round((toDecimal(voidedRow && voidedRow.Voided) || 0) * 100) / 100;
+
     const insuranceCharges =
       Math.round((toDecimal(chargedRow && chargedRow.Charged) || 0) * 100) /
       100;
     const balance =
-      Math.round((starting + payments - insuranceCharges) * 100) / 100;
+      Math.round((starting + payments - insuranceCharges - voided) * 100) / 100;
 
     await conn.query("UPDATE brokers SET CashBalance = ? WHERE id = ?", [
       balance,
       brokerId,
     ]);
 
-    return { balance, startingBalance: starting, insuranceCharges, payments };
+    return {
+      balance,
+      startingBalance: starting,
+      insuranceCharges,
+      voided,
+      payments,
+    };
   });
 
 // The tables the balance formula reads are created by db/setup.js on start-up
@@ -1155,6 +1213,14 @@ function queueBrokerBalanceNotification(brokerId) {
  *   CashBalance = starting balance
  *               + money the broker paid   (broker_payments)
  *               - live insurances         (insurance, Price / annulment tax)
+ *               - voids                   (hidden rows of live policies)
+ *
+ * A void is a policy charge an admin removed from the balance history: hiding a
+ * sale row stops the broker being charged for that policy, hiding a refund keeps
+ * the money with the broker. A soft-deleted insurance is charged nothing and all
+ * of its rows are skipped, hidden or not. This is the only input the balance
+ * takes from the ledger, and it keeps the figure equal to the visible history the
+ * balance history page walks.
  *
  * Brokers without a starting balance are left alone (null): their stored figure
  * is the only base they have, and it is maintained by the incremental updates
@@ -3118,6 +3184,27 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             Math.round((Number(broker.CashBalance) || 0) * 100) / 100;
         }
 
+        // A soft-deleted insurance is not charged at all (the balance counts 0
+        // for it), so NONE of its history rows belong on this page: keeping them
+        // would walk money the balance does not have - a visible sale row whose
+        // deletion refund was hidden, for instance, would look like a charge that
+        // was never made. A row of a policy that does not exist here any more (it
+        // was deleted or moved to another broker) is skipped for the same reason.
+        // Money rows (no blanc) are always kept.
+        const [livePolicyRows] = await DBConnection.query(
+          "SELECT BlancNumber FROM insurance WHERE BrokerId = ? AND Deleted = 0",
+          [brokerId]
+        );
+        const liveBlancs = new Set(
+          (livePolicyRows || []).map((r) => String(r.BlancNumber ?? "").trim())
+        );
+        allMovements = allMovements.filter((m) => {
+          const blanc = String(m.BlancNumber ?? "").trim();
+          if (!blanc) return true;
+          if (!isPolicyDerivedMovementType(m.Type)) return true;
+          return liveBlancs.has(blanc);
+        });
+
         // Price edits are stored as "price_change" deltas and an annulment as a
         // separate refund. Neither is a movement the user wants to read: the
         // original sale row should simply show the policy's current price (its
@@ -3247,29 +3334,56 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           Math.round(
             windowRows.reduce((sum, m) => sum + balanceDelta(m), 0) * 100
           ) / 100;
-        // The balance of this page ALWAYS comes from the stored figure, never
-        // from a sum of the ledger: the server rebuilds that figure from the
-        // insurances + the payments the broker made inside every transaction
-        // (see refreshBrokerBalance), so the Brokers tab and this page cannot
-        // disagree. The starting balance above is shown for reference and is
-        // already part of that figure - it is not added to the rows again.
+        // The figure the page's running balances are built on.
         //
-        // The stored balance is as of NOW, so the figure at the end of the
-        // window is today's balance without everything that came after it. That
-        // keeps walking the date back meaningful (a past day shows the balance
-        // the broker had then) while staying on the single source of truth.
-        const afterNet =
-          Math.round(
-            displayed.reduce(
-              (sum, m) =>
-                m.CreatedAt >= until ? sum + balanceDelta(m) : sum,
-              0
-            ) * 100
-          ) / 100;
-        const balanceAtEnd =
-          Math.round((currentBalance - afterNet) * 100) / 100;
-        const balanceAtStart =
-          Math.round((balanceAtEnd - netChange) * 100) / 100;
+        // A broker with a stored starting balance has a known base, so the rows
+        // are walked FORWARD from it: the oldest row's balance is the starting
+        // balance plus that row, and every later row continues from there, so
+        // the page can be checked by hand (starting -298, a 45 policy -> -343).
+        // The ledger is pure history - the server writes it from the insurance
+        // on every policy change - and the balance is rebuilt from the insurances
+        // and the payments, never from these rows.
+        //
+        // Without a starting balance there is no base to walk from, so the
+        // stored figure stays authoritative and the rows are walked back from
+        // it (what came after the window is removed from today's balance). A
+        // sub-broker keeps that walk too: its rows are shown at the parent's
+        // display prices, not at the real prices the starting balance uses.
+        const startingAmount =
+          !isSubBrokerHistory &&
+          startingBalance &&
+          startingBalance.amount !== null &&
+          startingBalance.amount !== undefined
+            ? Math.round((Number(startingBalance.amount) || 0) * 100) / 100
+            : null;
+        let balanceAtStart;
+        let balanceAtEnd;
+        if (startingAmount !== null) {
+          const beforeNet =
+            Math.round(
+              displayed.reduce(
+                (sum, m) =>
+                  m.CreatedAt < since ? sum + balanceDelta(m) : sum,
+                0
+              ) * 100
+            ) / 100;
+          balanceAtStart =
+            Math.round((startingAmount + beforeNet) * 100) / 100;
+          balanceAtEnd = Math.round((balanceAtStart + netChange) * 100) / 100;
+        } else {
+          const afterNet =
+            Math.round(
+              displayed.reduce(
+                (sum, m) =>
+                  m.CreatedAt >= until ? sum + balanceDelta(m) : sum,
+                0
+              ) * 100
+            ) / 100;
+          balanceAtEnd = Math.round((currentBalance - afterNet) * 100) / 100;
+          balanceAtStart =
+            Math.round((balanceAtEnd - netChange) * 100) / 100;
+        }
+
         const totalPages = Math.max(1, Math.ceil(total / pageSize));
         const offset = (page - 1) * pageSize;
 
@@ -3357,7 +3471,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   // contribution difference; `type` can too, because a retired type
   // ("reduce"/"adjust") contributes 0 while any other type contributes its
   // amount. `reason`, `author` and `blancNumber` are cosmetic and are stored
-  // verbatim.
+  // verbatim - except on a policy-derived row, which only takes `reason` and
+  // `author` (its money comes from the insurance, see the guard below).
   router.patch(
     "/brokers/:id/history/:movementId",
     auth,
@@ -3455,6 +3570,38 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           params.push(blanc ? blanc : null);
         }
 
+        // A policy-derived row is the history of a charge taken from the
+        // insurance table. Its money can be changed by DELETING it (a void: the
+        // broker is no longer charged, and the balance is rebuilt with it) but
+        // not by rewriting its amount, type or blanc: those have to keep
+        // matching the insurance the charge is computed from, or the history
+        // page and the balance would part ways. Correct the policy (price,
+        // annulment, deletion, blanc) and the server rewrites the row with it.
+        // Sending a field unchanged (common when a client posts the whole row
+        // back) is allowed.
+        if (isPolicyDerivedMovementType(existing.Type)) {
+          const sameBlanc = (value) =>
+            (String(value ?? "").trim() || null) ===
+            (String(existing.BlancNumber ?? "").trim() || null);
+          const amountChanges =
+            rawAmount !== undefined &&
+            rawAmount !== "" &&
+            Math.round((toDecimal(rawAmount) || 0) * 100) / 100 !==
+              Math.round((Number(existing.Amount) || 0) * 100) / 100;
+          const typeChanges =
+            rawType !== undefined &&
+            String(rawType).trim() !== "" &&
+            String(rawType).trim() !== String(existing.Type ?? "").trim();
+          const blancChanges = rawBlanc !== undefined && !sameBlanc(rawBlanc);
+
+          if (amountChanges || typeChanges || blancChanges) {
+            return res.status(400).json({
+              error:
+                "A policy's charge is history taken from the insurance: correct the insurance (price, annulment, deletion, blanc) and this row follows. Only its reason and author can be edited here.",
+            });
+          }
+        }
+
         if (sets.length === 0) {
           return res.status(400).json({ error: "Nothing to update" });
         }
@@ -3523,9 +3670,16 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   // DELETE /brokers/:id/history/:movementId — admin-only removal of a single
   // movement. The row is NEVER physically deleted: it is tied off as
   // (Deleted = 1, DeletedAt, DeletedBy) so it stays recoverable, and its
-  // effect on the broker's CashBalance is reversed. A retired row
-  // (reduce/adjust) has no effect on the balance, so deleting it leaves
-  // CashBalance untouched. POST …/restore undoes it.
+  // effect is taken out of the balance. A retired row (reduce/adjust) has no
+  // effect on the balance, so deleting it changes nothing. POST …/restore
+  // undoes it.
+  //
+  // A policy-derived row (the charge history of an insurance) is a VOID: hiding
+  // it stops the broker being charged for that policy (hiding a refund instead
+  // keeps the money with the broker), and the rebuilt balance in the same
+  // transaction follows - see recalculateBrokerBalance. Restoring it charges the
+  // policy again. The full price/annulment is corrected on the insurance, which
+  // patches its rows.
   router.delete(
     "/brokers/:id/history/:movementId",
     auth,
@@ -3601,10 +3755,11 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
   );
 
   // POST /brokers/:id/history/:movementId/restore — admin-only undo of a soft
-  // delete. Re-applies the movement's amount to the broker's CashBalance and
-  // clears Deleted/DeletedAt/DeletedBy, putting the row back as it was. A
-  // retired row (reduce/adjust) never affected the balance, so restoring it
-  // leaves CashBalance untouched.
+  // delete. Clears Deleted/DeletedAt/DeletedBy, putting the row back as it was,
+  // and the balance follows: a restored policy row is no longer a void, so the
+  // broker is charged for that policy again (a restored payment counts as money
+  // again). A retired row (reduce/adjust) never affected the balance, so
+  // restoring it leaves CashBalance untouched.
   router.post(
     "/brokers/:id/history/:movementId/restore",
     auth,

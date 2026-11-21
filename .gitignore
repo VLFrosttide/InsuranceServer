@@ -42,6 +42,9 @@ jspm_packages/
 
 
 
+# Local dumps of the live database (real customer data - never commit these)
+backups/
+
 # dotenv environment variable files
 .env
 .env.development.local

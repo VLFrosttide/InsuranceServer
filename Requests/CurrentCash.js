@@ -2563,14 +2563,40 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
       // branch an admin selected).
       const branchFilter = branch ? " AND Branch = ?" : "";
       const branchArg = branch ? [branch] : [];
+      // A policy's contribution is its price (the annulment tax once annulled),
+      // plus whatever the admin removed from its broker history: a hidden
+      // (soft-deleted) policy row is a VOID the broker balance no longer charges
+      // for, so the day's figure must not count it either. Hiding a sale row
+      // therefore drops that policy's money and hiding a refund keeps it, exactly
+      // like recalculateBrokerBalance. A walk-in has no broker rows (the join
+      // finds nothing) and a deleted insurance is filtered out entirely, so its
+      // rows can neither add nor void anything.
       const insuranceMoneySql = (where) =>
-        `SELECT Branch, CurrencyType AS Currency,
-                ${INSURANCE_AMOUNT_SQL} AS Net
-           FROM insurance
-          WHERE ${where} AND Deleted = 0
-            AND CreationDate >= ? AND CreationDate < ?${branchFilter}
-          GROUP BY Branch, CurrencyType
-          ORDER BY Branch, CurrencyType`;
+        `SELECT x.Branch, x.Currency, ROUND(SUM(x.Net), 2) AS Net
+           FROM (
+             SELECT i.Branch, i.CurrencyType AS Currency,
+                    (CASE WHEN i.Annulled = 0
+                          THEN CAST(i.Price AS DECIMAL(15,2))
+                          ELSE COALESCE(i.AnnulFee, 0) END)
+                    + COALESCE(v.Voided, 0) AS Net
+               FROM insurance i
+               LEFT JOIN (
+                     SELECT BrokerId AS VoidBrokerId,
+                            BlancNumber AS VoidBlanc,
+                            SUM(Amount) AS Voided
+                       FROM broker_balance_movements
+                      WHERE Deleted = 1
+                        AND Type IN ('policy', 'price_change', 'annulment',
+                                     'deletion')
+                      GROUP BY BrokerId, BlancNumber
+                   ) v
+                 ON v.VoidBrokerId = i.BrokerId
+                AND v.VoidBlanc = i.BlancNumber
+              WHERE ${where} AND i.Deleted = 0
+                AND i.CreationDate >= ? AND i.CreationDate < ?${branchFilter}
+           ) x
+          GROUP BY x.Branch, x.Currency
+          ORDER BY x.Branch, x.Currency`;
       // Walk-in policies paid into the drawer, walk-in policies paid by card,
       // policies funded from a broker's balance, and all of them together.
       const [[cashRows], [cardRows], [brokerRows], [allRows]] =

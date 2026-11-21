@@ -6,6 +6,9 @@
   "scripts": {
     "start": "node --env-file=.env main.js",
     "db:setup": "node --env-file=.env db/setup.js",
+    "db:seed:live": "powershell -NoProfile -ExecutionPolicy Bypass -File db/seed-from-live.ps1",
+    "db:seed:file": "powershell -NoProfile -ExecutionPolicy Bypass -File db/seed-from-live.ps1",
+    "db:repair:ledger": "node --env-file=.env db/repair-broker-ledger.js",
     "test:e2e": "node test_e2e.mjs",
     "test": "node test_e2e.mjs",
     "build:exe": "pkg .",

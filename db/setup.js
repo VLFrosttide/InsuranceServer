@@ -1372,6 +1372,8 @@ async function runSetup(config = {}) {
   //               + payments from broker_payments
   //               - live policies (an annulled one at its tax ONLY when the
   //                 broker paid it, AnnulReason = 'broker')
+  //               - voided policy charges (hidden policy-derived ledger rows of
+  //                 policies that still exist)
   //
   // This makes a corrected rule reach brokers whose balance was stored under an
   // older one (e.g. the annulment tax charged even when the worker paid it).
@@ -1401,6 +1403,16 @@ async function runSetup(config = {}) {
                        END)
               FROM insurance i
              WHERE i.BrokerId = b.id AND i.Deleted = 0
+          ), 0)
+
+        - COALESCE((
+            SELECT SUM(m.Amount)
+              FROM broker_balance_movements m
+              JOIN insurance vi
+                ON vi.BrokerId = m.BrokerId AND vi.BlancNumber = m.BlancNumber
+               AND vi.Deleted = 0
+             WHERE m.BrokerId = b.id AND m.Deleted = 1
+               AND m.Type IN ('policy', 'price_change', 'annulment', 'deletion')
           ), 0), 2)
     `);
     if (recalculated && recalculated.affectedRows) {

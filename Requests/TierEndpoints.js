@@ -3163,6 +3163,29 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             params
           );
 
+          // The broker's balance ledger keys a policy's rows by its
+          // BlancNumber. A blanc correction has to carry those rows with it:
+          // otherwise the sale row stays under the old number while everything
+          // recorded afterwards (a price change, an annulment, a deletion) uses
+          // the new one, so the balance history can no longer group them into
+          // one policy - it shows the policy twice and the sale row loses its
+          // live-policy details. Only a plain blanc edit is relabelled here; a
+          // broker move rewrites the old broker's rows its own way.
+          const oldBlancNumber = String(insurance.BlancNumber ?? blancNumber);
+          if (
+            newBlancNumber !== oldBlancNumber &&
+            oldBrokerId !== null &&
+            newBrokerId === oldBrokerId
+          ) {
+            await conn.query(
+              `UPDATE broker_balance_movements
+                  SET BlancNumber = ?
+                WHERE BrokerId = ? AND BlancNumber = ?
+                  AND Type IN ('policy', 'price_change', 'annulment', 'deletion')`,
+              [newBlancNumber, oldBrokerId, oldBlancNumber]
+            );
+          }
+
           // The policy has its final owner and price: rebuild BOTH brokers'
           // balances from the insurance table (a move touches two of them).
           const touchedBrokers = new Set();

@@ -35,6 +35,77 @@ required tables, and seeds demo accounts:
 The `broker` account is linked to the `Ahmed` broker and can only view its own
 broker data (see `users.BrokerId`).
 
+## Seeding local from the live database
+
+`npm run db:setup` only seeds the demo accounts. To develop against real data,
+copy the live database into the local `insurancedb`:
+
+```powershell
+npm run db:seed:live
+```
+
+`db/seed-from-live.ps1` reads the connection details from `.env`:
+
+| Settings | Meaning |
+| -------- | ------- |
+| `LIVE_DB_HOST` `LIVE_DB_PORT` `LIVE_DB_USER` `LIVE_DB_PASSWORD` `LIVE_DB_NAME` | source to dump |
+| `DB_HOST` `DB_PORT` `DB_USER` `DB_PASSWORD` `DB_NAME` | local target to load |
+
+What it does:
+
+1. `mysqldump --single-transaction` of the live database into
+   `backups/<live-db>-<timestamp>.sql` (git-ignored: real customer data).
+2. `node --env-file=.env db/setup.js`, so the local database and every table
+   exist and match the server code.
+3. Loads the dump into the local database.
+4. Clears `tokens` (live login sessions), `email_outbox` (a pending reply would
+   otherwise be re-sent to a real customer by the local server) and the
+   `app_settings.billing*` rows, then prints row counts.
+
+Hostinger rejects remote MySQL connections until the client IP is whitelisted
+(hPanel → Databases → Remote MySQL); without that `mysqldump` stops with
+`ERROR 1045 (28000): Access denied for user ... (using password: YES)`.
+Either whitelist the IP, or export the database from hPanel's phpMyAdmin and
+import the downloaded file:
+
+```powershell
+npm run db:seed:file -- C:\Downloads\u174622325_InsuranceDB.sql
+```
+
+The live server runs MariaDB, so the script disables the MySQL 8 client's
+`--column-statistics` query (MariaDB has no `information_schema.COLUMN_STATISTICS`
+and the dump would otherwise stop with `ERROR 1109`).
+
+Useful switches:
+
+- `-SchemaOnly` — structure only, no rows.
+- `-DataOnly` — rows only, on top of the local schema.
+- `-Tables insurance,brokers` — only those tables.
+- `-NoImport` — keep the dump and stop.
+- `-KeepSessions` — keep the live `tokens` rows.
+
+## Patching the broker balance history (one-off)
+
+The broker balance is rebuilt from the insurance table and `broker_payments`
+(minus the voids), while `broker_balance_movements` is the history the balance
+history page walks. The server writes and patches that history itself on every
+change, so it normally needs no help. Rows written before a blanc correction was
+carried into the history, however, keep the policy's old number, and the page
+then shows the sale as its own entry without the policy's details:
+
+```powershell
+npm run db:repair:ledger                     # report only
+npm run db:repair:ledger -- --apply          # write the relabels
+npm run db:repair:ledger -- --broker=35      # one broker
+```
+
+`db/repair-broker-ledger.js` relabels only unambiguous rows (one live insurance
+created at the same second with no rows of its own, one sale row for it) and
+changes no money: it never un-hides a row, because a hidden row is a void the
+balance honours, and it never moves `brokers.CashBalance`. Anything it cannot
+match is printed for review. It is idempotent and only inspects brokers that
+have a starting balance. Always run it without `--apply` first.
+
 ## Database schema
 
 The database (`insurancedb`) contains the following tables. `db/setup.js`
@@ -211,17 +282,23 @@ after every change.
 
 `broker_payments` — money the broker actually handed over: a branch top-up
 (`increase`), a paid bill (`increase`) or a hand-over to the owner (`handover`).
-The balance formula reads **this** table, never the `broker_balance_movements`
-ledger, so correcting or soft-deleting a history row cannot silently move a
-balance. Each payment is also written to the ledger in the same transaction
-(`MovementId` ties the two rows) for the history page, Cash from Brokers and the
-reports; `db/setup.js` mirrors existing ledger payments once, idempotently.
+The balance formula reads **this** table for payments, never the
+`broker_balance_movements` ledger, so correcting a history row cannot silently
+move a balance. The one thing it takes from the ledger is the VOID: a
+policy-derived row an admin soft-deleted stops being charged (see the broker
+balance rules). Each payment is also written to the ledger in the same
+transaction (`MovementId` ties the two rows) for the history page, Cash from
+Brokers and the reports; `db/setup.js` mirrors existing ledger payments once,
+idempotently.
 
 ```
 CashBalance = starting balance
             + SUM(broker_payments.Amount)          (live rows)
             - SUM(live insurances.Price)           (annulled: the annulment tax,
                                                     only when the broker paid it)
+            - SUM(hidden policy rows.Amount)       (voids: charges removed from
+                                                    the history of a live policy,
+                                                    never of a deleted one)
 ```
 
 ### `brokers`
@@ -453,28 +530,56 @@ A broker balance never moves current cash:
   email card touches neither current cash nor Cash from Brokers, and is never
   blocked by how much cash happens to be available.
 - There is no manual reduction. The balance is
-  `starting balance + payments - the broker's live policies` (an annulled policy
-  at its annulment tax only when the broker paid it). It is rebuilt from that
-  source data after EVERY change that can move it - a policy created, edited,
-  annulled, restored or deleted; a top-up, a hand-over or a paid bill; a
-  correction or delete of a payment from the history page; a starting balance
-  saved - inside the same transaction as the change (see
-  `refreshBrokerBalance` in `Requests/Brokers.js`), plus once on every start-up
-  for brokers that have a starting balance. So `GET /brokers`, the broker's
-  balance history and the bi-weekly figures all show the same figure.
+  `starting balance + payments - the broker's live policies - voids` (an
+  annulled policy at its annulment tax only when the broker paid it; a void is a
+  policy row an admin deleted from the history). It is rebuilt from that source
+  data after EVERY change that can move it - a policy created, edited, annulled,
+  restored or deleted; a top-up, a hand-over or a paid bill; a correction or
+  delete of a payment from the history page; a policy row deleted or restored
+  from the history page; a starting balance saved - inside the same transaction
+  as the change (see `refreshBrokerBalance` in `Requests/Brokers.js`), plus once
+  on every start-up for brokers that have a starting balance. So `GET /brokers`,
+  the broker's balance history and the bi-weekly figures all show the same
+  figure.
 - The money is read from `broker_payments` (a broker's top-ups, hand-overs and
-  paid bills), never from `broker_balance_movements`: that ledger is the history
-  of who did what, when, and an admin may correct or soft-delete a row there
-  without silently changing a balance. Each payment is still written to both
-  tables in the same transaction (`MovementId` ties them), so the history page,
-  Cash from Brokers and the reports keep reading the ledger. `db/setup.js`
-  creates `broker_payments` and mirrors the payments already in the ledger once.
-- The balance history page shows the stored balance (walked back by the rows
-  recorded after the shown range), the same figure as the Brokers tab. The
-  stored starting balance is displayed for reference; it is not added to the
-  rows a second time. Old `reduce`/`adjust` rows are kept as history: the page
-  tags them as retired, they never move the balance, and an admin can soft-delete
-  them without changing it.
+  paid bills), never from `broker_balance_movements`: that ledger is the pure
+  history of who did what, when, and no balance calculation adds it up. Each
+  payment is still written to both tables in the same transaction (`MovementId`
+  ties them), so the history page, Cash from Brokers and the reports keep reading
+  the ledger. `db/setup.js` creates `broker_payments` and mirrors the payments
+  already in the ledger once.
+- That history is patched by the server itself, on every change that produces or
+  alters it, in the same transaction: a policy charge (`policy`), a price
+  correction (`price_change`), an annulment refund (`annulment`) and a deletion
+  refund (`deletion`) are written when the policy is created, re-priced,
+  annulled/restored, deleted/restored or moved between brokers, and a blanc
+  correction carries a policy's rows to the new number with it.
+- Deleting such a row from the balance history is a VOID and the balance honours
+  it: `DELETE /brokers/:id/history/:movementId` on a policy row stops the broker
+  being charged for that policy (hiding a refund instead keeps the money with the
+  broker, i.e. the charge stays), and the rebuilt balance in the same transaction
+  follows. `POST …/restore` charges it again. Only rows of a policy that still
+  exists count: a soft-deleted insurance is charged nothing, and ALL of its
+  history rows (hidden or not) are left out of the history page - the refund the
+  deletion wrote may itself have been hidden, and a deleted policy must not leave
+  a charge behind. The row itself is never removed and its amount/type/blanc
+  cannot be rewritten by hand (`PATCH` accepts only `reason`/`author` on these
+  rows): change the policy (price, annulment, deletion, blanc) and the server
+  rewrites the rows. Money rows (`increase`/`handover`) stay editable and
+  deletable, and the payments table follows them.
+- The void is honoured by every figure built from the same charges, so they all
+  agree: the daily report (`GET /currentcash/daily` - its `brokerBalance` and
+  `totalDailyBalance`), `GET /reports/payments` (`brokerBalance`),
+  `GET /reports/cash-inflow` (`totalOwed`) and the bi-weekly bills (`Charges`;
+  a fully voided policy is left off the bill and a deleted annulment refund is
+  not credited).
+- The balance history page walks the movements forward from the stored starting
+  balance, so the figures can be read with a pen: the first policy after a
+  starting balance of -298 at 45 shows -343, and the newest row matches the
+  Brokers tab. Without a starting balance there is no base, so the page walks
+  back from the stored figure instead. Old `reduce`/`adjust` rows are kept as
+  history: the page tags them as retired, they never move the balance, and an
+  admin can soft-delete them without changing it.
 - Every balance change is pushed to the connected clients (`broker_balance_changed`
   over the WebSocket), so an open Brokers tab or balance history re-reads the
   figure instead of showing a stale one.
@@ -495,6 +600,13 @@ it is excluded by both its type and its missing `Branch`.
   `brokerCashTransactions` (the top-ups of the requested day) and
   `brokerCashResets`.
 - `GET /currentcash/daily` returns `cashFromBrokers` (the top-ups of the day).
+  Its insurance money (`cashPayments`, `cardPayments`, `brokerBalance`,
+  `totalDailyBalance`) counts a policy's current price, or the annulment tax once
+  annulled, **plus whatever the admin removed from that policy's broker history**:
+  a soft-deleted insurance is left out completely (its rows can neither charge
+  nor void anything), and a hidden charge row of a live policy is a void exactly
+  like in the broker balance - so the day's broker figure and the broker balances
+  agree. Deleted cash entries are excluded from `availableCash`.
 - `POST /currentcash/reset` also clears it, recording the kept amounts in
   `broker_cash_resets`.
 
@@ -570,10 +682,14 @@ Each created insurance whose email sender is associated with a broker charges th
 Every payment period (two weeks of `Requests/PaymentSchedule.js`) ends with one
 **bill per broker**: the insurances created for that broker inside the period,
 counted by vehicle type and summed. An annulled policy is billed at its annulled
-price (`AnnulFee`), never at its original `Price`; a deleted one is not billed.
-A policy that was billed and **paid** in an earlier period and is annulled now
-gives the remaining cash (`Price - AnnulFee`) back as a credit of the current
-period, so the amount due is `Charges - Refund`. Bills are in **euros only**.
+price (`AnnulFee`), never at its original `Price`; a deleted one is not billed. A
+charge whose history row the admin deleted (a void) is not billed either: the
+broker's balance stops charging it, so the bill cannot ask for it - a policy
+whose whole charge is voided is left off the bill, and an annulment refund that
+was deleted is not credited. A policy that was billed and **paid** in an earlier
+period and is annulled now gives the remaining cash (`Price - AnnulFee`) back as
+a credit of the current period, so the amount due is `Charges - Refund`. Bills
+are in **euros only**.
 
 A **sub-broker is never mailed**: its bill is charged its display price (its own
 `broker_tariffs`) and sent to its main broker, together with what we receive

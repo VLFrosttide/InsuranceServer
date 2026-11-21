@@ -97,16 +97,29 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
       // walk-in net-value convention above (full price while active, the
       // annulment tax once annulled ONLY when the broker paid it, deleted
       // policies contribute nothing) and is keyed on the policy's creation date.
+      // A charge the admin removed from a policy's broker history (a hidden
+      // policy-derived row) is a void: the broker balance no longer charges it,
+      // so it comes off here too, exactly like in the daily report.
       const [[brokerAgg]] = await DBConnection.query(
         `SELECT ROUND(SUM(CASE
-                  WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2))
-                  WHEN LOWER(TRIM(COALESCE(AnnulReason, ''))) = 'broker'
-                  THEN COALESCE(AnnulFee, 0)
+                  WHEN i.Annulled = 0 THEN CAST(i.Price AS DECIMAL(15,2))
+                  WHEN LOWER(TRIM(COALESCE(i.AnnulReason, ''))) = 'broker'
+                  THEN COALESCE(i.AnnulFee, 0)
                   ELSE 0
-                END), 2) AS Net
-           FROM insurance
-          WHERE BrokerId IS NOT NULL AND Deleted = 0
-            AND CreationDate >= ? AND CreationDate < ?`,
+                END) + COALESCE(SUM(v.Voided), 0), 2) AS Net
+           FROM insurance i
+           LEFT JOIN (
+                 SELECT BrokerId AS VoidBrokerId, BlancNumber AS VoidBlanc,
+                        SUM(Amount) AS Voided
+                   FROM broker_balance_movements
+                  WHERE Deleted = 1
+                    AND Type IN ('policy', 'price_change', 'annulment',
+                                 'deletion')
+                  GROUP BY BrokerId, BlancNumber
+               ) v
+             ON v.VoidBrokerId = i.BrokerId AND v.VoidBlanc = i.BlancNumber
+          WHERE i.BrokerId IS NOT NULL AND i.Deleted = 0
+            AND i.CreationDate >= ? AND i.CreationDate < ?`,
         [fromParam, toParam]
       );
       const brokerBalance = round2(Number(brokerAgg && brokerAgg.Net) || 0);
@@ -200,18 +213,31 @@ module.exports.createReportsRouter = function createReportsRouter(DBConnection) 
       );
 
       // 2) Total owed: net value of broker insurances created within the period.
+      //    A charge the admin removed from a policy's broker history (a hidden
+      //    policy-derived row) is a void: the broker balance no longer charges
+      //    it, so it is not owed either.
       const [owedRows] = await DBConnection.query(
-        `SELECT BrokerId AS brokerId,
+        `SELECT i.BrokerId AS brokerId,
                 ROUND(SUM(CASE
-                  WHEN Annulled = 0 THEN CAST(Price AS DECIMAL(15,2))
-                  WHEN LOWER(TRIM(COALESCE(AnnulReason, ''))) = 'broker'
-                  THEN COALESCE(AnnulFee, 0)
+                  WHEN i.Annulled = 0 THEN CAST(i.Price AS DECIMAL(15,2))
+                  WHEN LOWER(TRIM(COALESCE(i.AnnulReason, ''))) = 'broker'
+                  THEN COALESCE(i.AnnulFee, 0)
                   ELSE 0
-                END), 2) AS totalOwed
-           FROM insurance
-          WHERE BrokerId IS NOT NULL AND Deleted = 0
-            AND CreationDate >= ? AND CreationDate < ?
-          GROUP BY BrokerId`,
+                END) + COALESCE(SUM(v.Voided), 0), 2) AS totalOwed
+           FROM insurance i
+           LEFT JOIN (
+                 SELECT BrokerId AS VoidBrokerId, BlancNumber AS VoidBlanc,
+                        SUM(Amount) AS Voided
+                   FROM broker_balance_movements
+                  WHERE Deleted = 1
+                    AND Type IN ('policy', 'price_change', 'annulment',
+                                 'deletion')
+                  GROUP BY BrokerId, BlancNumber
+               ) v
+             ON v.VoidBrokerId = i.BrokerId AND v.VoidBlanc = i.BlancNumber
+          WHERE i.BrokerId IS NOT NULL AND i.Deleted = 0
+            AND i.CreationDate >= ? AND i.CreationDate < ?
+          GROUP BY i.BrokerId`,
         [fromDay, toDay]
       );
 

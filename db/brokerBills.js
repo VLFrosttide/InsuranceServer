@@ -10,7 +10,11 @@
 //   * an annulled policy counts with its ANNULLED price (AnnulFee - the part of
 //     the price the company keeps), never with the original sale price (kept in
 //     OriginalPrice once the tax becomes the price);
-//   * a deleted policy does not count at all.
+//   * a deleted policy does not count at all;
+//   * a charge the admin deleted from the policy's broker history (a void) is not
+//     charged either - the broker's balance stops charging it, so the bill cannot
+//     ask for it. A policy whose whole charge is voided is left off the bill, and
+//     an annulment refund that was deleted is not credited.
 //
 // Two things are added to the period's charges:
 //
@@ -353,6 +357,61 @@ async function loadAnnulments(conn, brokerId, periodStart, periodEnd) {
 module.exports.loadAnnulments = loadAnnulments;
 
 /**
+ * The charges an admin deleted from a policy's broker history. A hidden
+ * (soft-deleted) policy-derived row is a VOID: the broker balance no longer
+ * charges it, so the bill must not charge it either - otherwise the broker is
+ * billed for money its balance does not owe. Only rows of a policy that still
+ * exists count; a soft-deleted insurance is not on the bill at all.
+ *
+ * @param {{query: Function}} conn
+ * @param {number} brokerId
+ * @param {string} periodStart
+ * @param {string} periodEnd
+ * @returns {Promise<{byBlanc: Map<string, number>,
+ *                    annulledRefunds: Set<string>}>}
+ *   `byBlanc` is the total void per policy created inside the period;
+ *   `annulledRefunds` names the policies whose annulment refund was deleted.
+ */
+async function loadVoidedCharges(conn, brokerId, periodStart, periodEnd) {
+  const [chargeRows] = await conn.query(
+    `SELECT i.BlancNumber, SUM(m.Amount) AS Amount
+       FROM broker_balance_movements m
+       JOIN insurance i
+         ON i.BrokerId = m.BrokerId AND i.BlancNumber = m.BlancNumber
+        AND i.Deleted = 0
+      WHERE m.BrokerId = ? AND m.Deleted = 1
+        AND m.Type IN ('policy', 'price_change', 'annulment', 'deletion')
+        AND i.CreationDate >= ? AND i.CreationDate < ?
+      GROUP BY i.BlancNumber`,
+    [
+      brokerId,
+      `${periodStart} 00:00:00`,
+      `${shiftDays(periodEnd, 1)} 00:00:00`,
+    ]
+  );
+  const [refundRows] = await conn.query(
+    `SELECT DISTINCT i.BlancNumber
+       FROM broker_balance_movements m
+       JOIN insurance i
+         ON i.BrokerId = m.BrokerId AND i.BlancNumber = m.BlancNumber
+        AND i.Deleted = 0
+      WHERE m.BrokerId = ? AND m.Deleted = 1 AND m.Type = 'annulment'`,
+    [brokerId]
+  );
+
+  const byBlanc = new Map();
+  for (const row of chargeRows || []) {
+    const blanc = String(row.BlancNumber ?? "").trim();
+    if (blanc) byBlanc.set(blanc, round2(row.Amount));
+  }
+  const annulledRefunds = new Set(
+    (refundRows || []).map((row) => String(row.BlancNumber ?? "").trim())
+  );
+  return { byBlanc, annulledRefunds };
+}
+module.exports.loadVoidedCharges = loadVoidedCharges;
+
+/**
  * The broker's balance (signed) right before a period starts, from the balance
  * ledger. Informational on the bill: a negative value is money carried over
  * from earlier periods.
@@ -479,9 +538,32 @@ async function computeBillFigures(conn, broker, periodStart, periodEnd) {
     pricing = { subPricing: display.subPricing, priceFor: helpers.priceFor };
   }
 
-  const lines = rows.map((row) =>
-    priceLineForBroker(toBillLine(row), row, pricing)
-  );
+  // Charges the admin deleted from a policy's broker history are voids: the
+  // balance does not charge them, so the bill must not either.
+  const voids = await loadVoidedCharges(conn, brokerId, periodStart, periodEnd);
+  const lines = [];
+  for (const row of rows) {
+    const base = toBillLine(row);
+    const priced = priceLineForBroker(base, row, pricing);
+    const voided = voids.byBlanc.get(base.blancNumber) || 0;
+    if (voided === 0) {
+      lines.push(priced);
+      continue;
+    }
+    // A hidden sale row voids the whole charge: the policy is not billed at all
+    // (no charge, no cost, and it does not count as a billed policy).
+    if (round2(base.amount + voided) === 0) continue;
+    // Otherwise the void is a delta the admin removed (a hidden refund, say):
+    // it comes off what we charge. A sub-broker's charged amount is its display
+    // price, in other units than the ledger, so only its cost to us moves.
+    lines.push({
+      ...priced,
+      amount: round2(priced.amount + (pricing ? 0 : voided)),
+      cost: round2(priced.cost + voided),
+      voided,
+    });
+  }
+  if (!lines.length) return null;
   const summary = summarizeLines(lines);
   const charges = summary.total;
   const costCharges = round2(
@@ -506,6 +588,9 @@ async function computeBillFigures(conn, broker, periodStart, periodEnd) {
     // annulled price, so there is nothing to refund on top of it.
     if (!ownPeriod || ownPeriod >= periodStart) continue;
     if (!paidPeriods.has(ownPeriod)) continue;
+    // The refund itself was deleted from the broker's history (a void): the
+    // balance did not credit it, so the bill must not credit it either.
+    if (voids.annulledRefunds.has(String(row.BlancNumber ?? "").trim())) continue;
     const displayPrice =
       pricing && pricing.subPricing
         ? pricing.priceFor(row, pricing.subPricing)

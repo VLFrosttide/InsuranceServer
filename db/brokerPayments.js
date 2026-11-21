@@ -8,6 +8,7 @@
 //   CashBalance = starting balance
 //               + every payment in broker_payments
 //               - every live insurance (an annulled one at its tax)
+//               - every voided policy charge (a hidden policy-derived row)
 //
 // Payments used to be read back from `broker_balance_movements` (the history
 // ledger). That table is a JOURNAL: an admin may correct an amount or
@@ -16,6 +17,10 @@
 // it meant a cosmetic correction could move the balance and a missing row could
 // hide a payment. The payment money therefore lives here, in its own table,
 // while the ledger stays what it is: the audit trail of who did what, when.
+// The only thing the balance takes from the ledger is the set of VOIDS: a
+// policy-derived row of a live policy that an admin soft-deleted stops being
+// charged (a soft-deleted insurance is charged nothing and all its rows are
+// skipped). See recalculateBrokerBalance.
 //
 // Every payment is still written to the ledger as well, in the same
 // transaction, so the history page, "Cash from Brokers" and the reports keep
