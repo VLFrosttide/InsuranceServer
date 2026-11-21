@@ -439,8 +439,8 @@ npm start
 
 Log in with any of the demo accounts above. The client routes by role:
 
-- worker / list4e → Add Insurance form + dashboard
-- admin → dashboard (users, stats, insurances)
+- worker / list4e → Add Insurance form + dashboard (unread email cards)
+- admin → dashboard (unread email cards, users, branches, insurances)
 - client → dashboard (profile, my insurances)
 
 ## HTTP API
@@ -467,7 +467,10 @@ still sent over `http://`. The Electron client does not rely on the cookie:
   `POST /admin/users/:username/restore`,
   `POST /admin/users/:username/promote`
 - Worker (`role 2`): `/worker`, `/worker/clients`,
-  `POST /worker/clients/balance`, `POST /worker/insurances`
+  `POST /worker/clients/balance`
+- Email cards (`role 1`/`role 2`): `POST /worker/insurances` (the same form also
+  creates walk-ins), `POST /worker/insurances/reply`,
+  `GET /worker/emails/:messageId/thread`
 - Client (`role 3`): `/client`, `/client/profile`, `/client/insurances`
 - Broker + current cash (`role 1`/`role 2`): see the sections below.
 
@@ -753,13 +756,14 @@ blocks employee login and blocks the creation of new insurances through it.
 
 1. Send `{ "type": "auth", "token": "<login token>", "branch": "..." }` to
    authenticate.
-2. Connected users with role `2` (worker) receive
+2. Connected users with role `1` (admin) or `2` (worker) receive
    `{ "type": "new_email", "data": {...} }` when the Gmail poller finds a new
    unread message. Send `{ "type": "list_emails" }` to (re-)fetch the current
-   cards.
+   cards. Admins get the same cards on their dashboard, so they can claim, reply
+   to and complete an email when no worker is available.
 3. Email cards carry only attachment **metadata** (`id`, `filename`,
    `mimeType`, `size`) — the bytes are not downloaded or sent until requested.
-   When a worker opens a card, send
+   When a user opens a card, send
    `{ "type": "get_attachment", "messageId": "<email message id>", "id": "<attachment id>" }`
    to fetch one attachment's bytes; the server replies with
    `{ "type": "get_attachment", ok, id, filename, mimeType, size, base64 }`.

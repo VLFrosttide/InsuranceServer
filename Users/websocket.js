@@ -11,8 +11,14 @@ function checkCutOffSender(from) {
 let wss = null;
 let db = null;
 
-// Only clients whose user account has this role receive email updates.
-const EMAIL_UPDATE_ROLE = "2";
+// Roles that receive and may work the unread email cards. Workers handle the
+// broker emails day to day; admins get the same cards on their dashboard so
+// they can step in and process an email themselves when needed.
+const EMAIL_UPDATE_ROLES = new Set(["1", "2"]);
+
+function canUseEmailCards(role) {
+  return EMAIL_UPDATE_ROLES.has(String(role == null ? "" : role));
+}
 
 // How long a dropped connection's claimed emails stay reserved before they are
 // returned to the pool (and marked unread), giving the worker time to
@@ -282,8 +288,8 @@ module.exports.initWsServer = function initWsServer(server, DBConnection) {
     ws.lastBufferedAmount = 0;
     ws.stalledTicks = 0;
     // Email cards claimed through this specific connection. Used to release
-    // them if the worker client drops (power loss / network failure) so other
-    // workers can pick them up again.
+    // them if the client drops (power loss / network failure) so other
+    // workers or admins can pick them up again.
     ws.claimedEmails = new Set();
 
     ws.on("error", (err) => {
@@ -500,7 +506,7 @@ async function handleMessage(ws, data) {
     if (!ws.username) return;
     safeSend(ws, { type: "presence_update", data: onlineWorkers() });
   } else if (msg.type === "list_emails") {
-    if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
+    if (!ws.username || !canUseEmailCards(ws.role)) {
       safeSend(ws, { type: "list_emails", data: [] });
       return;
     }
@@ -531,7 +537,7 @@ async function handleMessage(ws, data) {
         : [];
     safeSend(ws, { type: "list_emails", data, archived });
   } else if (msg.type === "get_attachment") {
-    if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
+    if (!ws.username || !canUseEmailCards(ws.role)) {
       return;
     }
     const messageId = msg.messageId || null;
@@ -577,7 +583,7 @@ async function handleMessage(ws, data) {
       });
     }
   } else if (msg.type === "claim_email") {
-    if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
+    if (!ws.username || !canUseEmailCards(ws.role)) {
       return;
     }
     const messageId = msg.messageId || null;
@@ -631,7 +637,8 @@ async function handleMessage(ws, data) {
     }
     safeSend(ws, { type: "claim_email", ok, messageId });
     if (ok) {
-      // Opened (or re-opened after a reconnect) by a worker: mark it read.
+      // Opened (or re-opened after a reconnect) by an email-card user: mark it
+      // read.
       try {
         await mailStore.syncReadState(email.account, messageId);
       } catch (err) {
@@ -639,7 +646,7 @@ async function handleMessage(ws, data) {
       }
     }
   } else if (msg.type === "release_email") {
-    if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
+    if (!ws.username || !canUseEmailCards(ws.role)) {
       return;
     }
     const messageId = msg.messageId || null;
@@ -647,19 +654,19 @@ async function handleMessage(ws, data) {
     const releasable = messageId ? mailStore.get(messageId) : null;
     if (releasable && !canSeeEmail(ws.branch, releasable)) return;
     const claimer = mailStore.getClaimer(messageId);
-    // Only the worker that holds the claim may return it to everyone. Carry
+    // Only the user that holds the claim may return it to everyone. Carry
     // the full email so clients without it can reconstruct the card.
     if (!claimer || claimer === ws.username) {
       mailStore.unclaim(messageId);
       ws.claimedEmails.delete(messageId);
       if (claimer === ws.username) {
         const email = mailStore.get(messageId);
-        // The worker cancelled (went back to the dashboard).
+        // The user cancelled (went back to the dashboard).
         if (email) await releaseEmail(email, messageId);
       }
     }
   } else if (msg.type === "complete_email") {
-    if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
+    if (!ws.username || !canUseEmailCards(ws.role)) {
       return;
     }
     const messageId = msg.messageId || null;
@@ -670,7 +677,7 @@ async function handleMessage(ws, data) {
 
     mailStore.remove(messageId, "completed");
     ws.claimedEmails.delete(messageId);
-    // Only now mark the Gmail message read (the worker finished the form).
+    // Only now mark the Gmail message read (the user finished the form).
     // Pass the account so the correct inbox's API client is used.
     // Queued behind any pending "mark unread" (e.g. from a dropped
     // connection), so the email always ends up read.
@@ -681,7 +688,7 @@ async function handleMessage(ws, data) {
     }
     broadcast({ type: "email_completed", messageId }, email);
   } else if (msg.type === "mark_irrelevant") {
-    if (!ws.username || String(ws.role) !== EMAIL_UPDATE_ROLE) {
+    if (!ws.username || !canUseEmailCards(ws.role)) {
       return;
     }
     const messageId = msg.messageId || null;
@@ -705,7 +712,7 @@ async function handleMessage(ws, data) {
 
 /**
  * Send a "new email" notification only to connected, authenticated clients
- * whose user account has the designated role.
+ * whose user account may work email cards (admins and workers).
  *
  * @param {Object} emailInfo  Details about the unread email.
  * @returns {number} Number of clients the notification was delivered to.
@@ -715,8 +722,8 @@ module.exports.notifyUnreadEmail = function notifyUnreadEmail(emailInfo) {
 };
 
 /**
- * Tell workers that an email was read in Gmail outside of this app, so its
- * card must be removed from their dashboards.
+ * Tell workers and admins that an email was read in Gmail outside of this app,
+ * so its card must be removed from their dashboards.
  *
  * @param {Object} emailInfo  The email that is no longer unread.
  * @returns {number} Number of clients the notification was delivered to.
@@ -730,8 +737,8 @@ module.exports.notifyEmailRead = function notifyEmailRead(emailInfo) {
 
 /**
  * Evict every stored email whose sender matches one of `addresses` (e.g. when a
- * broker is cut off) and notify connected workers so their cards disappear
- * immediately.
+ * broker is cut off) and notify connected workers and admins so their cards
+ * disappear immediately.
  *
  * @param {Iterable<string>} addresses
  */
@@ -773,11 +780,11 @@ module.exports.evictEmailsForAddresses = async function evictEmailsForAddresses(
 };
 
 /**
- * Send a payload to every connected, authenticated client belonging to the
- * designated email-update role.
+ * Send a payload to every connected, authenticated client belonging to one of
+ * the email-card roles (admins and workers).
  *
- * @param {Object} payload  Message to deliver to workers.
- * @param {Object} [email]  When given, only workers whose branch is allowed to
+ * @param {Object} payload  Message to deliver to email-card users.
+ * @param {Object} [email]  When given, only users whose branch is allowed to
  *   see this email (see Mail/branchRouting.js) receive the payload.
  * @returns {number} Number of clients the notification was delivered to.
  */
@@ -792,7 +799,7 @@ function broadcast(payload, email) {
     if (
       client.readyState === WebSocket.OPEN &&
       client.username &&
-      String(client.role) === EMAIL_UPDATE_ROLE &&
+      canUseEmailCards(client.role) &&
       (!email || canSeeEmail(client.branch, email))
     ) {
       try {

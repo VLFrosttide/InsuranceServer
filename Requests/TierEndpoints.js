@@ -1374,7 +1374,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     }
   );
 
-  router.post("/worker/insurances", auth, requireRole(2), async (req, res) => {
+  // Create an insurance from the add-insurance form. Workers use it for their
+  // email cards and walk-ins; admins use the same form when they claim an email
+  // card on their dashboard, so the route serves both roles.
+  router.post("/worker/insurances", auth, requireRole(1, 2), async (req, res) => {
     try {
       const b = req.body || {};
       const policyNumber = b.PolicyNumber ?? b.policyNumber ?? "";
@@ -1718,11 +1721,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // POST /worker/insurances/reply
   // Send a text reply back to the original sender of an unread email. Used by
   // the dedicated reply field at the bottom of the add-insurance form when it
-  // was opened from an email card.
+  // was opened from an email card (a worker's or an admin's).
   router.post(
     "/worker/insurances/reply",
     auth,
-    requireRole(2),
+    requireRole(1, 2),
     async (req, res) => {
       try {
         const messageId = req.body?.messageId ?? req.body?.MessageId ?? null;
@@ -1766,7 +1769,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   router.get(
     "/worker/emails/:messageId/thread",
     auth,
-    requireRole(2),
+    requireRole(1, 2),
     async (req, res) => {
       const messageId = String(req.params.messageId || "").trim();
       if (!messageId) {
