@@ -837,6 +837,134 @@ async function main() {
       r.status === 403
     );
 
+    // --- Borrowed blancs: Kadri, Beysim and Varna use Kap Andreevo's ---------
+    // The three small brokers keep no blanc batches of their own; they sell
+    // Kap Andreevo's blancs. A blanc from Kap Andreevo's batches is therefore
+    // accepted for them, while a blanc from any other broker (and Kap
+    // Andreevo's blanc for any other broker) keeps the hard error.
+    {
+      const brokers =
+        (await req("GET", "/brokers", null, adminToken)).data.brokers || [];
+      const byName = new Map(
+        brokers.map((b) => [String(b.Name || "").trim().toLowerCase(), b])
+      );
+      const kadri = byName.get("kadri");
+      const beysim = byName.get("beysim");
+      const varna = byName.get("varna");
+      const kap = byName.get("kapandreevo");
+      const outsider = brokers.find(
+        (b) =>
+          !["kadri", "beysim", "varna", "kapandreevo"].includes(
+            String(b.Name || "").trim().toLowerCase()
+          ) &&
+          Array.isArray(b.batches) &&
+          b.batches.length > 0
+      );
+
+      // A throw-away batch in a far-away, timestamp-unique range gives the
+      // checks three Kap Andreevo blancs without consuming the crossing's real
+      // numbers; the batch is removed at the end.
+      const kapBlancs = [];
+      let createdBatch = null;
+      if (kap) {
+        const base = (Date.now() % 100000000) * 10 + 1000;
+        const added = await req(
+          "POST",
+          `/brokers/${kap.id}/batches`,
+          { RangeStart: base, RangeEnd: base + 2 },
+          adminToken
+        );
+        const batch = (added.data?.broker?.batches || []).find(
+          (x) => Number(x.RangeStart) === base
+        );
+        if (batch) {
+          createdBatch = { brokerId: kap.id, id: batch.id };
+          kapBlancs.push(base, base + 1, base + 2);
+        }
+      }
+
+      if (
+        !kadri ||
+        !beysim ||
+        !varna ||
+        !kap ||
+        !outsider ||
+        kapBlancs.length < 3
+      ) {
+        console.log(
+          "  SKIP  borrowed-blanc checks (fixture brokers missing or the Kap Andreevo test batch could not be created)"
+        );
+      } else {
+        const createFor = (broker, blanc) =>
+          req(
+            "POST",
+            "/admin/insurances",
+            {
+              BlancNumber: String(blanc),
+              PolicyNumber: `P-${blanc}-${broker.id}`,
+              CarNumber: "CB 8282 ZZ",
+              Price: "40",
+              BrokerId: broker.id,
+            },
+            adminToken
+          );
+
+        const borrowers = [kadri, beysim, varna];
+        for (let i = 0; i < borrowers.length; i += 1) {
+          const broker = borrowers[i];
+          const blanc = kapBlancs[i];
+          const created = await createFor(broker, blanc);
+          check(
+            `${broker.Name} may write a policy on Kap Andreevo's blanc ${blanc} -> 201`,
+            created.status === 201,
+            JSON.stringify(created.data)
+          );
+          if (created.status === 201) {
+            const removed = await req(
+              "DELETE",
+              `/insurances/${blanc}`,
+              null,
+              adminToken
+            );
+            check(
+              `Borrowed blanc ${blanc} policy deleted -> 200`,
+              removed.status === 200,
+              JSON.stringify(removed.data)
+            );
+          }
+        }
+
+        // The exemption is Kap Andreevo only: another broker's blanc is still
+        // refused for Kadri, and Kap Andreevo's blanc is still refused for
+        // every other broker.
+        const otherBrokerBlanc = outsider.batches[0].RangeStart;
+        const refusedOther = await createFor(kadri, otherBrokerBlanc);
+        check(
+          `Kadri is still refused a blanc from ${outsider.Name} -> 422 BLANC_BELONGS_TO_ANOTHER_BROKER`,
+          refusedOther.status === 422 &&
+            refusedOther.data.code === "BLANC_BELONGS_TO_ANOTHER_BROKER",
+          JSON.stringify(refusedOther.data)
+        );
+
+        const refusedKap = await createFor(outsider, kapBlancs[0]);
+        check(
+          `${outsider.Name} is still refused a Kap Andreevo blanc -> 422 BLANC_BELONGS_TO_ANOTHER_BROKER`,
+          refusedKap.status === 422 &&
+            refusedKap.data.code === "BLANC_BELONGS_TO_ANOTHER_BROKER",
+          JSON.stringify(refusedKap.data)
+        );
+      }
+
+      if (createdBatch) {
+        await req(
+          "DELETE",
+          `/brokers/${createdBatch.brokerId}/batches/${createdBatch.id}`,
+          null,
+          adminToken
+        );
+      }
+    }
+
     // Clean up test fixtures
     await req("POST", `/admin/users/${encodeURIComponent(subUsername)}/delete`, null, adminToken);
     await req("DELETE", `/insurances/${sbBlanc}`, null, adminToken);

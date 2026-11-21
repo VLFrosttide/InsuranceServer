@@ -54,6 +54,14 @@
 // admin editing that batch's range adopts it: AutoAdded is cleared and the pink
 // goes away. A blanc that is already inside another broker's batch is never
 // adopted - the create is refused with a message naming that broker.
+//
+// Exception - borrowed blancs: Kadri, Beysim and Varna are small brokers that
+// keep no blanc batches of their own; the blancs they sell are Kap Andreevo's
+// (the walk-in border crossing hands them out). A policy for one of those three
+// brokers may therefore carry a blanc from Kap Andreevo's batches although it
+// is in none of the broker's own. This is the ONLY exemption - a blanc that
+// belongs to any other broker is still refused, and every other broker still
+// gets the hard error (see canUseKapAndreevoBlanc).
 
 const express = require("express");
 const { requireAuth, requireRole } = require("./Auth.js");
@@ -299,6 +307,72 @@ const findOtherBrokerWithBlanc = (module.exports.findOtherBrokerWithBlanc =
       id: Number(rows[0].id),
       name: rows[0].name === undefined || rows[0].name === null ? "" : String(rows[0].name),
     };
+  });
+
+/**
+ * Normalise a broker name for the borrowed-blanc comparison. Case and
+ * whitespace insensitive, so a stored "Kap Andreevo" matches "KapAndreevo" and
+ * a stored "Kadri " matches "Kadri".
+ *
+ * @param {any} name
+ * @returns {string}
+ */
+function normalizeBlancBrokerName(name) {
+  return String(name == null ? "" : name)
+    .toLowerCase()
+    .replace(/\s+/g, "");
+}
+
+// The small brokers that write on Kap Andreevo's blancs. They keep no blanc
+// batches of their own, so a blanc from Kap Andreevo's batches is accepted for
+// them (and ONLY from Kap Andreevo: a blanc held by any other broker stays a
+// hard error, exactly as it is for every other broker).
+const KAP_ANDREEVO_BLANC_BORROWERS = new Set(["kadri", "beysim", "varna"]);
+const KAP_ANDREEVO_BLANC_LENDER = "kapandreevo";
+
+/**
+ * Whether `brokerId` may write a policy on a blanc that lives in Kap Andreevo's
+ * blanc batches although it is not in a batch of its own. True only for the
+ * small brokers Kadri, Beysim and Varna and only when the blanc really is inside
+ * one of Kap Andreevo's batches - a blanc from any other broker is never
+ * borrowed this way. A blanc that belongs to several brokers (legacy overlap,
+ * impossible through the batch endpoints) is not borrowed either.
+ *
+ * @param {{query: Function}} conn
+ * @param {number} brokerId  The broker the policy is written for.
+ * @param {any} blancNumber
+ * @returns {Promise<boolean>}
+ */
+const canUseKapAndreevoBlanc = (module.exports.canUseKapAndreevoBlanc =
+  async function canUseKapAndreevoBlanc(conn, brokerId, blancNumber) {
+    const id = Number(brokerId);
+    if (!Number.isInteger(id) || id <= 0) return false;
+    const numeric = parseInt(String(blancNumber ?? "").trim(), 10);
+    if (!Number.isFinite(numeric)) return false;
+    // Every batch that contains the blanc, together with its owner and the
+    // name of the broker the policy is written for.
+    const [rows] = await conn.query(
+      `SELECT t.Name AS TargetName, o.id AS OwnerId, o.Name AS OwnerName
+         FROM brokers t
+         JOIN broker_blanc_batches bb
+           ON bb.RangeStart <= ? AND bb.RangeEnd >= ?
+         LEFT JOIN brokers o ON o.id = bb.BrokerId
+        WHERE t.id = ?`,
+      [numeric, numeric, id]
+    );
+    if (!Array.isArray(rows) || rows.length === 0) return false;
+    const target = normalizeBlancBrokerName(rows[0].TargetName);
+    if (!KAP_ANDREEVO_BLANC_BORROWERS.has(target)) return false;
+    // Ignore the broker's own batches (a blanc it already holds needs no
+    // borrowing); every remaining owner must be Kap Andreevo.
+    const owners = rows.filter((row) => Number(row.OwnerId) !== id);
+    return (
+      owners.length > 0 &&
+      owners.every(
+        (row) =>
+          normalizeBlancBrokerName(row.OwnerName) === KAP_ANDREEVO_BLANC_LENDER
+      )
+    );
   });
 
 /**

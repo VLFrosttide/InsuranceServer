@@ -23,6 +23,7 @@ const {
   resolveBrokerByEmail,
   blancInBrokerBatches,
   findOtherBrokerWithBlanc,
+  canUseKapAndreevoBlanc,
   addAutoBlancBatch,
   decreaseBrokerForInsurance,
   restoreBrokerForAnnulment,
@@ -169,6 +170,11 @@ function toFlag(value) {
  * already asked the user) create the policy anyway. Returns true when the
  * response was sent and the create must be aborted.
  *
+ * The small brokers Kadri, Beysim and Varna hold no batches of their own: they
+ * write on Kap Andreevo's blancs, so a blanc inside Kap Andreevo's batches is
+ * accepted for them here (see canUseKapAndreevoBlanc). A blanc from any other
+ * broker is not - that case is refused by rejectIfBlancBelongsToAnotherBroker.
+ *
  * @param {import("express").Response} res
  * @param {{query: Function}} conn
  * @param {number|null} brokerId
@@ -188,6 +194,13 @@ async function rejectIfBlancOutsideBrokerBatches(
     return false;
   }
   if (await blancInBrokerBatches(conn, brokerId, blancNumber)) return false;
+  // Kadri, Beysim and Varna write on Kap Andreevo's blancs, and only on those.
+  if (
+    typeof canUseKapAndreevoBlanc === "function" &&
+    (await canUseKapAndreevoBlanc(conn, brokerId, blancNumber))
+  ) {
+    return false;
+  }
   res.status(422).json({
     error: "This blanc number is not in any of the broker's blanc batches",
     code: "BLANC_OUTSIDE_BROKER_BATCHES",
@@ -206,6 +219,10 @@ async function rejectIfBlancOutsideBrokerBatches(
  * changes the blanc number. Returns true when the response was sent and the
  * create must be aborted.
  *
+ * The one exemption: Kadri, Beysim and Varna sell Kap Andreevo's blancs, so a
+ * blanc inside Kap Andreevo's batches is allowed for them. Every other lender
+ * (and every other broker) keeps the hard error.
+ *
  * @param {import("express").Response} res
  * @param {{query: Function}} conn
  * @param {number|null} brokerId
@@ -222,6 +239,15 @@ async function rejectIfBlancBelongsToAnotherBroker(
   if (typeof findOtherBrokerWithBlanc !== "function") return false;
   const owner = await findOtherBrokerWithBlanc(conn, brokerId, blancNumber);
   if (!owner) return false;
+  // Kadri, Beysim and Varna write on Kap Andreevo's blancs. The exemption
+  // covers ONLY Kap Andreevo as the lender; any other broker's blanc is still
+  // refused below.
+  if (
+    typeof canUseKapAndreevoBlanc === "function" &&
+    (await canUseKapAndreevoBlanc(conn, brokerId, blancNumber))
+  ) {
+    return false;
+  }
   const name = owner.name || `#${owner.id}`;
   res.status(422).json({
     error: `This blanc number belongs to another broker's blanc batches (${name})`,
