@@ -1031,6 +1031,7 @@ async function runSetup(config = {}) {
        Amount DECIMAL(15,2) NOT NULL,
        Type VARCHAR(30) NOT NULL,
        Reason VARCHAR(255) NOT NULL DEFAULT '',
+       Recipient VARCHAR(100) NULL,
        Author VARCHAR(45) NOT NULL DEFAULT '',
        BlancNumber VARCHAR(45) NULL,
        CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1046,6 +1047,20 @@ async function runSetup(config = {}) {
      COMMENT='Every change to a broker CashBalance (signed Amount)'
    `);
 
+  // Hand-overs record who received the money ("Received by"). Add the column to
+  // pre-existing ledgers BEFORE the payments mirror is backfilled, so the
+  // backfill can copy it. Fresh installs already have it in the CREATE above.
+  const [movementRecipientCols] = await db.query(
+    "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    [DB_NAME, "broker_balance_movements"]
+  );
+  if (!movementRecipientCols.some((c) => c.COLUMN_NAME === "Recipient")) {
+    await db.query(
+      "ALTER TABLE broker_balance_movements ADD COLUMN Recipient VARCHAR(100) NULL AFTER Reason"
+    );
+    console.log("Added broker_balance_movements.Recipient column");
+  }
+
   // A broker's balance is rebuilt from the insurance table and the money the
   // broker actually handed over, so those payments have their own table now
   // (db/brokerPayments.js). The history ledger is only the audit trail; a
@@ -1053,6 +1068,16 @@ async function runSetup(config = {}) {
   // table and mirror the payments already in the ledger (idempotent).
   try {
     await ensureBrokerPaymentsTable(db);
+    const [paymentRecipientCols] = await db.query(
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+      [DB_NAME, "broker_payments"]
+    );
+    if (!paymentRecipientCols.some((c) => c.COLUMN_NAME === "Recipient")) {
+      await db.query(
+        "ALTER TABLE broker_payments ADD COLUMN Recipient VARCHAR(100) NULL AFTER Reason"
+      );
+      console.log("Added broker_payments.Recipient column");
+    }
     const mirrored = seed ? await backfillBrokerPayments(db) : 0;
     if (mirrored) {
       console.log(`Mirrored ${mirrored} broker payment(s) into broker_payments`);

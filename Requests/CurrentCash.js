@@ -2798,7 +2798,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
   );
 
   // POST /currentcash/handover
-  //   { amount, reason, recipient, currency, branch }
+  //   { amount, reason, recipient, currency, branch, date? (admin only) }
   //
   // The "Hand over" button of the Current cash screen: money physically given to
   // a person (a runner taking the takings to the safe, the owner collecting the
@@ -2822,6 +2822,34 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         if (time.error) {
           return res.status(400).json({ error: time.error });
         }
+        // An admin may record a hand-over on an earlier day (money given before
+        // anyone could enter it): `date` is the explicit calendar day and the
+        // time of day is kept from the movement's own timestamp. A worker always
+        // records "now"; the server refuses `date` from anyone else.
+        let createdAt = time.createdAt;
+        const rawDate = req.body?.date ?? req.body?.Date;
+        if (
+          rawDate !== undefined &&
+          rawDate !== null &&
+          String(rawDate).trim()
+        ) {
+          if (String(req.user?.role ?? "") !== "1") {
+            return res.status(403).json({
+              error: "Only an admin can record a hand-over on an earlier date",
+            });
+          }
+          const offset = req.body?.TzOffset ?? req.body?.tzOffset ?? null;
+          const day = resolveHistoryDay(rawDate, offset);
+          if (day.error) {
+            return res.status(400).json({ error: "Date must be YYYY-MM-DD" });
+          }
+          if (day.date > clientLocalDate(offset)) {
+            return res
+              .status(400)
+              .json({ error: "Date cannot be in the future" });
+          }
+          createdAt = `${day.date} ${createdAt.slice(11)}`;
+        }
         const applied = await DBConnection.withTransaction((conn) =>
           recordCashHandover(
             conn,
@@ -2831,7 +2859,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
             reasonText(reason),
             recipient,
             cur,
-            time.createdAt
+            createdAt
           )
         );
 
@@ -2971,9 +2999,10 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
   });
 
   // PATCH /currentcash/transactions/:id — correct a ledger entry.
-  // Only the entry's original author may edit it. The running balance is
-  // adjusted to match the reversed original movement + the new movement.
-  // The branch is taken from the original transaction (cannot be changed).
+  // Its original author may edit it; an admin may also edit any hand-over (for
+  // example to correct the day it belongs to). The running balance is adjusted
+  // to match the reversed original movement + the new movement. The branch is
+  // taken from the original transaction (cannot be changed).
   router.patch(
     "/currentcash/transactions/:id",
     auth,
@@ -2990,6 +3019,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         }
 
         const tx = rows[0];
+        const isAdmin = String(req.user?.role ?? "") === "1";
         // A deleted entry was already undone (its money was moved back), so
         // there is nothing left to correct.
         if (tx.Deleted) {
@@ -3003,7 +3033,8 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
             .status(400)
             .json({ error: "a hand-over return cannot be edited or deleted" });
         }
-        if (String(tx.Username) !== String(req.user.username)) {
+        const ownEntry = String(tx.Username) === String(req.user.username);
+        if (!ownEntry && !(isAdmin && isCashHandover(tx.Type))) {
           return res.status(403).json({
             error: "Forbidden: you can only edit your own transactions",
           });
@@ -3080,10 +3111,51 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         const oldAmount = Number(tx.Amount);
 
         // The correction's own ledger entries are stamped with the client's
-        // local time (the original transaction keeps its CreatedAt).
+        // local time. The hand-over itself keeps its own CreatedAt unless an
+        // admin explicitly moves it to another day (`date`).
         const time = resolveRequestCreatedAt(req.body);
         if (time.error) {
           return res.status(400).json({ error: time.error });
+        }
+
+        let newCreatedAt = null;
+        const rawDate = b.date ?? b.Date;
+        if (
+          rawDate !== undefined &&
+          rawDate !== null &&
+          String(rawDate).trim()
+        ) {
+          if (!isAdmin) {
+            return res.status(403).json({
+              error: "Only an admin can change the date of a hand-over",
+            });
+          }
+          if (!oldIsHandover) {
+            return res
+              .status(400)
+              .json({ error: "only a hand-over can change its date" });
+          }
+          const offset = b.TzOffset ?? b.tzOffset ?? null;
+          const day = resolveHistoryDay(rawDate, offset);
+          if (day.error) {
+            return res.status(400).json({ error: "Date must be YYYY-MM-DD" });
+          }
+          if (day.date > clientLocalDate(offset)) {
+            return res
+              .status(400)
+              .json({ error: "Date cannot be in the future" });
+          }
+          const p = (n) => String(n).padStart(2, "0");
+          const current =
+            tx.CreatedAt instanceof Date
+              ? `${tx.CreatedAt.getFullYear()}-${p(tx.CreatedAt.getMonth() + 1)}-${p(
+                  tx.CreatedAt.getDate()
+                )} ${p(tx.CreatedAt.getHours())}:${p(
+                  tx.CreatedAt.getMinutes()
+                )}:${p(tx.CreatedAt.getSeconds())}`
+              : String(tx.CreatedAt ?? "");
+          // Keep the time of day, so the row still sorts last within its day.
+          newCreatedAt = `${day.date} ${current.slice(11)}`;
         }
 
         // adjustBalance only knows "increase" and "reduce": both an expense and
@@ -3154,6 +3226,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
           await conn.query(
             `UPDATE cash_transactions
              SET Type = ?, Amount = ?, Currency = ?, Reason = ?, Recipient = ?
+                 ${newCreatedAt ? ", CreatedAt = ?" : ""}
              WHERE id = ?`,
             [
               newType,
@@ -3161,6 +3234,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
               newCurrency,
               newReason,
               newRecipient || null,
+              ...(newCreatedAt ? [newCreatedAt] : []),
               id,
             ]
           );

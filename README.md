@@ -289,7 +289,9 @@ after every change.
 
 `broker_payments` — money the broker actually handed over: a branch top-up
 (`increase`), a paid bill (`increase`) or a hand-over to the owner (`handover`).
-The balance formula reads **this** table for payments, never the
+A hand-over also stores who received it (`Recipient`) and the day the money
+changed hands (`CreatedAt`, which an admin may pick when recording or correct
+later). The balance formula reads **this** table for payments, never the
 `broker_balance_movements` ledger, so correcting a history row cannot silently
 move a balance. The one thing it takes from the ledger is the VOID: a
 policy-derived row an admin soft-deleted stops being charged (see the broker
@@ -488,12 +490,14 @@ the amount that was kept at the time of the reset.
   (Available cash) drops, but no Total cash row is written: a hand-over is
   neither a sale nor an expense, so Total daily cash and the day's expenses are
   untouched. Stored as `Type = 'handover'` with `Recipient`, and listed in the
-  day's Transactions.
+  day's Transactions. An admin may add `"date": "YYYY-MM-DD"` to record it on an
+  earlier day; the time of day is kept.
 - `POST /currentcash/reset` — reset the balance to `0` (records user + kept amount)
-- `PATCH /currentcash/transactions/:id` — correct a ledger entry (only its own
-  author may do this). A hand-over may be corrected (amount, currency, reason,
-  recipient) but its type cannot be changed to/from `increase`/`reduce`, so
-  money never silently moves between the expenses and Total daily cash.
+- `PATCH /currentcash/transactions/:id` — correct a ledger entry (its author, or
+  an admin for a hand-over). A hand-over may be corrected (amount, currency,
+  reason, recipient) and an admin may move it to another day (`date`), but its
+  type cannot be changed to/from `increase`/`reduce`, so money never silently
+  moves between the expenses and Total daily cash.
 - `DELETE /currentcash/transactions/:id` — soft-delete a ledger entry (admin
   only). The row is kept in `cash_transactions`, flagged with
   `Deleted`/`DeletedAt`/`DeletedBy`, and its money is reversed: an `increase` is
@@ -633,7 +637,7 @@ is left exactly as it was. The run is marked in `app_settings` as
   `deleted`, each with `DeletedAt`/`DeletedBy`)
 - `GET /brokers/:id` — single broker
 - `POST /brokers/:id/increase` — body `{ "amount": 100, "branch": "..." }` (the money is the branch's Cash from Brokers; current cash is not touched)
-- `POST /brokers/:id/handover` — body `{ "amount": 100, "currency": "EUR", "reason": "..." }` (the broker paid the owner directly: the balance grows like a top-up and the reports count it as a payment, but no branch takes the money, so Cash from Brokers is untouched)
+- `POST /brokers/:id/handover` — body `{ "amount": 100, "currency": "EUR", "reason": "...", "recipient": "Owner" }` (the broker paid the owner directly: the balance grows like a top-up and the reports count it as a payment, but no branch takes the money, so Cash from Brokers is untouched). An admin may add `"date": "YYYY-MM-DD"` to record it on an earlier day; the time of day is kept.
 
 There is **no `POST /brokers/:id/reduce`** any more. A balance is raised only by
 money the broker actually paid; it falls as policies are created and is

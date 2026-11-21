@@ -154,6 +154,58 @@ function resolveBrokerCreatedAt(body) {
 }
 
 /**
+ * Apply an ADMIN's explicitly chosen calendar day to a broker movement's
+ * timestamp. `date` ("YYYY-MM-DD") is a deliberate choice, unlike CreatedAt,
+ * which every client has always sent for "now": only an admin may name a day,
+ * it must exist and it may not lie in the future. The time of day is kept from
+ * the movement itself, so a backdated row still sorts last within its day.
+ *
+ * @param {object} [body]  Request body (reads `date` and `TzOffset`).
+ * @param {object} [user]  The authenticated user (role 1 = admin).
+ * @param {string} createdAt  The timestamp the movement would have without it.
+ * @param {string} label  Noun for the refusal message ("an increase" ...).
+ * @returns {{createdAt: string, changed?: boolean}|{status: number, error: string}}
+ */
+function resolveChosenMovementDay(body, user, createdAt, label) {
+  const b = body || {};
+  const rawDate = b.date ?? b.Date;
+  if (rawDate === undefined || rawDate === null || !String(rawDate).trim()) {
+    return { createdAt };
+  }
+  if (String(user?.role ?? "") !== "1") {
+    return {
+      status: 403,
+      error: `Only an admin can record ${label} on an earlier date`,
+    };
+  }
+  const day = String(rawDate).trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!m) {
+    return { status: 400, error: "Date must be YYYY-MM-DD" };
+  }
+  const [y, mo, d] = m.slice(1).map(Number);
+  const probe = new Date(Date.UTC(y, mo - 1, d));
+  // A day that does not exist in that month (2026-02-31) fails the round-trip.
+  // No timezone conversion applies: it is a calendar day.
+  if (
+    probe.getUTCFullYear() !== y ||
+    probe.getUTCMonth() !== mo - 1 ||
+    probe.getUTCDate() !== d
+  ) {
+    return { status: 400, error: "Date must be YYYY-MM-DD" };
+  }
+  const offset = b.TzOffset ?? b.tzOffset ?? null;
+  const today = clientLocalDateTime(offset).slice(0, 10);
+  if (day > today) {
+    return { status: 400, error: "Date cannot be in the future" };
+  }
+  return {
+    createdAt: `${day} ${String(createdAt || "").slice(11)}`,
+    changed: true,
+  };
+}
+
+/**
  * Resolve the broker that an insurance belongs to.
  *
  * Order of resolution:
@@ -984,6 +1036,7 @@ const BROKER_MOVEMENT_TABLE_SQL = `CREATE TABLE IF NOT EXISTS broker_balance_mov
   Amount DECIMAL(15,2) NOT NULL,
   Type VARCHAR(30) NOT NULL,
   Reason VARCHAR(255) NOT NULL DEFAULT '',
+  Recipient VARCHAR(100) NULL,
   Author VARCHAR(45) NOT NULL DEFAULT '',
   BlancNumber VARCHAR(45) NULL,
   CreatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -3107,7 +3160,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               brokerId
             );
             const [rows] = await DBConnection.query(
-              `SELECT id, Type, Amount, Reason, Author, BlancNumber, CreatedAt
+              `SELECT id, Type, Amount, Reason, Author, BlancNumber, CreatedAt,
+                      Recipient
                  FROM broker_balance_movements
                 WHERE BrokerId = ? AND Deleted = 0
                 ORDER BY CreatedAt DESC, id DESC`,
@@ -3124,6 +3178,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
                 Reason: m.Reason,
                 Author: m.Author,
                 BlancNumber: m.BlancNumber,
+                Recipient: m.Recipient ?? null,
                 CreatedAt:
                   m.CreatedAt instanceof Date
                     ? toLocalDateTime(m.CreatedAt)
@@ -3146,7 +3201,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         if (!allMovements) {
           const [rows] = await DBConnection.query(
             `SELECT m.id, m.Type, m.Amount, m.Reason, m.Author,
-                    m.BlancNumber, m.CreatedAt,
+                    m.BlancNumber, m.Recipient, m.CreatedAt,
                     i.Annulled AS PolicyAnnulled,
                     i.AnnulReason AS PolicyAnnulReason,
                     i.BrokerId AS PolicyBrokerId
@@ -3166,6 +3221,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
               Reason: m.Reason,
               Author: m.Author,
               BlancNumber: m.BlancNumber,
+              Recipient: m.Recipient ?? null,
               CreatedAt:
                 m.CreatedAt instanceof Date
                   ? toLocalDateTime(m.CreatedAt)
@@ -3399,6 +3455,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             Reason: m.Reason,
             Author: m.Author,
             BlancNumber: m.BlancNumber,
+            Recipient: m.Recipient ?? null,
             CreatedAt: m.CreatedAt,
             BalanceAfter: balAfter,
             PolicyAnnulled: m.PolicyAnnulled,
@@ -3416,7 +3473,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         if (includeDeleted) {
           const [deletedRows] = await DBConnection.query(
             `SELECT id, Type, Amount, Reason, Author, BlancNumber, CreatedAt,
-                    DeletedAt, DeletedBy
+                    DeletedAt, DeletedBy, Recipient
                FROM broker_balance_movements
               WHERE BrokerId = ? AND Deleted = 1
               ORDER BY CreatedAt DESC, id DESC
@@ -3431,6 +3488,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             Reason: r.Reason,
             Author: r.Author,
             BlancNumber: r.BlancNumber,
+            Recipient: r.Recipient ?? null,
             CreatedAt:
               r.CreatedAt instanceof Date ? toLocalDateTime(r.CreatedAt) : r.CreatedAt,
             DeletedAt:
@@ -3493,7 +3551,7 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
 
         const [[existing]] = await DBConnection.query(
           `SELECT id, BrokerId, Amount, Type, Reason, Author, BlancNumber,
-                  CreatedAt, Branch, Currency
+                  CreatedAt, Branch, Currency, Recipient
              FROM broker_balance_movements
             WHERE id = ? AND BrokerId = ? AND Deleted = 0`,
           [movementId, brokerId]
@@ -3568,6 +3626,54 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           const blanc = String(rawBlanc).trim();
           sets.push("BlancNumber = ?");
           params.push(blanc ? blanc : null);
+        }
+
+        // A hand-over also records WHO received the money, and an admin may
+        // correct which day it belongs to. Both stay out of the balance: the
+        // payment row is kept in step below, so reports and the history read
+        // the corrected date as well.
+        let nextCreatedAt =
+          existing.CreatedAt instanceof Date
+            ? toLocalDateTime(existing.CreatedAt)
+            : String(existing.CreatedAt ?? "");
+        let nextRecipient =
+          existing.Recipient === undefined ? null : existing.Recipient;
+        const rawRecipient = pick("Recipient", "recipient");
+        if (rawRecipient !== undefined) {
+          const recipient = String(rawRecipient ?? "").trim();
+          const isHandoverRow =
+            String(existing.Type ?? "").trim() === "handover";
+          if (!isHandoverRow && recipient) {
+            return res
+              .status(400)
+              .json({ error: "only a hand-over has a recipient" });
+          }
+          if (isHandoverRow && !recipient) {
+            return res.status(400).json({ error: "recipient is required" });
+          }
+          nextRecipient = recipient || null;
+          sets.push("Recipient = ?");
+          params.push(nextRecipient);
+        }
+
+        const chosen = resolveChosenMovementDay(
+          b,
+          req.user,
+          nextCreatedAt,
+          "a movement"
+        );
+        if (chosen.error) {
+          return res.status(chosen.status).json({ error: chosen.error });
+        }
+        if (chosen.changed) {
+          if (String(existing.Type ?? "").trim() !== "handover") {
+            return res
+              .status(400)
+              .json({ error: "only a hand-over can change its date" });
+          }
+          nextCreatedAt = chosen.createdAt;
+          sets.push("CreatedAt = ?");
+          params.push(nextCreatedAt);
         }
 
         // A policy-derived row is the history of a charge taken from the
@@ -3645,8 +3751,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             type: nextType,
             amount: nextAmount,
             reason: rawReason === undefined ? existing.Reason : String(rawReason),
+            recipient: nextRecipient,
             author: rawAuthor === undefined ? existing.Author : String(rawAuthor),
-            createdAt: existing.CreatedAt,
+            createdAt: nextCreatedAt,
             branch: existing.Branch,
             currency: existing.Currency,
             deleted: false,
@@ -3873,39 +3980,16 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         // from CreatedAt, which every client has always sent: only an admin may
         // ask for it, it must be a real calendar day and it may not be in the
         // future. The time of day is kept from the movement's own timestamp.
-        let createdAt = moveTime.createdAt;
-        const rawDate = req.body?.date ?? req.body?.Date;
-        if (
-          rawDate !== undefined &&
-          rawDate !== null &&
-          String(rawDate).trim()
-        ) {
-          if (String(req.user?.role ?? "") !== "1") {
-            return res.status(403).json({
-              error: "Only an admin can record an increase on an earlier date",
-            });
-          }
-          const day = String(rawDate).trim();
-          const parsed = new Date(`${day}T00:00:00`);
-          // A day that does not exist in that month (2026-02-31) fails the
-          // round-trip. No timezone conversion applies: it is a calendar day.
-          if (
-            !/^\d{4}-\d{2}-\d{2}$/.test(day) ||
-            Number.isNaN(parsed.getTime()) ||
-            toLocalDateTime(parsed).slice(0, 10) !== day
-          ) {
-            return res.status(400).json({ error: "Date must be YYYY-MM-DD" });
-          }
-          const today = clientLocalDateTime(
-            req.body?.TzOffset ?? req.body?.tzOffset ?? null
-          ).slice(0, 10);
-          if (day > today) {
-            return res
-              .status(400)
-              .json({ error: "Date cannot be in the future" });
-          }
-          createdAt = `${day} ${createdAt.slice(11)}`;
+        const chosen = resolveChosenMovementDay(
+          req.body,
+          req.user,
+          moveTime.createdAt,
+          "an increase"
+        );
+        if (chosen.error) {
+          return res.status(chosen.status).json({ error: chosen.error });
         }
+        const createdAt = chosen.createdAt;
 
         // Money handed over by a broker is the branch's Cash from Brokers, never
         // current cash. The top-up is recorded once, as a broker balance
@@ -4070,7 +4154,8 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
     }
   );
 
-  // POST /brokers/:id/handover  { amount, reason, currency, CreatedAt? }
+  // POST /brokers/:id/handover
+  //   { amount, reason, recipient, currency, CreatedAt?, date? }
   // The broker paid the OWNER directly. This is a payment on the broker's
   // account - their balance grows by the amount, exactly like a top-up - but
   // the money never reached a branch, so the movement carries NO branch:
@@ -4102,11 +4187,32 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         if (!reason) {
           return res.status(400).json({ error: "reason is required" });
         }
+        // Who in the office received the money from the broker. Required, just
+        // like a cash hand-over: the reason says why, the recipient says who.
+        const recipient = (
+          typeof (req.body?.Recipient ?? req.body?.recipient) === "string"
+            ? req.body.Recipient ?? req.body.recipient
+            : ""
+        ).trim();
+        if (!recipient) {
+          return res.status(400).json({ error: "recipient is required" });
+        }
         const currency = normalizeCurrency(req.body?.currency);
 
         const moveTime = resolveBrokerCreatedAt(req.body);
         if (moveTime.error) {
           return res.status(400).json({ error: moveTime.error });
+        }
+        // An admin may record a hand-over on an earlier day (money collected
+        // before anyone could enter it); a worker always records "now".
+        const chosen = resolveChosenMovementDay(
+          req.body,
+          req.user,
+          moveTime.createdAt,
+          "a hand-over"
+        );
+        if (chosen.error) {
+          return res.status(chosen.status).json({ error: chosen.error });
         }
 
         await ensurePaymentsTable();
@@ -4122,8 +4228,9 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             // branches, so this must not become Cash from Brokers.
             await recordBrokerPayment(conn, brokerId, amount, "handover", {
               reason,
+              recipient,
               author: req.user.username,
-              createdAt: moveTime.createdAt,
+              createdAt: chosen.createdAt,
               currency,
             });
 
@@ -4145,11 +4252,16 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
           message: "Broker handover recorded",
           amount,
           currency,
+          recipient,
           broker,
         });
       } catch (err) {
         const msg = (err && err.message) || "";
-        if (msg.includes("amount") || msg.includes("reason")) {
+        if (
+          msg.includes("amount") ||
+          msg.includes("reason") ||
+          msg.includes("recipient")
+        ) {
           return res.status(400).json({ error: msg });
         }
         console.error("Broker handover failed:", err);

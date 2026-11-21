@@ -38,6 +38,7 @@ const BROKER_PAYMENTS_TABLE_SQL = `
     Amount DECIMAL(15,2) NOT NULL,
     Type VARCHAR(30) NOT NULL DEFAULT 'increase',
     Reason VARCHAR(255) NOT NULL DEFAULT '',
+    Recipient VARCHAR(100) NULL,
     Author VARCHAR(45) NOT NULL DEFAULT '',
     Branch VARCHAR(45) NULL,
     Currency VARCHAR(3) NOT NULL DEFAULT 'EUR',
@@ -81,10 +82,10 @@ async function ensureBrokerPaymentsTable(db) {
 async function backfillBrokerPayments(db) {
   const [result] = await db.query(
     `INSERT INTO broker_payments
-       (BrokerId, Amount, Type, Reason, Author, Branch, Currency, CreatedAt,
-        MovementId, Deleted, DeletedAt, DeletedBy)
-     SELECT m.BrokerId, m.Amount, m.Type, m.Reason, m.Author, m.Branch,
-            COALESCE(m.Currency, 'EUR'), m.CreatedAt, m.id,
+       (BrokerId, Amount, Type, Reason, Recipient, Author, Branch, Currency,
+        CreatedAt, MovementId, Deleted, DeletedAt, DeletedBy)
+     SELECT m.BrokerId, m.Amount, m.Type, m.Reason, m.Recipient, m.Author,
+            m.Branch, COALESCE(m.Currency, 'EUR'), m.CreatedAt, m.id,
             m.Deleted, m.DeletedAt, m.DeletedBy
        FROM broker_balance_movements m
        LEFT JOIN broker_payments p ON p.MovementId = m.id
@@ -104,8 +105,8 @@ async function backfillBrokerPayments(db) {
  * @param {number} brokerId
  * @param {number|string} amount  Positive amount handed over.
  * @param {string} type  "increase" (branch top-up / paid bill) or "handover".
- * @param {{reason?: string, author?: string, createdAt?: string,
- *          branch?: string, currency?: string}} [meta]
+ * @param {{reason?: string, recipient?: string, author?: string,
+ *          createdAt?: string, branch?: string, currency?: string}} [meta]
  * @returns {Promise<{id: number, amount: number}>} The ledger row id + amount.
  */
 async function recordBrokerPayment(conn, brokerId, amount, type, meta = {}) {
@@ -113,6 +114,12 @@ async function recordBrokerPayment(conn, brokerId, amount, type, meta = {}) {
   if (amt === 0) return { id: null, amount: 0 };
 
   const branch = typeof meta.branch === "string" ? meta.branch.trim() : null;
+  // Who received a hand-over the broker paid directly (the owner, usually).
+  // Every other payment is money a branch took, so it has no recipient.
+  const recipient =
+    typeof meta.recipient === "string" && meta.recipient.trim()
+      ? meta.recipient.trim()
+      : null;
   const currency =
     String(meta.currency || "EUR")
       .trim()
@@ -123,14 +130,15 @@ async function recordBrokerPayment(conn, brokerId, amount, type, meta = {}) {
   // CurrentCash.js reads the branch-carrying ones as "Cash from Brokers".
   const [movement] = await conn.query(
     `INSERT INTO broker_balance_movements
-       (BrokerId, Amount, Type, Reason, Author, BlancNumber, CreatedAt,
-        Branch, Currency)
-     VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+       (BrokerId, Amount, Type, Reason, Recipient, Author, BlancNumber,
+        CreatedAt, Branch, Currency)
+     VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
     [
       brokerId,
       amt,
       type,
       String(meta.reason ?? ""),
+      recipient,
       String(meta.author ?? ""),
       meta.createdAt || null,
       branch,
@@ -141,14 +149,15 @@ async function recordBrokerPayment(conn, brokerId, amount, type, meta = {}) {
   const movementId = movement && movement.insertId ? movement.insertId : null;
   await conn.query(
     `INSERT INTO broker_payments
-       (BrokerId, Amount, Type, Reason, Author, Branch, Currency, CreatedAt,
-        MovementId)
-     VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, NOW()), ?)`,
+       (BrokerId, Amount, Type, Reason, Recipient, Author, Branch, Currency,
+        CreatedAt, MovementId)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, NOW()), ?)`,
     [
       brokerId,
       amt,
       type,
       String(meta.reason ?? ""),
+      recipient,
       String(meta.author ?? ""),
       branch,
       currency,
@@ -173,6 +182,7 @@ async function recordBrokerPayment(conn, brokerId, amount, type, meta = {}) {
  * @param {string} [change.type]        The movement's type after the change.
  * @param {number|string} [change.amount]
  * @param {string} [change.reason]
+ * @param {string} [change.recipient]   Who received a hand-over.
  * @param {string} [change.author]
  * @param {string} [change.createdAt]
  * @param {string} [change.branch]
@@ -201,17 +211,22 @@ async function syncBrokerPaymentFromMovement(conn, change = {}) {
   }
 
   const amount = Math.round((Number(change.amount) || 0) * 100) / 100;
+  const recipient =
+    typeof change.recipient === "string" && change.recipient.trim()
+      ? change.recipient.trim()
+      : null;
   if (!existing) {
     await conn.query(
       `INSERT INTO broker_payments
-         (BrokerId, Amount, Type, Reason, Author, Branch, Currency, CreatedAt,
-          MovementId, Deleted)
-       VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, NOW()), ?, ?)`,
+         (BrokerId, Amount, Type, Reason, Recipient, Author, Branch, Currency,
+          CreatedAt, MovementId, Deleted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, NOW()), ?, ?)`,
       [
         Number(change.brokerId),
         amount,
         String(change.type),
         String(change.reason ?? ""),
+        recipient,
         String(change.author ?? ""),
         change.branch === undefined ? null : change.branch,
         String(change.currency || "EUR").toUpperCase().slice(0, 3) || "EUR",
@@ -226,14 +241,18 @@ async function syncBrokerPaymentFromMovement(conn, change = {}) {
   await conn.query(
     `UPDATE broker_payments
         SET Amount = ?, Type = ?, Reason = COALESCE(?, Reason),
-            Author = COALESCE(?, Author), Deleted = ?, DeletedAt = ?,
-            DeletedBy = ?
+            Recipient = COALESCE(?, Recipient),
+            Author = COALESCE(?, Author),
+            CreatedAt = COALESCE(?, CreatedAt),
+            Deleted = ?, DeletedAt = ?, DeletedBy = ?
       WHERE id = ?`,
     [
       amount,
       String(change.type),
       change.reason === undefined ? null : String(change.reason),
+      recipient,
       change.author === undefined ? null : String(change.author),
+      change.createdAt || null,
       change.deleted ? 1 : 0,
       change.deleted ? new Date() : null,
       change.deleted ? String(change.deletedBy || "") : null,
