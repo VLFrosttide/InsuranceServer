@@ -4,8 +4,8 @@
 
 .DESCRIPTION
   Dumps the live database with mysqldump and loads the dump into the local
-  `insurancedb`, so local development runs on realistic data instead of the
-  demo accounts `npm run db:setup` creates.
+  `insurancedb`, so local development runs on realistic data instead of an
+  empty (or seed-only) database.
 
   Connection details come from the server's .env file (an environment variable
   of the same name, when set, wins - handy for throw-away test databases):

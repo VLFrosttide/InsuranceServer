@@ -23,22 +23,29 @@ npm run db:setup
 ```
 
 This creates the `insurancedb` database, adds any missing columns, creates the
-required tables, and seeds demo accounts:
+required tables, and applies the data steps (branch registry, default tariffs,
+card balances, broker codes, balance backfills). Run it when you want those
+data steps to happen — it is a deliberate, one-off command.
 
-| Username | Password      | Role            |
-| -------- | ------------- | --------------- |
-| admin    | AdminPass123  | admin           |
-| worker   | WorkerPass123 | worker          |
-| client   | ClientPass123 | client          |
-| broker   | BrokerPass123 | client (broker) |
+**Starting the server only applies schema changes — it never seeds.** Restarting
+`npm start` does not re-insert branch/broker seed rows, re-run backfills or
+recalculate broker balances, so local edits always survive a restart. If a
+throw-away database really should be seeded while the server boots, opt in with
+`DB_SEED_ON_START=1`:
 
-The `broker` account is linked to the `Ahmed` broker and can only view its own
-broker data (see `users.BrokerId`).
+```powershell
+$env:DB_SEED_ON_START = "1"; npm start
+```
+
+The accounts used by `npm run test:e2e` (`admin` / `AdminPass123`,
+`worker` / `WorkerPass123`, `client` / `ClientPass123`) are not created by
+`db/setup.js`; create them once through the admin dashboard (registration +
+approval) or insert them directly.
 
 ## Seeding local from the live database
 
-`npm run db:setup` only seeds the demo accounts. To develop against real data,
-copy the live database into the local `insurancedb`:
+`npm run db:setup` prepares an empty/seed-only database. To develop against
+real data, copy the live database into the local `insurancedb`:
 
 ```powershell
 npm run db:seed:live

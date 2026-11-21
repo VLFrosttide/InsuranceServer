@@ -58,14 +58,28 @@ async function seedBranchCardBalances(db) {
 }
 
 /**
- * Run the idempotent schema creation/upgrades (no test-data seeding).
+ * Run the idempotent schema creation/upgrades.
+ *
+ * Schema changes (CREATE/ALTER) always run, so a brand-new or upgraded
+ * database matches what the server code expects. Every step that writes or
+ * rewrites DATA (seeding the branch registry, backfills, balance
+ * recalculations) runs only when `seed` is true.
+ *
+ * `npm run db:setup` and db/seed-from-live.ps1 seed by default. The server
+ * passes `seed: false`, so restarting it never re-seeds the database or
+ * recalculates balances behind the operator's back; set DB_SEED_ON_START=1 to
+ * opt back in.
  *
  * @param {{host?: string, port?: number|string, user?: string,
- *          password?: string, database?: string}} [config]
+ *          password?: string, database?: string, seed?: boolean}} [config]
  *   Optional connection overrides. Falls back to env vars / sensible local
  *   defaults so the script still runs standalone (`npm run db:setup`).
  */
 async function runSetup(config = {}) {
+  // A missing `seed` means "run the whole setup": that is what the CLI and
+  // db/seed-from-live.ps1 expect. Only an explicit `seed: false` skips the
+  // data steps.
+  const seed = config.seed !== false;
   const DB_NAME = config.database || process.env.DB_NAME || "insurancedb";
   const host = config.host || process.env.DB_HOST || "localhost";
   const user = config.user || process.env.DB_USER || "root";
@@ -73,6 +87,12 @@ async function runSetup(config = {}) {
   const password = config.password || process.env.DB_PASSWORD;
   if (!password) {
     throw new Error("Missing DB_PASSWORD in .env");
+  }
+  if (!seed) {
+    console.log(
+      "Schema only: data seeding/backfills are skipped " +
+        "(run `npm run db:setup` or set DB_SEED_ON_START=1 when you want them)."
+    );
   }
 
   // 1) Try the target database directly first. On shared/released hosting the
@@ -793,7 +813,7 @@ async function runSetup(config = {}) {
   const [totalCashRows] = await db.query(
     "SELECT COUNT(*) AS n FROM total_cash"
   );
-  if (Number(totalCashRows[0].n) === 0) {
+  if (seed && Number(totalCashRows[0].n) === 0) {
     await db.query(`
       INSERT INTO total_cash (id, Branch, Currency, CardPart, BrokerPart)
       SELECT 1, Branch, CurrencyType,
@@ -821,39 +841,42 @@ async function runSetup(config = {}) {
     console.log("Backfilled total_cash parts from existing insurances");
   }
 
-  // Split the old global card balance into per-branch balances (one-time).
-  await seedBranchCardBalances(db);
+  // Split the old global card balance into per-branch balances (explicit setup
+  // only: see the `seed` switch at the top).
+  if (seed) await seedBranchCardBalances(db);
 
-  // One-time cleanup: the +2 card tax goes to the bank and is visual-only
-  // during policy creation. Strip any previously stored +2 card fee from
-  // existing policies' prices and card balances, and clear their CardFee flag
-  // so this runs at most once per row.
-  const [legacyCardFees] = await db.query(
-    `SELECT Branch, COALESCE(CurrencyType, 'EUR') AS Currency,
-            COUNT(*) AS ActiveCardCount
-       FROM insurance
-      WHERE CardFee = 1 AND PaymentType = 'Card' AND Deleted = 0 AND Annulled = 0
-      GROUP BY Branch, COALESCE(CurrencyType, 'EUR')`
-  );
-  for (const row of legacyCardFees || []) {
-    const deduction = Number(row.ActiveCardCount) * 2;
-    if (deduction > 0) {
-      await db.query(
-        "UPDATE branch_card_balance SET CardBalance = CardBalance - ? WHERE Branch = ?",
-        [deduction, row.Branch || ""]
-      );
-      await db.query(
-        "UPDATE total_cash SET CardPart = CardPart - ? WHERE id = 1 AND Branch = ? AND Currency = ?",
-        [deduction, row.Branch || "", row.Currency || "EUR"]
-      );
+  if (seed) {
+    // One-time cleanup: the +2 card tax goes to the bank and is visual-only
+    // during policy creation. Strip any previously stored +2 card fee from
+    // existing policies' prices and card balances, and clear their CardFee flag
+    // so this runs at most once per row.
+    const [legacyCardFees] = await db.query(
+      `SELECT Branch, COALESCE(CurrencyType, 'EUR') AS Currency,
+              COUNT(*) AS ActiveCardCount
+         FROM insurance
+        WHERE CardFee = 1 AND PaymentType = 'Card' AND Deleted = 0 AND Annulled = 0
+        GROUP BY Branch, COALESCE(CurrencyType, 'EUR')`
+    );
+    for (const row of legacyCardFees || []) {
+      const deduction = Number(row.ActiveCardCount) * 2;
+      if (deduction > 0) {
+        await db.query(
+          "UPDATE branch_card_balance SET CardBalance = CardBalance - ? WHERE Branch = ?",
+          [deduction, row.Branch || ""]
+        );
+        await db.query(
+          "UPDATE total_cash SET CardPart = CardPart - ? WHERE id = 1 AND Branch = ? AND Currency = ?",
+          [deduction, row.Branch || "", row.Currency || "EUR"]
+        );
+      }
     }
+    await db.query(
+      `UPDATE insurance
+          SET Price = CAST(GREATEST(0, ROUND(CAST(Price AS DECIMAL(15,2)) - 2, 2)) AS CHAR),
+              CardFee = 0
+        WHERE CardFee = 1`
+    );
   }
-  await db.query(
-    `UPDATE insurance
-        SET Price = CAST(GREATEST(0, ROUND(CAST(Price AS DECIMAL(15,2)) - 2, 2)) AS CHAR),
-            CardFee = 0
-      WHERE CardFee = 1`
-  );
 
   // 4b) Create brokers + broker_emails tables.
   await db.query(`
@@ -936,7 +959,9 @@ async function runSetup(config = {}) {
 
   // Seed the branches the system already knows about. New branches are created
   // by admins through POST /admin/branches. INSERT IGNORE keeps this idempotent.
-  {
+  // Only on an explicit setup: a server restart must not recreate a branch an
+  // admin renamed or emptied.
+  if (seed) {
     const { BranchPricingKeys } = require("./BrokerInfo.js");
     for (const branchName of Object.keys(BranchPricingKeys)) {
       await db.query(
@@ -1028,7 +1053,7 @@ async function runSetup(config = {}) {
   // table and mirror the payments already in the ledger (idempotent).
   try {
     await ensureBrokerPaymentsTable(db);
-    const mirrored = await backfillBrokerPayments(db);
+    const mirrored = seed ? await backfillBrokerPayments(db) : 0;
     if (mirrored) {
       console.log(`Mirrored ${mirrored} broker payment(s) into broker_payments`);
     }
@@ -1225,8 +1250,9 @@ async function runSetup(config = {}) {
   }
 
   // Backfill the broker IDs for the brokers listed in BrokerInfo.BrokerCodes.
-  // Only fills missing/empty codes, so an ID entered by an admin is kept.
-  {
+  // Only fills missing/empty codes, so an ID entered by an admin is kept. This
+  // is a data step, so it waits for an explicit setup instead of every restart.
+  if (seed) {
     const { BrokerCodes } = require("./BrokerInfo.js");
     for (const [name, code] of Object.entries(BrokerCodes)) {
       await db.query(
@@ -1289,30 +1315,32 @@ async function runSetup(config = {}) {
   // out of the drawer once (see db/separateBrokerCash.js). The migration is
   // transactional and marks itself in `app_settings`; a failure rolls it back and
   // is retried on the next start, so setup carries on either way.
-  try {
-    await db.beginTransaction();
-    let separated;
+  if (seed) {
     try {
-      separated = await separateBrokerCash(db, { log: console.warn });
-      await db.commit();
+      await db.beginTransaction();
+      let separated;
+      try {
+        separated = await separateBrokerCash(db, { log: console.warn });
+        await db.commit();
+      } catch (err) {
+        await db.rollback();
+        throw err;
+      }
+      if (separated.ran) {
+        const detail = separated.groups
+          .map((g) => `${g.Branch || "(no branch)"} ${g.Currency} ${g.Amount}`)
+          .join(", ");
+        console.log(
+          `Separated ${separated.pairs} broker top-up(s) from current cash` +
+            (detail ? `: ${detail}` : "")
+        );
+      }
     } catch (err) {
-      await db.rollback();
-      throw err;
-    }
-    if (separated.ran) {
-      const detail = separated.groups
-        .map((g) => `${g.Branch || "(no branch)"} ${g.Currency} ${g.Amount}`)
-        .join(", ");
-      console.log(
-        `Separated ${separated.pairs} broker top-up(s) from current cash` +
-          (detail ? `: ${detail}` : "")
+      console.warn(
+        "Could not separate past broker top-ups from current cash:",
+        (err && err.message) || err
       );
     }
-  } catch (err) {
-    console.warn(
-      "Could not separate past broker top-ups from current cash:",
-      (err && err.message) || err
-    );
   }
 
   // One-time backfill of the broker balance ledger from existing insurances,
@@ -1322,7 +1350,7 @@ async function runSetup(config = {}) {
   const [[{ n: movementCount }]] = await db.query(
     "SELECT COUNT(*) AS n FROM broker_balance_movements"
   );
-  if (Number(movementCount) === 0) {
+  if (seed && Number(movementCount) === 0) {
     // Creation deducts the policy price from the broker's balance. An annulled
     // policy's Price is its annulment tax, so the original sale price is used.
     await db.query(`
@@ -1364,8 +1392,8 @@ async function runSetup(config = {}) {
     console.log("Backfilled broker_balance_movements from existing insurances");
   }
 
-  // Re-apply the broker balance formula on every start for every broker that
-  // has a starting balance (see recalculateBrokerBalance in
+  // Re-apply the broker balance formula on an explicit setup for every broker
+  // that has a starting balance (see recalculateBrokerBalance in
   // Requests/Brokers.js):
   //
   //   CashBalance = starting balance
@@ -1379,9 +1407,11 @@ async function runSetup(config = {}) {
   // older one (e.g. the annulment tax charged even when the worker paid it).
   // Brokers without a starting balance keep their stored figure: that is the
   // only base they have. The statement is idempotent and runs only on brokers
-  // with a stored starting balance.
-  try {
-    const [recalculated] = await db.query(`
+  // with a stored starting balance. It is a data step, so a plain restart does
+  // not touch any balance.
+  if (seed) {
+    try {
+      const [recalculated] = await db.query(`
       UPDATE brokers b
       JOIN broker_starting_balances sb ON sb.BrokerId = b.id
       SET b.CashBalance = ROUND(
@@ -1415,16 +1445,17 @@ async function runSetup(config = {}) {
                AND m.Type IN ('policy', 'price_change', 'annulment', 'deletion')
           ), 0), 2)
     `);
-    if (recalculated && recalculated.affectedRows) {
-      console.log(
-        `Re-applied the starting-balance formula to ${recalculated.affectedRows} broker(s)`
+      if (recalculated && recalculated.affectedRows) {
+        console.log(
+          `Re-applied the starting-balance formula to ${recalculated.affectedRows} broker(s)`
+        );
+      }
+    } catch (err) {
+      console.warn(
+        "Could not re-apply the broker starting-balance formula:",
+        (err && err.message) || err
       );
     }
-  } catch (err) {
-    console.warn(
-      "Could not re-apply the broker starting-balance formula:",
-      (err && err.message) || err
-    );
   }
 
 

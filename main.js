@@ -216,6 +216,13 @@ const DB_CONFIG = {
   dateStrings: true,
 };
 
+// Seeding/backfilling the database on start is OPT-IN. A restart must never
+// re-insert seed rows (branches, broker codes, card balances) or re-apply the
+// broker balance formula: that is a deliberate operation, run manually with
+// `npm run db:setup`. Set DB_SEED_ON_START=1 only for a throw-away database
+// that should be prepared while the server boots.
+const SEED_DB_ON_START = process.env.DB_SEED_ON_START === "1";
+
 function startGmailPolling() {
   // Gmail polling is optional and runs in the background. If OAuth isn't
   // configured / valid, or a sweep takes a long time, the REST + WebSocket
@@ -494,9 +501,11 @@ async function start() {
     // Ensure the schema exists BEFORE the pool is verified. `runSetup` creates
     // the database when it is missing, so running it first lets a brand-new
     // (deployed) database be created and its schema brought up to date. It is
-    // also idempotent, so it is safe to call on every start. Any failure is
-    // non-fatal here: the code below still attempts the pool connection so the
-    // server can report a degraded /health instead of crashing.
+    // also idempotent, so it is safe to call on every start. Data seeding and
+    // backfills are NOT part of a normal start: they run only for an explicit
+    // `npm run db:setup` (or DB_SEED_ON_START=1). Any failure is non-fatal
+    // here: the code below still attempts the pool connection so the server
+    // can report a degraded /health instead of crashing.
     try {
       await runSetup({
         host: DB_CONFIG.host,
@@ -504,8 +513,14 @@ async function start() {
         password: DB_CONFIG.password,
         database: DB_CONFIG.database,
         port: DB_CONFIG.port,
+        seed: SEED_DB_ON_START,
       });
       console.log("Database schema is ready.");
+      if (!SEED_DB_ON_START) {
+        console.log(
+          "Seeding/backfills skipped on start (run `npm run db:setup` when wanted)."
+        );
+      }
     } catch (setupErr) {
       console.warn(
         "Database setup skipped:",
