@@ -96,22 +96,88 @@ Useful switches:
 The broker balance is rebuilt from the insurance table and `broker_payments`
 (minus the voids), while `broker_balance_movements` is the history the balance
 history page walks. The server writes and patches that history itself on every
-change, so it normally needs no help. Rows written before a blanc correction was
-carried into the history, however, keep the policy's old number, and the page
-then shows the sale as its own entry without the policy's details:
+change, so it normally needs no help. Two kinds of stranded charge can still be
+left behind by an older server:
+
+- **A sale row under the policy's previous blanc.** The page pairs a row with a
+  policy by its `BlancNumber`. When a policy's blanc was corrected, the rows
+  written earlier kept the old number, so the row belonged to no live policy and
+  the page hid it - the insurance existed and the broker was charged, but the
+  charge was missing from that day's history.
+- **A charged policy with no row at all.** The sale row was never written, so
+  the charge is invisible even though the balance counts it.
 
 ```powershell
-npm run db:repair:ledger                     # report only
-npm run db:repair:ledger -- --apply          # write the relabels
+npm run db:repair:ledger                     # report only (local DB_*)
+npm run db:repair:ledger -- --apply          # write the fixes
 npm run db:repair:ledger -- --broker=35      # one broker
+npm run db:repair:ledger:live                # report the live database
+npm run db:repair:ledger:live -- --apply     # repair the live database
 ```
 
-`db/repair-broker-ledger.js` relabels only unambiguous rows (one live insurance
-created at the same second with no rows of its own, one sale row for it) and
-changes no money: it never un-hides a row, because a hidden row is a void the
-balance honours, and it never moves `brokers.CashBalance`. Anything it cannot
-match is printed for review. It is idempotent and only inspects brokers that
-have a starting balance. Always run it without `--apply` first.
+`db/repair-broker-ledger.js` works the same way for every broker, with or
+without a starting balance (a broker without one used to be skipped, which is
+how charges went missing in the first place). For every live policy it checks
+that the rows its history shows add up to the charge the balance applies to it,
+then:
+
+- relabels an orphan sale row to the policy's current blanc, only when the
+  pairing is unambiguous (one live insurance of that broker created at the same
+  second and still with no sale row of its own, one such sale row for it);
+- writes the missing sale row for a plain (not annulled) policy that is charged
+  but has no row at all;
+- **reports** everything else for review - a soft-deleted policy row (VOID: the
+  balance honours it, so restoring it would change money), an annulled policy
+  with no sale row, or rows whose total does not match the charge.
+
+It changes no money: it never un-hides a row and never writes
+`brokers.CashBalance`. After a relabel or an insert the balance history page
+shows the charge for the insurance that always had it. It is idempotent; always
+run it without `--apply` first, and `--live` prints the host/database it is
+about to inspect.
+
+### Without Node access (phpMyAdmin)
+
+The same repair is available as SQL, for a database reached through phpMyAdmin.
+Both files are in the client repository (`Insurance/migrations/`):
+
+- `check_broker_history_gaps.sql` - **read-only**: lists every live
+  broker-charged policy whose history does not add up to its charge, with a
+  Status (`MISSING ROW`, `MISSING SALE ROW`, `VOID`, `AMOUNT MISMATCH`), plus a
+  preview of the rows block 2 relabels and block 3 writes.
+- `fix_broker_history_gaps.sql` - **writes**: relabels the stale sale rows, then
+  writes the missing ones, then verifies (`StillMissing` must be 0).
+
+Run them block by block in phpMyAdmin (each block ends with a semicolon). They
+follow the same rules as the script but are deliberately more conservative on
+ambiguous pairs: a sale row is only relabelled when its blanc exists in no
+insurance at all and exactly one policy / one orphan row sit on that second;
+anything unclear stays reported. Like the script they never touch
+`brokers.CashBalance` and never restore a void.
+
+### The structural link (why this cannot happen again)
+
+`insurance.SaleMovementId` points at the history row of the policy's SALE, with
+a unique key. The server writes it on every sale (create, restore, broker move),
+and the balance history endpoint reads it: a policy's charge row now stays
+attached to the policy even when its `BlancNumber` is stale, so a blanc edit can
+no longer make the charge disappear. The relabel on a blanc edit and the repair
+above stay as the second and third safety nets.
+
+The column is created by `npm run db:setup` (or
+`migrations/022_insurance_sale_movement_link.sql` in the client repository) and
+existing policies are linked by:
+
+```powershell
+npm run db:link:sales                     # report (local DB_*)
+npm run db:link:sales -- --apply          # add the column + link the policies
+npm run db:link:sales:live                # report the live database
+npm run db:link:sales:live -- --apply     # link the live database
+```
+
+A policy with no live sale row (a void, a missing row, or a row still under an
+older blanc) is deliberately left unlinked: run the history repair first, then
+this script again. It changes no money and is idempotent.
 
 ## Database schema
 

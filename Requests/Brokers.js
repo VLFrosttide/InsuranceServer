@@ -950,7 +950,9 @@ async function manageableBrokerIds(conn, user) {
  * @param {import("mysql2/promise").Connection} conn
  * @param {number} brokerId
  * @param {number|string} price
- * @returns {Promise<number|null>} The charge applied, or null if broker missing.
+ * @returns {Promise<{amount: number, movementId: number|null}|null>} The
+ *          charge applied and the id of the history row it wrote, or null if
+ *          the broker is missing. The policy row is linked to that movement.
  */
 const decreaseBrokerForInsurance = (module.exports.decreaseBrokerForInsurance =
   async function decreaseBrokerForInsurance(conn, brokerId, price, meta = {}) {
@@ -966,9 +968,30 @@ const decreaseBrokerForInsurance = (module.exports.decreaseBrokerForInsurance =
       [priceNum, brokerId]
     );
 
-    await recordBrokerMovement(conn, brokerId, -priceNum, "policy", meta);
+    const sale = await recordBrokerMovement(
+      conn,
+      brokerId,
+      -priceNum,
+      "policy",
+      meta
+    );
 
-    return priceNum;
+    // Link the policy to the history row of its sale. The history page pairs a
+    // row with a policy by BlancNumber; the link keeps that pairing through any
+    // blanc correction, so the charge can never be left attached to a number no
+    // policy carries any more. The insurance row already exists in every caller
+    // (created before this runs). A broker move re-points the insurance row
+    // afterwards, so the edit endpoint re-links it there; an update that matches
+    // nothing here is harmless.
+    if (sale.id && meta.blancNumber) {
+      await conn.query(
+        `UPDATE insurance SET SaleMovementId = ?
+          WHERE BlancNumber = ? AND BrokerId = ?`,
+        [sale.id, String(meta.blancNumber), brokerId]
+      );
+    }
+
+    return { amount: priceNum, movementId: sale.id };
   });
 
 /**
@@ -982,9 +1005,22 @@ const decreaseBrokerForInsurance = (module.exports.decreaseBrokerForInsurance =
  * (see {@link restoreBrokerForDeletion}). Runs inside the caller's
  * transaction.
  *
+ * Options in `meta`:
+ *   - `updateExisting: true` (with `blancNumber`) rewrites the policy's live
+ *     refund row's Amount (to `totalRefund` when given, otherwise by adding
+ *     `price`) - used when an admin changes who is at fault or the fee.
+ *   - `reuseExisting: true` (with `blancNumber`) fills that row in again with
+ *     `price` and the new reason/author/time - used when a policy is annulled
+ *     after an un-annul had morphed the row to 0 (see
+ *     {@link settleBrokerForUnannulment}). One policy therefore keeps one
+ *     refund row instead of collecting one per annulment.
+ *
  * @param {import("mysql2/promise").Connection} conn
  * @param {number} brokerId
  * @param {number|string} price
+ * @param {{reason?: string, author?: string, blancNumber?: string,
+ *          createdAt?: string, updateExisting?: boolean,
+ *          reuseExisting?: boolean, totalRefund?: number|string}} [meta]
  * @returns {Promise<number|null>} The amount restored, or null if broker missing.
  */
 const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
@@ -1003,7 +1039,11 @@ const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
       );
     }
 
-    if (meta && meta.updateExisting && meta.blancNumber) {
+    if (
+      meta &&
+      (meta.updateExisting || meta.reuseExisting) &&
+      meta.blancNumber
+    ) {
       const [existingMovs] = await conn.query(
         `SELECT id, Amount FROM broker_balance_movements
           WHERE BrokerId = ? AND BlancNumber = ? AND Type = 'annulment' AND Deleted = 0
@@ -1011,6 +1051,28 @@ const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
         [brokerId, meta.blancNumber]
       );
       if (Array.isArray(existingMovs) && existingMovs.length > 0) {
+        // A policy that was annulled before (its refund row is still there,
+        // possibly morphed to 0 by un-annulling - see
+        // settleBrokerForUnannulment) keeps that ONE row: a new annulment
+        // fills it in again instead of inserting another refund, so the
+        // policy never grows a stack of annulment rows.
+        if (meta.reuseExisting && !meta.updateExisting) {
+          await conn.query(
+            `UPDATE broker_balance_movements
+                SET Amount = ?, Reason = ?, Author = ?, CreatedAt = ?
+              WHERE id = ?`,
+            [
+              priceNum,
+              String(meta.reason ?? ""),
+              String(meta.author ?? ""),
+              typeof meta.createdAt === "string"
+                ? meta.createdAt
+                : clientLocalDateTime(null),
+              existingMovs[0].id,
+            ]
+          );
+          return priceNum;
+        }
         const nextAmt =
           meta.totalRefund !== undefined
             ? Math.round((toDecimal(meta.totalRefund) || 0) * 100) / 100
@@ -1026,6 +1088,70 @@ const restoreBrokerForAnnulment = (module.exports.restoreBrokerForAnnulment =
     await recordBrokerMovement(conn, brokerId, priceNum, "annulment", meta);
 
     return priceNum;
+  });
+
+/**
+ * Undo the money side of an annulment when the policy is un-annulled (an admin
+ * unticks "Annulled"): the broker is charged back the amount its annulment
+ * returned, exactly the inverse of {@link restoreBrokerForAnnulment}.
+ *
+ * The refund is NOT recorded as a new movement. The policy's annulment row is
+ * the same record that morphs: it is kept but its Amount becomes 0, so the
+ * balance history shows ONE row per policy - the sale row with the policy's
+ * price - instead of a sale, a refund and a re-charge stacked on top of each
+ * other. If the policy is annulled again, restoreBrokerForAnnulment fills the
+ * same row in again (meta.reuseExisting).
+ *
+ * The incremental CashBalance update matters for brokers without a starting
+ * balance; a broker with one is rebuilt from its insurances by
+ * refreshBrokerBalance in the caller's transaction anyway.
+ *
+ * Runs inside the caller's transaction.
+ *
+ * @param {import("mysql2/promise").Connection} conn
+ * @param {number} brokerId
+ * @param {string} blancNumber  the blanc the annulment was recorded under
+ * @param {number|string} amount  the refund being taken back (>= 0)
+ * @returns {Promise<number|null>} The amount charged, or null if broker missing.
+ */
+const settleBrokerForUnannulment = (module.exports.settleBrokerForUnannulment =
+  async function settleBrokerForUnannulment(
+    conn,
+    brokerId,
+    blancNumber,
+    amount
+  ) {
+    const [[broker]] = await conn.query("SELECT id FROM brokers WHERE id = ?", [
+      brokerId,
+    ]);
+    if (!broker) return null;
+
+    const amountNum = Math.max(0, toDecimal(amount) || 0);
+
+    if (amountNum > 0) {
+      await conn.query(
+        "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
+        [amountNum, brokerId]
+      );
+    }
+
+    // Morph the policy's refund record to "no refund" (0) instead of writing a
+    // charge row. Only the LIVE refund row is touched: an admin-voided one is
+    // already out of the balance and must stay that way.
+    const [annulRows] = await conn.query(
+      `SELECT id FROM broker_balance_movements
+        WHERE BrokerId = ? AND BlancNumber = ? AND Type = 'annulment' AND Deleted = 0
+        ORDER BY id DESC LIMIT 1`,
+      [brokerId, String(blancNumber)]
+    );
+    if (Array.isArray(annulRows) && annulRows.length > 0) {
+      await conn.query(
+        "UPDATE broker_balance_movements SET Amount = 0 WHERE id = ?",
+        [annulRows[0].id]
+      );
+    }
+
+    return amountNum;
   });
 
 /**
@@ -1407,12 +1533,13 @@ const refreshBrokerBalance = (module.exports.refreshBrokerBalance =
  *          that branch's Cash from Brokers. A hand-over to the owner passes
  *          `currency` WITHOUT `branch`, so the currency is recorded but the
  *          movement stays out of Cash from Brokers.
- * @returns {Promise<number>} the (rounded) amount recorded, or 0 if skipped.
+ * @returns {Promise<{id: number|null, amount: number}>} the new row's id and
+ *          the (rounded) amount recorded; `{id: null, amount: 0}` if skipped.
  */
 const recordBrokerMovement = (module.exports.recordBrokerMovement =
   async function recordBrokerMovement(conn, brokerId, amount, type, meta = {}) {
     const amt = Math.round((toDecimal(amount) || 0) * 100) / 100;
-    if (amt === 0) return 0;
+    if (amt === 0) return { id: null, amount: 0 };
     // Store the client's local wall-clock time when a caller resolved it (a
     // validated "YYYY-MM-DD HH:MM:SS" string); otherwise fall back to the
     // server's UTC clock — the value the old DEFAULT CURRENT_TIMESTAMP used.
@@ -1451,12 +1578,14 @@ const recordBrokerMovement = (module.exports.recordBrokerMovement =
         normalizeCurrency(meta.currency)
       );
     }
-    await conn.query(
+    const [inserted] = await conn.query(
       `INSERT INTO broker_balance_movements (${columns.join(", ")})
        VALUES (${columns.map(() => "?").join(", ")})`,
       values
     );
-    return amt;
+    const id =
+      inserted && inserted.insertId ? Number(inserted.insertId) : null;
+    return { id, amount: amt };
   });
 
 // Bi-weekly bucketing: a fixed 14-day grid anchored to Monday 2020-01-06.
@@ -3330,13 +3459,35 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
         // was never made. A row of a policy that does not exist here any more (it
         // was deleted or moved to another broker) is skipped for the same reason.
         // Money rows (no blanc) are always kept.
+        //
+        // The SALE row a policy owns is linked explicitly
+        // (insurance.SaleMovementId), so it is kept even when its BlancNumber
+        // was not carried along by an older server's blanc correction: the row
+        // is shown under the policy's current number instead of disappearing.
+        // The relabel in the edit endpoint keeps the stored number in step too;
+        // this is the belt to that braces.
         const [livePolicyRows] = await DBConnection.query(
-          "SELECT BlancNumber FROM insurance WHERE BrokerId = ? AND Deleted = 0",
+          `SELECT BlancNumber, SaleMovementId FROM insurance
+            WHERE BrokerId = ? AND Deleted = 0`,
           [brokerId]
         );
         const liveBlancs = new Set(
           (livePolicyRows || []).map((r) => String(r.BlancNumber ?? "").trim())
         );
+        const linkedBlancByMovement = new Map();
+        for (const row of livePolicyRows || []) {
+          const id = Number(row.SaleMovementId);
+          const blanc = String(row.BlancNumber ?? "").trim();
+          if (Number.isInteger(id) && id > 0 && blanc) {
+            linkedBlancByMovement.set(id, blanc);
+          }
+        }
+        if (linkedBlancByMovement.size > 0) {
+          for (const m of allMovements) {
+            const linked = linkedBlancByMovement.get(Number(m.id));
+            if (linked) m.BlancNumber = linked;
+          }
+        }
         allMovements = allMovements.filter((m) => {
           const blanc = String(m.BlancNumber ?? "").trim();
           if (!blanc) return true;
@@ -3432,32 +3583,102 @@ module.exports.createBrokerRouter = function createBrokerRouter(DBConnection) {
             }
           }
 
-          // An annulled policy's refund is folded too, but a restored policy
-          // (Annulled = 0, with the historical refund still on the ledger) keeps
-          // its refund row - the raw rows are the truth again.
+          // An annulled policy's refund is folded into its sale row, which then
+          // shows the annulment tax. An annulment that was undone (the policy is
+          // active again) is not money any more either:
+          //
+          //   - un-annulling used to write the re-charge back as a NEW "policy"
+          //     row (older servers). That refund and the charge that undoes it
+          //     cancel out, so both are hidden and the sale row keeps showing
+          //     the policy's price.
+          //   - the server now MORPHS the refund row itself (Amount 0) instead
+          //     of writing a charge, so a zero refund is folded too and only the
+          //     sale row remains.
+          //
+          // Either way the policy keeps ONE row that changes with its state,
+          // instead of a sale, a refund and a re-charge stacked on top of each
+          // other.
           const annulled = group.some((m) => m.PolicyAnnulled);
-          const foldedRows = group.filter((m) => {
+          const ordered = [...group].sort((a, b) =>
+            a.CreatedAt === b.CreatedAt
+              ? a.id - b.id
+              : a.CreatedAt < b.CreatedAt
+                ? -1
+                : 1
+          );
+          // Refunds that were already undone by a later charge are dead pairs:
+          // the refund plus the first "policy" row after it (an un-annul's
+          // re-charge is always later than the refund it reverses). A deletion
+          // refund is a movement of its own, so it ends the pairing.
+          const undoneRefunds = new Set();
+          let pendingRefund = null;
+          for (const m of ordered) {
             const type = String(m.Type ?? "").trim();
-            return (
-              type === "price_change" || (annulled && type === "annulment")
-            );
-          });
-          if (foldedRows.length === 0) continue;
-
-          const delta =
-            Math.round(
-              foldedRows.reduce((sum, m) => sum + m.DisplayAmount, 0) * 100
-            ) / 100;
+            if (type === "annulment") {
+              pendingRefund = m;
+            } else if (type === "policy" && pendingRefund) {
+              undoneRefunds.add(pendingRefund);
+              undoneRefunds.add(m);
+              pendingRefund = null;
+            } else if (type === "deletion") {
+              pendingRefund = null;
+            }
+          }
+          const foldedRows = new Set(
+            group.filter((m) => {
+              const type = String(m.Type ?? "").trim();
+              if (type === "price_change") return true;
+              if (type !== "annulment") return false;
+              if (undoneRefunds.has(m)) return false; // handled as a dead pair
+              if (annulled) return true;
+              // A refund morphed to 0 by the un-annul is not money any more.
+              return Math.abs(Number(m.DisplayAmount) || 0) < 0.005;
+            })
+          );
           // The original sale (oldest policy movement) is where the policy's
-          // current price belongs.
+          // current price belongs. It never folds into itself (only possible
+          // when an admin removed the sale row from the history).
           const target = policyRows.reduce((oldest, m) => {
             if (m.CreatedAt < oldest.CreatedAt) return m;
             if (m.CreatedAt === oldest.CreatedAt && m.id < oldest.id) return m;
             return oldest;
           }, policyRows[0]);
+          foldedRows.delete(target);
+          // The rows of a refund that was undone (a refund and the re-charge
+          // that reversed it). Their money is already gone from the balance, so
+          // they are hidden. On a main broker the two amounts cancel exactly and
+          // nothing is folded; on a sub-broker they are shown at the parent's
+          // tariff (so they need not cancel), and the sale row already carries
+          // the policy's display price.
+          const deadPairRows = new Set(
+            Array.from(undoneRefunds).filter((m) => m !== target)
+          );
+          const deadPairSum =
+            Math.round(
+              Array.from(deadPairRows).reduce(
+                (sum, m) => sum + (Number(m.DisplayAmount) || 0),
+                0
+              ) * 100
+            ) / 100;
+          if (foldedRows.size === 0 && deadPairRows.size === 0) continue;
+
+          // A pair that does not cancel is real money (it was not an un-annul
+          // re-charge), so it folds into the sale like a price edit would.
+          if (!isSubBrokerHistory && Math.abs(deadPairSum) >= 0.005) {
+            for (const m of deadPairRows) foldedRows.add(m);
+          }
+
+          const delta =
+            Math.round(
+              Array.from(foldedRows).reduce(
+                (sum, m) => sum + m.DisplayAmount,
+                0
+              ) * 100
+            ) / 100;
           target.DisplayAmount =
             Math.round((target.DisplayAmount + delta) * 100) / 100;
           for (const m of foldedRows) hiddenMovements.add(m);
+          for (const m of deadPairRows) hiddenMovements.add(m);
         }
 
         const displayed = allMovements.filter((m) => !hiddenMovements.has(m));

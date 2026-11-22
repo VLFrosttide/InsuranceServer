@@ -438,6 +438,21 @@ async function runSetup(config = {}) {
     console.log("Added insurance.DeletedBy column");
   }
 
+  // Structural link between a policy and the history row of its SALE. The
+  // history page pairs a row with a policy by BlancNumber, so a blanc
+  // correction that did not carry the row along used to leave the charge
+  // attached to nothing (the page then hid it). With this link the sale row
+  // follows the policy through any number of blanc corrections; the unique key
+  // makes one movement belong to at most one policy. Rows written before the
+  // link existed are matched once by backfillInsuranceSaleLinks below.
+  if (!insColNames.has("SaleMovementId")) {
+    await db.query(
+      "ALTER TABLE insurance ADD COLUMN SaleMovementId INT NULL AFTER DeletedBy, " +
+        "ADD UNIQUE KEY unique_insurance_sale_movement (SaleMovementId)"
+    );
+    console.log("Added insurance.SaleMovementId column");
+  }
+
   // 4) Create the tokens table.
 
   await db.query(`
@@ -1089,6 +1104,22 @@ async function runSetup(config = {}) {
     );
   }
 
+  // Link the policies that predate insurance.SaleMovementId to the history row
+  // of their sale, so a later blanc correction can never detach the charge.
+  if (seed) {
+    try {
+      const linked = await backfillInsuranceSaleLinks(db);
+      if (linked) {
+        console.log(`Linked ${linked} insurance(s) to their sale movement`);
+      }
+    } catch (err) {
+      console.warn(
+        "Could not link policies to their sale movements:",
+        (err && err.message) || err
+      );
+    }
+  }
+
   // The balance a broker had BEFORE its first insurance (the base the balance
   // history page recalculates from, see recalculateBrokerBalance in
   // Requests/Brokers.js). One row per broker; a broker without a row has no
@@ -1532,7 +1563,44 @@ async function runSetup(config = {}) {
   await db.end();
 }
 
-module.exports = { runSetup };
+/**
+ * Link every policy that has no link yet to the history row of its sale.
+ *
+ * The sale row is the oldest live `policy` movement of the same broker and blanc
+ * (row ids grow with time and a restore writes a newer charge); it is the row the
+ * history page already shows for the policy. Linking it changes no money - it
+ * only makes the pairing independent of the blanc, so a later blanc correction
+ * cannot detach the charge. A policy with no live sale row (a void, a missing row
+ * or a row left under an older blanc) stays NULL until
+ * `db/repair-broker-ledger.js` (or the SQL in Insurance/migrations) puts it right.
+ *
+ * Idempotent: it only fills SaleMovementId where it is still NULL, and the
+ * unique key makes a second run a no-op.
+ *
+ * @param {{query: Function}} db
+ * @returns {Promise<number>} rows linked
+ */
+async function backfillInsuranceSaleLinks(db) {
+  const [result] = await db.query(
+    `UPDATE insurance i
+       JOIN (
+             SELECT i2.BlancNumber, MIN(m.id) AS MovementId
+               FROM insurance i2
+               JOIN broker_balance_movements m
+                 ON m.BrokerId = i2.BrokerId
+                AND m.BlancNumber = i2.BlancNumber
+                AND m.Type = 'policy'
+                AND m.Deleted = 0
+              WHERE i2.BrokerId IS NOT NULL AND i2.SaleMovementId IS NULL
+              GROUP BY i2.BlancNumber
+            ) sale ON sale.BlancNumber = i.BlancNumber
+        SET i.SaleMovementId = sale.MovementId
+      WHERE i.SaleMovementId IS NULL`
+  );
+  return Number(result && result.affectedRows) || 0;
+}
+
+module.exports = { runSetup, backfillInsuranceSaleLinks };
 
 // Allow `npm run db:setup` to run this file directly.
 if (require.main === module) {

@@ -27,6 +27,7 @@ const {
   addAutoBlancBatch,
   decreaseBrokerForInsurance,
   restoreBrokerForAnnulment,
+  settleBrokerForUnannulment,
   restoreBrokerForDeletion,
   adjustBrokerForPriceChange,
   refreshBrokerBalance,
@@ -2988,7 +2989,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         // annulment paid out goes back into the channel the policy was paid
         // through, and a broker-linked policy is charged again for what the
         // annulment had returned to it. The kept fee folds back into the price,
-        // so the policy contributes its full price once more.
+        // so the policy contributes its full price once more. The broker's
+        // refund row is morphed (Amount 0) rather than a new charge row being
+        // written - the policy stays ONE record through annul/un-annul.
         let unannulPlan = null;
         if (unannul) {
           const oldPayerRaw = String(insurance.AnnulReason ?? "")
@@ -3038,6 +3041,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           return res.status(400).json({ error: moveTime.error });
         }
         await DBConnection.withTransaction(async (conn) => {
+          // The sale row written by a broker (re)assignment, so the policy can be
+          // linked to it once its insurance row carries the final broker/blanc.
+          let newSaleMovement = null;
           if (moneyChanged && !insurance.Annulled) {
             // 1) If the policy moved to another branch, transfer its standing
             //    money to the new branch and re-branch its ledger rows so the
@@ -3100,12 +3106,17 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                 });
               }
               if (newBrokerId !== null && newPrice > 0) {
-                await decreaseBrokerForInsurance(conn, newBrokerId, newPrice, {
-                  reason: newBlancNumber,
-                  author: req.user.username,
-                  blancNumber: newBlancNumber,
-                  createdAt: moveTime.createdAt,
-                });
+                newSaleMovement = await decreaseBrokerForInsurance(
+                  conn,
+                  newBrokerId,
+                  newPrice,
+                  {
+                    reason: newBlancNumber,
+                    author: req.user.username,
+                    blancNumber: newBlancNumber,
+                    createdAt: moveTime.createdAt,
+                  }
+                );
               }
             } else if (isEmailPolicy && newPrice !== oldPrice) {
               await adjustBrokerForPriceChange(
@@ -3172,17 +3183,17 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                 moveTime.createdAt
               );
             }
-            if (isBrokerLinked(insurance) && unannulPlan.brokerRefund > 0) {
-              await decreaseBrokerForInsurance(
+            if (isBrokerLinked(insurance)) {
+              // The broker is charged back what the annulment returned to it
+              // (nothing when the fee used up the price). This MORPHS the
+              // policy's refund row (its Amount becomes 0) instead of writing a
+              // new charge row, so annul -> un-annul stays one record that
+              // changes state rather than a growing ledger.
+              await settleBrokerForUnannulment(
                 conn,
                 insurance.BrokerId,
-                unannulPlan.brokerRefund,
-                {
-                  reason: `Restore ${newBlancNumber}`,
-                  author: req.user.username,
-                  blancNumber: newBlancNumber,
-                  createdAt: moveTime.createdAt,
-                }
+                insurance.BlancNumber,
+                unannulPlan.brokerRefund
               );
             }
           }
@@ -3212,6 +3223,33 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                 WHERE BrokerId = ? AND BlancNumber = ?
                   AND Type IN ('policy', 'price_change', 'annulment', 'deletion')`,
               [newBlancNumber, oldBrokerId, oldBlancNumber]
+            );
+          }
+
+          // Keep the policy's SALE row linked (insurance.SaleMovementId). A move
+          // to another broker wrote a new charge above; a move back to a walk-in
+          // has no broker row any more, so the link is dropped. The linked row
+          // also follows a blanc correction even when it sat under an older
+          // number the relabel above could not know about.
+          if (newSaleMovement && newSaleMovement.movementId) {
+            await conn.query(
+              `UPDATE insurance SET SaleMovementId = ?
+                WHERE BlancNumber = ? AND BrokerId = ?`,
+              [newSaleMovement.movementId, newBlancNumber, newBrokerId]
+            );
+          } else if (brokerReassigned && newBrokerId === null) {
+            await conn.query(
+              `UPDATE insurance SET SaleMovementId = NULL
+                WHERE BlancNumber = ?`,
+              [newBlancNumber]
+            );
+          } else if (newBrokerId !== null) {
+            await conn.query(
+              `UPDATE broker_balance_movements m
+                 JOIN insurance i ON i.SaleMovementId = m.id
+                  SET m.BlancNumber = ?
+                WHERE i.BlancNumber = ? AND i.BrokerId = ?`,
+              [newBlancNumber, newBlancNumber, newBrokerId]
             );
           }
 
@@ -3504,6 +3542,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                   author: req.user.username,
                   blancNumber,
                   createdAt: moveTime.createdAt,
+                  // A policy that was annulled before and un-annulled again
+                  // keeps its ONE refund row: fill it back in instead of
+                  // inserting a second one (see settleBrokerForUnannulment).
+                  reuseExisting: true,
                 }
               );
             }
