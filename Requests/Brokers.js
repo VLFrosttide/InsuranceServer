@@ -86,6 +86,7 @@ const {
   normalizeBranch,
   clientLocalDateTime,
   parseClientDateTime,
+  resolvePickedTime,
 } = require("./CurrentCash.js");
 const { getSchedule } = require("./PaymentSchedule.js");
 const {
@@ -162,13 +163,15 @@ function resolveBrokerCreatedAt(body) {
 }
 
 /**
- * Apply an ADMIN's explicitly chosen calendar day to a broker movement's
- * timestamp. `date` ("YYYY-MM-DD") is a deliberate choice, unlike CreatedAt,
- * which every client has always sent for "now": only an admin may name a day,
- * it must exist and it may not lie in the future. The time of day is kept from
- * the movement itself, so a backdated row still sorts last within its day.
+ * Apply an ADMIN's explicitly chosen calendar day and, optionally, time of day
+ * to a broker movement's timestamp. `date` ("YYYY-MM-DD") is a deliberate
+ * choice, unlike CreatedAt, which every client has always sent for "now": only
+ * an admin may name a day, it must exist and it may not lie in the future.
+ * `time` ("HH:mm", 24-hour clock) names the moment inside that day; without it
+ * the movement keeps its own time of day, so a backdated row still sorts last
+ * within its day.
  *
- * @param {object} [body]  Request body (reads `date` and `TzOffset`).
+ * @param {object} [body]  Request body (reads `date`, `time` and `TzOffset`).
  * @param {object} [user]  The authenticated user (role 1 = admin).
  * @param {string} createdAt  The timestamp the movement would have without it.
  * @param {string} label  Noun for the refusal message ("an increase" ...).
@@ -207,8 +210,14 @@ function resolveChosenMovementDay(body, user, createdAt, label) {
   if (day > today) {
     return { status: 400, error: "Date cannot be in the future" };
   }
+  // The clock is optional: an admin correcting only the day leaves the
+  // movement's own time of day alone.
+  const picked = resolvePickedTime(b);
+  if (picked.error) {
+    return { status: 400, error: picked.error };
+  }
   return {
-    createdAt: `${day} ${String(createdAt || "").slice(11)}`,
+    createdAt: `${day} ${picked.time || String(createdAt || "").slice(11)}`,
     changed: true,
   };
 }

@@ -331,6 +331,79 @@ const resolveRequestCreatedAt = (module.exports.resolveRequestCreatedAt =
   });
 
 /**
+ * Resolve an ADMIN's explicitly picked time of day from a request body's
+ * `time` ("HH:mm" or "HH:mm:ss", 24-hour clock). It travels next to `date`, so
+ * a payment or hand-over can be booked at the moment it really happened and not
+ * only on the right day. Nothing sent means "keep the movement's own time".
+ * Returns `{ time: "HH:mm:ss" }`, `{ time: "" }`, or `{ error }` when the value
+ * is not a real time of day.
+ *
+ * @param {object} [body]
+ * @returns {{time: string}|{error: string}}
+ */
+const resolvePickedTime = (module.exports.resolvePickedTime =
+  function resolvePickedTime(body) {
+    const b = body || {};
+    const raw = b.time ?? b.Time;
+    if (raw === undefined || raw === null || !String(raw).trim()) {
+      return { time: "" };
+    }
+    const m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(String(raw).trim());
+    if (!m) return { error: "Time must be HH:mm" };
+    const h = Number(m[1]);
+    const mi = Number(m[2]);
+    const s = m[3] === undefined ? 0 : Number(m[3]);
+    if (h > 23 || mi > 59 || s > 59) return { error: "Time must be HH:mm" };
+    const p = (n) => String(n).padStart(2, "0");
+    return { time: `${p(h)}:${p(mi)}:${p(s)}` };
+  });
+
+/**
+ * Apply an ADMIN's explicitly chosen calendar day and, optionally, 24-hour
+ * clock (`date` + `time` in the request body) to a new cash movement. Without
+ * `date` the movement keeps the timestamp it was given (normally "now"); with
+ * one, the day must exist and may not lie in the future, and only an admin may
+ * name it - the same rule as a hand-over. Returns `{ createdAt }`, or
+ * `{ status, error }` when the caller may not name a moment or the values are
+ * not a real day/time.
+ *
+ * @param {object} [body]
+ * @param {object} [user]  The authenticated user (role 1 = admin).
+ * @param {string} createdAt  The timestamp the movement would have without it.
+ * @param {string} noun  "an increase", "an expense", "a hand-over" ...
+ * @returns {{createdAt: string}|{status: number, error: string}}
+ */
+function resolveChosenMovementMoment(body, user, createdAt, noun) {
+  const b = body || {};
+  const rawDate = b.date ?? b.Date;
+  if (rawDate === undefined || rawDate === null || !String(rawDate).trim()) {
+    return { createdAt };
+  }
+  if (String(user?.role ?? "") !== "1") {
+    return {
+      status: 403,
+      error: `Only an admin can record ${noun} on an earlier date`,
+    };
+  }
+  const offset = b.TzOffset ?? b.tzOffset ?? null;
+  const day = resolveHistoryDay(rawDate, offset);
+  if (day.error) {
+    return { status: 400, error: "Date must be YYYY-MM-DD" };
+  }
+  if (day.date > clientLocalDate(offset)) {
+    return { status: 400, error: "Date cannot be in the future" };
+  }
+  const picked = resolvePickedTime(b);
+  if (picked.error) {
+    return { status: 400, error: picked.error };
+  }
+  return {
+    createdAt: `${day.date} ${picked.time || String(createdAt || "").slice(11)}`,
+  };
+}
+module.exports.resolveChosenMovementMoment = resolveChosenMovementMoment;
+
+/**
  * Ensure the current_cash row exists for a given branch and currency.
  *
  * @param {import("mysql2/promise").Connection} conn
@@ -2744,7 +2817,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
     }
   });
 
-  // POST /currentcash/increase  { amount, reason, currency, branch }
+  // POST /currentcash/increase  { amount, reason, currency, branch, date?, time? }
   router.post(
     "/currentcash/increase",
     auth,
@@ -2758,6 +2831,18 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         if (time.error) {
           return res.status(400).json({ error: time.error });
         }
+        // An admin may record the movement on an earlier day and at an earlier
+        // 24-hour time (money that was added before anyone could enter it);
+        // everyone else records it "now".
+        const moment = resolveChosenMovementMoment(
+          req.body,
+          req.user,
+          time.createdAt,
+          "an increase"
+        );
+        if (moment.error) {
+          return res.status(moment.status).json({ error: moment.error });
+        }
         const applied = await DBConnection.withTransaction((conn) =>
           recordCashMovement(
             conn,
@@ -2767,7 +2852,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
             amount,
             reasonText(reason),
             cur,
-            time.createdAt
+            moment.createdAt
           )
         );
 
@@ -2790,7 +2875,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
     }
   );
 
-  // POST /currentcash/reduce  { amount, reason, currency, branch }
+  // POST /currentcash/reduce  { amount, reason, currency, branch, date?, time? }
   //
   // The "Expense" button of the Current cash screen. The money leaves the
   // drawer and IS counted as an expense and in Total daily cash.
@@ -2807,6 +2892,17 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
         if (time.error) {
           return res.status(400).json({ error: time.error });
         }
+        // Like an increase, an admin may record the expense on the day and at
+        // the 24-hour time it really happened.
+        const moment = resolveChosenMovementMoment(
+          req.body,
+          req.user,
+          time.createdAt,
+          "an expense"
+        );
+        if (moment.error) {
+          return res.status(moment.status).json({ error: moment.error });
+        }
         const applied = await DBConnection.withTransaction((conn) =>
           recordCashMovement(
             conn,
@@ -2816,7 +2912,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
             amount,
             reasonText(reason),
             cur,
-            time.createdAt
+            moment.createdAt
           )
         );
 
@@ -2868,33 +2964,20 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
           return res.status(400).json({ error: time.error });
         }
         // An admin may record a hand-over on an earlier day (money given before
-        // anyone could enter it): `date` is the explicit calendar day and the
-        // time of day is kept from the movement's own timestamp. A worker always
-        // records "now"; the server refuses `date` from anyone else.
-        let createdAt = time.createdAt;
-        const rawDate = req.body?.date ?? req.body?.Date;
-        if (
-          rawDate !== undefined &&
-          rawDate !== null &&
-          String(rawDate).trim()
-        ) {
-          if (String(req.user?.role ?? "") !== "1") {
-            return res.status(403).json({
-              error: "Only an admin can record a hand-over on an earlier date",
-            });
-          }
-          const offset = req.body?.TzOffset ?? req.body?.tzOffset ?? null;
-          const day = resolveHistoryDay(rawDate, offset);
-          if (day.error) {
-            return res.status(400).json({ error: "Date must be YYYY-MM-DD" });
-          }
-          if (day.date > clientLocalDate(offset)) {
-            return res
-              .status(400)
-              .json({ error: "Date cannot be in the future" });
-          }
-          createdAt = `${day.date} ${createdAt.slice(11)}`;
+        // anyone could enter it): `date` is the explicit calendar day and
+        // `time` the 24-hour clock of the moment it happened. Without a `time`
+        // the time of day is kept from the movement's own timestamp. A worker
+        // always records "now"; the server refuses `date` from anyone else.
+        const moment = resolveChosenMovementMoment(
+          req.body,
+          req.user,
+          time.createdAt,
+          "a hand-over"
+        );
+        if (moment.error) {
+          return res.status(moment.status).json({ error: moment.error });
         }
+        const createdAt = moment.createdAt;
         const applied = await DBConnection.withTransaction((conn) =>
           recordCashHandover(
             conn,
@@ -3157,7 +3240,7 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
 
         // The correction's own ledger entries are stamped with the client's
         // local time. The hand-over itself keeps its own CreatedAt unless an
-        // admin explicitly moves it to another day (`date`).
+        // admin explicitly moves it to another day (`date`) or clock (`time`).
         const time = resolveRequestCreatedAt(req.body);
         if (time.error) {
           return res.status(400).json({ error: time.error });
@@ -3199,8 +3282,13 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
                   tx.CreatedAt.getMinutes()
                 )}:${p(tx.CreatedAt.getSeconds())}`
               : String(tx.CreatedAt ?? "");
-          // Keep the time of day, so the row still sorts last within its day.
-          newCreatedAt = `${day.date} ${current.slice(11)}`;
+          // Keep the time of day, so the row still sorts last within its day,
+          // unless the admin corrected the clock too (24-hour `time`).
+          const picked = resolvePickedTime(b);
+          if (picked.error) {
+            return res.status(400).json({ error: picked.error });
+          }
+          newCreatedAt = `${day.date} ${picked.time || current.slice(11)}`;
         }
 
         // adjustBalance only knows "increase" and "reduce": both an expense and
