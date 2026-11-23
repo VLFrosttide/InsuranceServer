@@ -179,6 +179,35 @@ A policy with no live sale row (a void, a missing row, or a row still under an
 older blanc) is deliberately left unlinked: run the history repair first, then
 this script again. It changes no money and is idempotent.
 
+## Patching the cash drawer ledger (one-off)
+
+`cash_transactions` pairs a policy's money with the policy by its `Reason`: the
+sale row written at creation carries the policy's blanc number, and every later
+drawer correction carries `Annul <blanc>` / `Edit <blanc>` / `Price change
+<blanc>`. A blanc correction used to relabel only the broker history, so a
+WALK-IN cash policy's sale row stayed under the number typed first. No policy
+had that number any more, so the derived drawer read the row as money typed in
+BY HAND: `GET /currentcash/daily` counted the policy's price twice that day and
+the Transactions list showed an increase nobody entered.
+
+The server now relabels `cash_transactions` and `total_cash_transactions` in
+the same transaction as the blanc edit. Rows written before that fix are
+re-attached by a script that only accepts an unambiguous pairing (exactly one
+walk-in cash policy of the same branch, author and currency, created at the
+same second, with that price - current or before its first price correction):
+
+```powershell
+npm run db:repair:cashblanc                  # report only (local DB_*)
+npm run db:repair:cashblanc -- --apply       # write the fixes
+npm run db:repair:cashblanc:live             # report the live database
+npm run db:repair:cashblanc:live -- --apply  # repair the live database
+```
+
+It changes no amount and never touches `current_cash` or the policy: only the
+row's `Reason` moves, so the row starts matching its policy and stops being
+counted as a manual increase. Anything ambiguous is listed for review. It is
+idempotent; always run it without `--apply` first.
+
 ## Database schema
 
 The database (`insurancedb`) contains the following tables. `db/setup.js`
@@ -582,6 +611,15 @@ the amount that was kept at the time of the reset.
 Reductions are rejected when the amount exceeds the available cash. Creating an
 insurance automatically increases the current cash by the policy `Price`, with
 the logged-in user as the author and the blanc number as the reason.
+
+`GET /currentcash/daily?branch=…&date=…` returns that branch's `availableCash`.
+For TODAY it is the live drawer (the money of the open shift). For a day that
+is already over it is the cash that day's shift brought into the drawer: its
+walk-in cash policies plus manual increases, minus expenses and hand-overs.
+"End shift" (`cash_resets`) empties the live drawer, so a finished day is read
+from the day itself (`getDayCash` in `Requests/CurrentCash.js`) and is never
+blanked by its own close - which is why a day whose shift was ended at 23:56
+still shows the shift's cash rather than `0`.
 
 ## Card balance
 

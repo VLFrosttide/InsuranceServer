@@ -10,6 +10,8 @@
     "db:seed:file": "powershell -NoProfile -ExecutionPolicy Bypass -File db/seed-from-live.ps1",
     "db:repair:ledger": "node --env-file=.env db/repair-broker-ledger.js",
     "db:repair:ledger:live": "node --env-file=.env db/repair-broker-ledger.js --live",
+    "db:repair:cashblanc": "node --env-file=.env db/repair-cash-ledger-blanc.js",
+    "db:repair:cashblanc:live": "node --env-file=.env db/repair-cash-ledger-blanc.js --live",
     "db:link:sales": "node --env-file=.env db/link-insurance-sales.js",
     "db:link:sales:live": "node --env-file=.env db/link-insurance-sales.js --live",
     "test:e2e": "node test_e2e.mjs",

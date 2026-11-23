@@ -17,6 +17,7 @@ const {
   recordChannelMovement,
   movePolicyBranch,
   toDecimal,
+  POLICY_MOVEMENT_REASON_PREFIXES,
 } = require("./CurrentCash.js");
 const { recordCardPayment, reduceCardBalance } = require("./CardPayments.js");
 const {
@@ -3224,6 +3225,40 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                   AND Type IN ('policy', 'price_change', 'annulment', 'deletion')`,
               [newBlancNumber, oldBrokerId, oldBlancNumber]
             );
+          }
+
+          // The CASH ledger keys a policy's money by the same blanc number: the
+          // sale row written at creation carries the blanc as its Reason, and
+          // every later drawer correction carries "Annul <blanc>",
+          // "Edit <blanc>", "Price change <blanc>"... A blanc correction must
+          // carry those rows too, or the sale row stays under the number typed
+          // first and matches no policy any more. The derived drawer then reads
+          // it as money typed in BY HAND on top of the policy itself (see
+          // getAvailableCashAsOf / getDayCash in CurrentCash.js), so the day's
+          // cash is counted twice - and the Transactions list shows a manual
+          // increase nobody entered. Both ledgers of the drawer are relabelled:
+          // cash_transactions (the drawer) and total_cash_transactions (its
+          // mirror in Total cash).
+          if (newBlancNumber !== oldBlancNumber) {
+            const renameReason = async (table, from, to) => {
+              await conn.query(
+                `UPDATE ${table} SET Reason = ? WHERE Reason = ?`,
+                [to, from]
+              );
+            };
+            for (const table of [
+              "cash_transactions",
+              "total_cash_transactions",
+            ]) {
+              await renameReason(table, oldBlancNumber, newBlancNumber);
+              for (const prefix of POLICY_MOVEMENT_REASON_PREFIXES) {
+                await renameReason(
+                  table,
+                  `${prefix}${oldBlancNumber}`,
+                  `${prefix}${newBlancNumber}`
+                );
+              }
+            }
           }
 
           // Keep the policy's SALE row linked (insurance.SaleMovementId). A move
