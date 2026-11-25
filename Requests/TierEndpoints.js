@@ -2930,7 +2930,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           // No fault is always free. An admin's manual fee wins when given;
           // otherwise a fault change keeps the stored fee (unless the start
           // date moved, which re-decides it), and a fresh fee is computed when
-          // there is nothing sensible to keep.
+          // there is nothing sensible to keep. A stored fee of 0 is a real fee
+          // the admin chose (e.g. the tax was zeroed by hand), so it is kept
+          // too - only a row with NO stored fee gets a computed one.
           let newFee;
           if (effectivePayer === "none") {
             newFee = 0;
@@ -2940,7 +2942,6 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             nextAnnulPayer !== null &&
             oldPayer !== "none" &&
             hasStoredFee &&
-            oldFee > 0 &&
             !startDateChanged
           ) {
             newFee = oldFee;
@@ -3436,7 +3437,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
 
         // No fault: 0. Otherwise 9 when the policy is already in effect (its
         // start date has been reached), 1 when it has not started yet - unless
-        // an admin overrode the fee by hand.
+        // an admin overrode the fee by hand. Re-annulling an already annulled
+        // policy keeps the fee it has, including a stored 0: that is a fee the
+        // admin chose, not a missing one.
         const computed = computeAnnulFee(insurance, new Date(), payer);
         const inEffect = computed.inEffect;
         let fee;
@@ -3447,8 +3450,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         } else if (
           alreadyAnnulled &&
           oldPayer !== "none" &&
-          hasStoredFee &&
-          oldFee > 0
+          hasStoredFee
         ) {
           fee = oldFee;
         } else {

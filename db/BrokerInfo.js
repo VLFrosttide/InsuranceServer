@@ -788,12 +788,17 @@ let EuroPricing = {
 // Turkish-lira pricing applies ONLY to Auto policies issued at the Lesovo
 // and Kap Andreevo border crossings. Every other vehicle type and every
 // other broker/branch is EUR only.
+//
+// Raised on 2026-11-24 to 1 600 / 2 050 / 2 300 TRY for 15 days / 1 month /
+// 3 months. This table only seeds a database that has no TRY rows yet; the
+// live rows are raised by migrations/023 in the client repository
+// (Insurance/migrations/023_turkish_lira_tariff_increase.sql).
 let TryPricing = {
   Lesovo: {
-    Auto: { 15: 1600, 30: 2000, 90: 2200 },
+    Auto: { 15: 1600, 30: 2050, 90: 2300 },
   },
   KapAndreevo: {
-    Auto: { 15: 1600, 30: 2000, 90: 2200 },
+    Auto: { 15: 1600, 30: 2050, 90: 2300 },
   },
 };
 
