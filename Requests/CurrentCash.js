@@ -1861,19 +1861,27 @@ const resetBranchCard = (module.exports.resetBranchCard =
 //
 // It is not stored as a running total. Every top-up is already a row in
 // `broker_balance_movements` (Type = 'increase') carrying the branch that took
-// the money and its currency, so the balance is computed on every read as the
-// branch's top-ups recorded after its last reset. The balance and the
-// "Transactions cash from brokers" list are therefore the same data: a top-up
-// an admin corrects or deletes in the broker's history is corrected here too.
+// the money, its currency and the date and time the money was handed over
+// (`CreatedAt` - the value the user picked when recording it).
+//
+// THE MOVEMENT'S OWN DATE DECIDES WHERE IT COUNTS. A top-up dated 31 October
+// and entered on 26 November belongs to 31 October: it is that day's Cash from
+// brokers and that day's "Transactions cash from brokers" list, and it never
+// lands in a period opened by a later reset. Reading insertion order (the
+// movement ids) instead pushed a historical correction into today's balance and
+// made the balance disagree with the list beside it.
+//
+// The day figure and the list are therefore the same data: a top-up an admin
+// corrects or deletes in the broker's history is corrected here too.
 //
 // Only manual top-ups count. The other movements that raise a broker balance -
 // the refund of an annulled or deleted insurance, a price change, an admin
 // adjustment - are not money handed over, and carry no branch.
 //
-// "Reset to 0" hands the branch's money over, so it clears this balance too:
-// `broker_cash_resets` records what was kept and the id of the last movement
-// the reset covered (movement ids, unlike the client-supplied CreatedAt, are
-// strictly ordered).
+// "Reset to 0"/"End shift" still hands the branch's money over: it keeps the
+// top-ups dated since the branch's previous reset (`broker_cash_resets`) and
+// records what it kept. `LastMovementId` stays in that table as the record of
+// the rows the reset covered; the arithmetic uses the movement times.
 // ---------------------------------------------------------------------------
 
 // The movements that are cash handed over by a broker (`m` = the movement).
@@ -1881,40 +1889,50 @@ const BROKER_CASH_WHERE =
   "m.Type = 'increase' AND m.Deleted = 0 AND m.Amount > 0";
 
 /**
- * Id of the last broker movement covered by a branch's most recent cash-from-
- * brokers reset (0 when the branch was never reset).
+ * Time of a branch's most recent cash-from-brokers reset before `before`
+ * (DAWN_OF_TIME when the branch was never reset before then).
+ *
+ * The reset time - not a movement id - opens the period it closed: a top-up is
+ * counted on the date it carries, so a historical correction entered later
+ * stays on its own day instead of falling into the current period.
  *
  * @param {import("mysql2/promise").Connection} conn
  * @param {string} branch  Already normalised.
- * @returns {Promise<number>}
+ * @param {string} before  "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD" (exclusive).
+ * @returns {Promise<string>}
  */
-async function brokerCashResetMarker(conn, branch) {
+async function brokerCashPeriodStart(conn, branch, before) {
   const [rows] = await conn.query(
-    "SELECT COALESCE(MAX(LastMovementId), 0) AS Marker FROM broker_cash_resets WHERE Branch = ?",
-    [branch]
+    `SELECT CreatedAt FROM broker_cash_resets
+      WHERE Branch = ? AND CreatedAt < ?
+      ORDER BY CreatedAt DESC, id DESC
+      LIMIT 1`,
+    [branch, before || clientLocalDateTime(0)]
   );
-  return rows.length ? Number(rows[0].Marker) || 0 : 0;
+  return rows.length && rows[0].CreatedAt ? rows[0].CreatedAt : DAWN_OF_TIME;
 }
 
 /**
- * Sum a branch's broker top-ups per currency, for the movements after
- * `afterId` and (when given) up to and including `throughId`.
+ * Sum a branch's broker top-ups per currency, for the movements whose own date
+ * and time fall in [from, to).
+ *
+ * The windows are half-open, so a movement dated exactly on a reset boundary
+ * belongs to the period that starts there and is never counted twice.
  *
  * @param {import("mysql2/promise").Connection} conn
  * @param {string} branch  Already normalised.
- * @param {number} afterId
- * @param {number} [throughId]
+ * @param {string} from  inclusive lower bound, "YYYY-MM-DD[ HH:MM:SS]".
+ * @param {string} to  exclusive upper bound.
  * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, TRY: 0 }
  */
-async function sumBrokerCash(conn, branch, afterId, throughId) {
-  const bounded = throughId !== undefined;
-  const upper = bounded ? " AND m.id <= ?" : "";
+async function sumBrokerCash(conn, branch, from, to) {
   const [rows] = await conn.query(
     `SELECT m.Currency, ROUND(SUM(m.Amount), 2) AS Total
        FROM broker_balance_movements m
-      WHERE ${BROKER_CASH_WHERE} AND m.Branch = ? AND m.id > ?${upper}
+      WHERE ${BROKER_CASH_WHERE} AND m.Branch = ?
+        AND m.CreatedAt >= ? AND m.CreatedAt < ?
       GROUP BY m.Currency`,
-    bounded ? [branch, afterId, throughId] : [branch, afterId]
+    [branch, from, to]
   );
   const totals = {};
   for (const currency of CURRENCIES) totals[currency] = 0;
@@ -1927,17 +1945,24 @@ async function sumBrokerCash(conn, branch, afterId, throughId) {
 }
 
 /**
- * Read a branch's Cash from Brokers, keyed by currency code: the money brokers
- * handed over at that branch since its last reset.
+ * Read a branch's Cash from Brokers for one day, keyed by currency code: the
+ * top-ups whose own date and time fall on that day.
+ *
+ * The movement's chosen date decides, never the moment it was entered: a
+ * historical correction entered today with an earlier date belongs to that
+ * earlier day. The rows are exactly the ones getBrokerCashTransactions()
+ * lists, so the card and the table below it always add up to the same money.
  *
  * @param {import("mysql2/promise").Connection} conn
  * @param {string} branch
+ * @param {string} date  "YYYY-MM-DD" of the picked day.
+ * @param {string} nextDate  "YYYY-MM-DD" of the day after it (exclusive).
  * @returns {Promise<Record<string, number>>} e.g. { EUR: 0, TRY: 0 }
  */
 const getBrokerCash = (module.exports.getBrokerCash =
-  async function getBrokerCash(conn, branch) {
+  async function getBrokerCash(conn, branch, date, nextDate) {
     const b = normalizeBranch(branch);
-    return sumBrokerCash(conn, b, await brokerCashResetMarker(conn, b));
+    return sumBrokerCash(conn, b, date, nextDate);
   });
 
 /**
@@ -1968,6 +1993,11 @@ const getBrokerCashTransactions = (module.exports.getBrokerCashTransactions =
  * Clear a branch's Cash from Brokers and record who did it and how much was
  * kept per currency. Nothing is recorded for a currency with nothing to keep.
  *
+ * What is kept is the money of the period the reset closes: the top-ups dated
+ * from the branch's previous reset up to this moment. A historical correction
+ * entered now with an older date is NOT kept - it was never in this period; it
+ * stays on the day it carries.
+ *
  * NOTE: runs inside the caller's transaction.
  *
  * @param {import("mysql2/promise").Connection} conn
@@ -1985,17 +2015,20 @@ const resetBrokerCash = (module.exports.resetBrokerCash =
         ? createdAt.trim()
         : clientLocalDateTime(0);
 
-    // The reset covers the movements recorded so far. Bounding the sum by the
-    // same id keeps a top-up that lands while this runs in the next period.
-    const after = await brokerCashResetMarker(conn, b);
-    const [last] = await conn.query(
-      "SELECT COALESCE(MAX(id), 0) AS LastId FROM broker_balance_movements"
+    // The period opens at the previous reset and closes when this reset is
+    // recorded, so a top-up dated at/after that moment belongs to the next
+    // period. Half-open windows keep it from being counted in both.
+    const from = await brokerCashPeriodStart(conn, b, ts);
+    const kept = await sumBrokerCash(conn, b, from, ts);
+    const [throughRows] = await conn.query(
+      `SELECT COALESCE(MAX(m.id), 0) AS ThroughId
+         FROM broker_balance_movements m
+        WHERE ${BROKER_CASH_WHERE} AND m.Branch = ?
+          AND m.CreatedAt >= ? AND m.CreatedAt < ?`,
+      [b, from, ts]
     );
-    const through = Math.max(
-      after,
-      last.length ? Number(last[0].LastId) || 0 : 0
-    );
-    const kept = await sumBrokerCash(conn, b, after, through);
+    // The id is recorded for the history only; the arithmetic above is by date.
+    const through = Number(throughRows[0] && throughRows[0].ThroughId) || 0;
 
     for (const currency of CURRENCIES) {
       if (kept[currency] === 0) continue;
@@ -2201,29 +2234,33 @@ const planBranchAsOf = (module.exports.planBranchAsOf =
       }
     }
 
-    // Cash from brokers: only manual top-ups count. Split them by CreatedAt
-    // since the last reset marker; the marker advances to the last top-up that
-    // belongs to the closed shift.
-    const marker = await brokerCashResetMarker(conn, b);
+    // Cash from brokers: only manual top-ups count, and each one belongs to the
+    // date it carries. The current period opens at the branch's last reset;
+    // everything dated before the cutoff is what the shift held, everything
+    // dated after it stays live. Insertion order is deliberately not used: a
+    // historical correction entered later must stay on its own day.
+    const periodStart = await brokerCashPeriodStart(conn, b, cut);
     const [brokerLiveRows] = await conn.query(
       `SELECT Currency, ROUND(SUM(Amount), 2) AS Total
          FROM broker_balance_movements m
-        WHERE ${BROKER_CASH_WHERE} AND m.Branch = ? AND m.id > ?
+        WHERE ${BROKER_CASH_WHERE} AND m.Branch = ? AND m.CreatedAt >= ?
         GROUP BY Currency`,
-      [b, marker]
+      [b, periodStart]
     );
     const [brokerAsOfRows] = await conn.query(
       `SELECT Currency, ROUND(SUM(Amount), 2) AS Total
          FROM broker_balance_movements m
-        WHERE ${BROKER_CASH_WHERE} AND m.Branch = ? AND m.id > ? AND m.CreatedAt < ?
+        WHERE ${BROKER_CASH_WHERE} AND m.Branch = ? AND m.CreatedAt >= ?
+          AND m.CreatedAt < ?
         GROUP BY Currency`,
-      [b, marker, cut]
+      [b, periodStart, cut]
     );
     const [throughRows] = await conn.query(
       `SELECT COALESCE(MAX(m.id), 0) AS ThroughId
          FROM broker_balance_movements m
-        WHERE ${BROKER_CASH_WHERE} AND m.Branch = ? AND m.id > ? AND m.CreatedAt < ?`,
-      [b, marker, cut]
+        WHERE ${BROKER_CASH_WHERE} AND m.Branch = ? AND m.CreatedAt >= ?
+          AND m.CreatedAt < ?`,
+      [b, periodStart, cut]
     );
     const liveBroker = zero();
     const asOfBroker = zero();
@@ -2237,10 +2274,7 @@ const planBranchAsOf = (module.exports.planBranchAsOf =
         asOfBroker[row.Currency] = round2(row.Total);
       }
     }
-    const through = Math.max(
-      marker,
-      Number(throughRows[0] && throughRows[0].ThroughId) || 0
-    );
+    const through = Number(throughRows[0] && throughRows[0].ThroughId) || 0;
 
     const kept = { cash: zero(), card: 0, brokerCash: zero() };
     const remaining = { cash: zero(), card: 0, brokerCash: zero() };
@@ -2579,9 +2613,15 @@ module.exports.createCurrentCashRouter = function createCurrentCashRouter(
           ORDER BY m.id DESC`,
         [day.date, day.nextDate]
       );
-      // Cash from Brokers: the branch's balance, the top-ups it received on the
-      // requested day, and the resets that cleared it that day.
-      const brokerCash = await getBrokerCash(DBConnection, branch);
+      // Cash from Brokers: the top-ups dated on the picked day (exactly the rows
+      // the day's list below shows, so the card and the table agree), and the
+      // resets that cleared the branch's money that day.
+      const brokerCash = await getBrokerCash(
+        DBConnection,
+        branch,
+        day.date,
+        day.nextDate
+      );
       const brokerCashTransactions = await getBrokerCashTransactions(
         DBConnection,
         branch,
