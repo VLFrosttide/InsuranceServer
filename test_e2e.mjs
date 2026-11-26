@@ -3,6 +3,7 @@
 // Spawns `main.js`, waits for the listen message, then exercises the REST API
 // and the WebSocket, printing PASS/FAIL for each check.
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { WebSocket } from "ws";
 
 const BASE = "http://127.0.0.1:5501";
@@ -92,7 +93,83 @@ function wsAuth(token) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Safety: the suite CREATES insurances (and a broker, top-ups, resets...), so it
+// must only ever run against a throw-away/local database. The live database is
+// the real business data - a test policy there is a real policy.
+//
+// The server the suite spawns reads DB_* from .env (never LIVE_DB_*), so the
+// check is on that target: refuse to start when DB_* points at the live
+// database (same host or same database name), or at any non-local host.
+// E2E_ALLOW_REMOTE=1 allows an intentional remote/staging run.
+// ---------------------------------------------------------------------------
+function readEnvFile(path) {
+  const out = {};
+  let text = "";
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return out;
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
+    if (!match || line.trim().startsWith("#")) continue;
+    let value = match[2].trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    out[match[1]] = value;
+  }
+  return out;
+}
+
+function assertSafeTestDatabase() {
+  const fileEnv = readEnvFile(".env");
+  // `node --env-file` does not override a variable that is already in the
+  // environment, so process.env wins exactly like it does for the server.
+  const env = (key) =>
+    process.env[key] !== undefined ? process.env[key] : fileEnv[key] || "";
+
+  const dbHost = env("DB_HOST").trim().toLowerCase() || "localhost";
+  const dbPort = env("DB_PORT").trim() || "5500";
+  const dbName = env("DB_NAME").trim() || "insurancedb";
+  const liveHost = env("LIVE_DB_HOST").trim().toLowerCase();
+  const liveName = env("LIVE_DB_NAME").trim().toLowerCase();
+
+  const sameAsLive =
+    (liveHost && dbHost === liveHost) || (liveName && dbName.toLowerCase() === liveName);
+  if (sameAsLive) {
+    throw new Error(
+      `Refusing to run: DB_* points at the LIVE database ` +
+        `(${dbHost}/${dbName}). The suite creates test insurances, so it must ` +
+        `use a local database (DB_HOST=localhost, DB_NAME=insurancedb). ` +
+        `LIVE_DB_* is for the read-only scripts only.`
+    );
+  }
+
+  const localHosts = ["localhost", "127.0.0.1", "::1", ""];
+  const allowRemote = String(process.env.E2E_ALLOW_REMOTE || "") === "1";
+  if (!localHosts.includes(dbHost) && !allowRemote) {
+    throw new Error(
+      `Refusing to run: DB_HOST=${dbHost} is not a local database. The suite ` +
+        `creates test insurances. Set E2E_ALLOW_REMOTE=1 only for a database ` +
+        `you are happy to fill with test policies.`
+    );
+  }
+
+  console.log(
+    `Test database: ${dbHost}:${dbPort}/${dbName}` +
+      ` (test policies are written HERE, never to the live database)${
+        allowRemote ? " [E2E_ALLOW_REMOTE=1]" : ""
+      }`
+  );
+}
+
 async function main() {
+  assertSafeTestDatabase();
   console.log("Starting server...");
   const child = await startServer();
   console.log("Server is up.\n");
@@ -217,6 +294,182 @@ async function main() {
       workerToken
     );
     check("POST /worker/insurances", r.status === 201, JSON.stringify(r.data));
+
+    // -----------------------------------------------------------------------
+    // Kinds of insurance (Requests/InsuranceKinds.js): border insurance is the
+    // main product and any employee may create it; medical insurance and civil
+    // liability are admin-only.
+    // -----------------------------------------------------------------------
+    r = await req("GET", "/insurance-kinds", null, workerToken);
+    const kindList = Array.isArray(r.data.kinds) ? r.data.kinds : [];
+    const kindEntry = (value) =>
+      kindList.find((kind) => kind.value === value) || {};
+    check(
+      "GET /insurance-kinds (worker)",
+      r.status === 200 && kindList.length === 3 && r.data.defaultKind === "border",
+      JSON.stringify(r.data)
+    );
+    check(
+      "border insurance is open to workers",
+      kindEntry("border").allowed === true &&
+        kindEntry("border").adminOnly === false
+    );
+    check(
+      "medical / civil liability are admin-only",
+      kindEntry("medical").allowed === false &&
+        kindEntry("civil").allowed === false
+    );
+
+    const kindBody = (kind, blanc) => ({
+      PolicyNumber: `BG/KIND/${blanc}`,
+      BlancNumber: blanc,
+      CarNumber: "CB 7777 KK",
+      Duration: "15 дена",
+      Branch: "ГКПП Лесово",
+      Otomobil: "Otomobil",
+      Price: "25",
+      CurrencyType: "EUR",
+      Cash: "true",
+      Kind: kind,
+    });
+
+    for (const kind of ["medical", "civil"]) {
+      r = await req(
+        "POST",
+        "/worker/insurances",
+        kindBody(kind, `KW${kind}${Date.now()}`),
+        workerToken
+      );
+      check(
+        `worker cannot create ${kind} insurance -> 403`,
+        r.status === 403,
+        JSON.stringify(r.data)
+      );
+    }
+
+    const borderBlanc = `KIND${Date.now()}B`;
+    r = await req(
+      "POST",
+      "/worker/insurances",
+      kindBody("border", borderBlanc),
+      workerToken
+    );
+    check(
+      "worker creates a border insurance -> 201",
+      r.status === 201 && r.data.kind === "border",
+      JSON.stringify(r.data)
+    );
+
+    r = await req(
+      "POST",
+      "/worker/insurances",
+      kindBody("marine", `KIND${Date.now()}X`),
+      workerToken
+    );
+    check("unknown kind -> 400", r.status === 400, JSON.stringify(r.data));
+
+    r = await req(
+      "PATCH",
+      `/insurances/${borderBlanc}`,
+      { Kind: "medical" },
+      workerToken
+    );
+    check(
+      "worker cannot turn a policy into medical -> 403",
+      r.status === 403,
+      JSON.stringify(r.data)
+    );
+
+    r = await req(
+      "PATCH",
+      `/insurances/${borderBlanc}`,
+      { Kind: "medical" },
+      adminToken
+    );
+    check(
+      "admin can change the kind of a policy",
+      r.status === 200 &&
+        r.data.insurance &&
+        r.data.insurance.Kind === "medical",
+      JSON.stringify(r.data)
+    );
+
+    const medicalBlanc = `KIND${Date.now()}M`;
+    r = await req(
+      "POST",
+      "/admin/insurances",
+      kindBody("medical", medicalBlanc),
+      adminToken
+    );
+    check(
+      "admin creates a medical insurance -> 201",
+      r.status === 201 && r.data.kind === "medical",
+      JSON.stringify(r.data)
+    );
+
+    r = await req(
+      "PATCH",
+      `/insurances/${medicalBlanc}`,
+      { Kind: "border" },
+      workerToken
+    );
+    check(
+      "worker cannot downgrade a medical policy -> 403",
+      r.status === 403,
+      JSON.stringify(r.data)
+    );
+
+    // A medical/civil policy is admin-only for every write, not just for its
+    // kind: a worker cannot correct it and cannot annul it either.
+    r = await req(
+      "PATCH",
+      `/insurances/${medicalBlanc}`,
+      { Price: "26" },
+      workerToken
+    );
+    check(
+      "worker cannot edit a medical policy -> 403",
+      r.status === 403,
+      JSON.stringify(r.data)
+    );
+
+    r = await req(
+      "POST",
+      `/insurances/${medicalBlanc}/annul`,
+      { payer: "none" },
+      workerToken
+    );
+    check(
+      "worker cannot annul a medical policy -> 403",
+      r.status === 403,
+      JSON.stringify(r.data)
+    );
+
+    r = await req(
+      "PATCH",
+      `/insurances/${medicalBlanc}`,
+      { Price: "33" },
+      adminToken
+    );
+    check(
+      "admin can edit a medical policy",
+      r.status === 200 &&
+        r.data.insurance &&
+        r.data.insurance.Kind === "medical" &&
+        r.data.insurance.Price === "33",
+      JSON.stringify(r.data)
+    );
+
+    r = await req("GET", "/insurances?kind=medical", null, adminToken);
+    check(
+      "GET /insurances?kind=medical lists only medical policies",
+      r.status === 200 &&
+        Array.isArray(r.data.insurances) &&
+        r.data.insurances.length > 0 &&
+        r.data.insurances.every((row) => row.Kind === "medical") &&
+        r.data.insurances.some((row) => row.BlancNumber === medicalBlanc),
+      JSON.stringify(r.data).slice(0, 300)
+    );
 
     // Current cash (roles 1 and 2 only). Uses own test values, not DB data.
     r = await req("GET", "/currentcash", null, workerToken);

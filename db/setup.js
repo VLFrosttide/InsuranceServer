@@ -170,6 +170,7 @@ async function runSetup(config = {}) {
       BrokerId INT NULL,
       Branch VARCHAR(45) NOT NULL,
       Otomobil VARCHAR(45) NOT NULL,
+      Kind VARCHAR(20) NOT NULL DEFAULT 'border',
       StartDate DATE NULL,
       PaymentType VARCHAR(45) NOT NULL,
       NonTurk TINYINT(1) NOT NULL DEFAULT 0,
@@ -361,6 +362,19 @@ async function runSetup(config = {}) {
       "ALTER TABLE insurance ADD COLUMN CardFee TINYINT(1) NOT NULL DEFAULT 0"
     );
     console.log("Added insurance.CardFee column");
+  }
+
+  // Which product the policy is (Requests/InsuranceKinds.js):
+  //   border  - Border insurance, the main one; any employee may create it.
+  //   medical - Medical insurance, admins only.
+  //   civil   - Civil liability, admins only.
+  // The column default is "border", so every policy written before this column
+  // existed is a border insurance - nothing has to be backfilled or guessed.
+  if (!insColNames.has("Kind")) {
+    await db.query(
+      "ALTER TABLE insurance ADD COLUMN Kind VARCHAR(20) NOT NULL DEFAULT 'border' AFTER Otomobil"
+    );
+    console.log("Added insurance.Kind column");
   }
 
   // Annulment support: a worker/admin can annul a policy, refunding its price

@@ -45,6 +45,7 @@ const { sendReply } = require("../Mail/SendReply.js");
 const mailStore = require("../Mail/mailStore.js");
 const { fetchThreadConversation } = require("../Mail/threadHistory.js");
 const { isBranchEnabled } = require("../db/branches.js");
+const insuranceKinds = require("./InsuranceKinds.js");
 
 /**
  * Resolve an insurance payment type from the received value.
@@ -903,6 +904,15 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         return res.status(400).json({ error: currencyError });
       }
 
+      // Which product this policy is. Border insurance is the default; medical
+      // insurance and civil liability are admin-only, and this endpoint already
+      // requires an admin, so every kind is allowed here.
+      const kindResult = insuranceKinds.kindFromBody(b);
+      if (kindResult.error) {
+        return res.status(400).json({ error: kindResult.error });
+      }
+      const kind = kindResult.kind;
+
       // A disabled branch must not issue new insurances.
       if (!(await isBranchEnabled(DBConnection, branch))) {
         return res.status(403).json({ error: "This branch is disabled" });
@@ -1054,9 +1064,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         await conn.query(
           `INSERT INTO insurance
               (Author, CreationDate, PolicyNumber, BlancNumber, CarNumber, Price,
-               CurrencyType, Duration, Broker, Branch, Otomobil, PaymentType,
+               CurrencyType, Duration, Broker, Branch, Otomobil, Kind, PaymentType,
                StartDate, BrokerId, NonTurk, CardFee)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             req.user.username,
             creationDate,
@@ -1069,6 +1079,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             brokerName,
             branch,
             otomobil,
+            kind,
             paymentType,
             startDate,
             brokerId,
@@ -1111,6 +1122,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         message: "Insurance created",
         blancNumber,
         author: req.user.username,
+        kind,
       });
     } catch (err) {
       if (err?.code === "ER_DUP_ENTRY") {
@@ -1376,6 +1388,19 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
     }
   );
 
+  // GET /insurance-kinds — the kinds (products) of insurance this system sells
+  // and which of them the caller may create. Border insurance is the main one
+  // and is open to every employee; medical insurance and civil liability are
+  // admin-only, so a worker's list marks them `allowed: false` (the create and
+  // edit endpoints enforce the rule themselves - this list only builds the
+  // form's dropdown).
+  router.get("/insurance-kinds", auth, requireRole(1, 2), (req, res) => {
+    res.json({
+      kinds: insuranceKinds.listForRole(req.user.role),
+      defaultKind: insuranceKinds.DEFAULT_KIND,
+    });
+  });
+
   // Create an insurance from the add-insurance form. Workers use it for their
   // email cards and walk-ins; admins use the same form when they claim an email
   // card on their dashboard, so the route serves both roles.
@@ -1394,6 +1419,20 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       const currencyError = validatePolicyCurrency(branch, otomobil, currencyType);
       if (currencyError) {
         return res.status(400).json({ error: currencyError });
+      }
+
+      // Border insurance is the main product and any employee may create it;
+      // medical insurance and civil liability are admin-only. The rule is
+      // enforced here - not only in the form - so an old client cannot sell one.
+      const kindResult = insuranceKinds.kindFromBody(b);
+      if (kindResult.error) {
+        return res.status(400).json({ error: kindResult.error });
+      }
+      const kind = kindResult.kind;
+      if (!insuranceKinds.canUseKind(req.user.role, kind)) {
+        return res.status(403).json({
+          error: insuranceKinds.adminOnlyKindError(kind),
+        });
       }
 
       // A disabled branch must not issue new insurances.
@@ -1628,9 +1667,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         await conn.query(
           `INSERT INTO insurance
               (Author, CreationDate, PolicyNumber, BlancNumber, CarNumber, Price,
-               CurrencyType, Duration, Broker, Branch, Otomobil, PaymentType,
+               CurrencyType, Duration, Broker, Branch, Otomobil, Kind, PaymentType,
                StartDate, BrokerId, NonTurk, CardFee)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             req.user.username,
             creationDate,
@@ -1643,6 +1682,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             brokerName,
             branch,
             otomobil,
+            kind,
             paymentType,
             startDate,
             brokerId,
@@ -1706,6 +1746,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         message: "Insurance created",
         blancNumber,
         author: req.user.username,
+        kind,
         replySkipped: disableReturnEmail,
         replyError: replyError || undefined,
       });
@@ -2020,6 +2061,19 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       );
       const payment = payments.join(",");
 
+      // ?kind= filters by product: border, medical or civil (the English and
+      // Bulgarian labels are accepted too). An unknown value is an error, not
+      // an empty result, so a typo is noticed.
+      const kindRaw = req.query.kind ? String(req.query.kind).trim() : "";
+      let kindFilter = "";
+      if (kindRaw) {
+        const parsedKind = insuranceKinds.parseKind(kindRaw);
+        if (parsedKind.error) {
+          return res.status(400).json({ error: parsedKind.error });
+        }
+        kindFilter = parsedKind.kind;
+      }
+
       if (
         !author &&
         !date &&
@@ -2029,11 +2083,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         !broker &&
         !brokerCode &&
         !annulled &&
-        !payment
+        !payment &&
+        !kindFilter
       ) {
         return res.status(400).json({
           error:
-            "At least one search parameter is required (author, date, policyNumber, blancNumber, carNumber, broker, brokerCode, payment or annulled)",
+            "At least one search parameter is required (author, date, policyNumber, blancNumber, carNumber, broker, brokerCode, payment, kind or annulled)",
         });
       }
 
@@ -2085,6 +2140,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           `PaymentType IN (${list.map(() => "?").join(", ")})`
         );
         params.push(...list);
+      }
+      if (kindFilter) {
+        conditions.push("Kind = ?");
+        params.push(kindFilter);
       }
 
       const [rows] = await DBConnection.query(
@@ -2468,6 +2527,16 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         // -------------------------------------------------------------------
         const isAdmin = Number(req.user && req.user.role) === 1;
 
+        // Medical insurance and civil liability are admin-only products: a
+        // worker may not edit such a policy at all (not merely change its kind),
+        // so every field below is refused instead of silently ignored.
+        const storedKind = insuranceKinds.policyKind(insurance);
+        if (!isAdmin && insuranceKinds.isAdminOnlyKind(storedKind)) {
+          return res.status(403).json({
+            error: insuranceKinds.adminOnlyKindError(storedKind, "edit"),
+          });
+        }
+
         const authorValue = b.Author ?? b.author;
         if (authorValue !== undefined && authorValue !== null) {
           if (!isAdmin) {
@@ -2491,6 +2560,32 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
             }
             sets.push("Author = ?");
             params.push(nextAuthor);
+          }
+        }
+
+        // Which product the policy is. Medical insurance and civil liability
+        // are admin-only, so a worker can neither turn a border policy into one
+        // nor downgrade an existing medical/civil policy back to border. A save
+        // that does not send the kind leaves it untouched.
+        const kindValue = b.Kind ?? b.kind ?? b.InsuranceKind ?? b.insuranceKind;
+        if (kindValue !== undefined && kindValue !== null) {
+          const parsedKind = insuranceKinds.parseKind(kindValue);
+          if (parsedKind.error) {
+            return res.status(400).json({ error: parsedKind.error });
+          }
+          const currentKind =
+            insuranceKinds.normalizeInsuranceKind(insurance.Kind) ||
+            insuranceKinds.DEFAULT_KIND;
+          if (parsedKind.kind !== currentKind) {
+            if (!isAdmin) {
+              return res.status(403).json({
+                error: insuranceKinds.isAdminOnlyKind(parsedKind.kind)
+                  ? insuranceKinds.adminOnlyKindError(parsedKind.kind)
+                  : "Only admins can change the kind of an insurance",
+              });
+            }
+            sets.push("Kind = ?");
+            params.push(parsedKind.kind);
           }
         }
 
@@ -3337,7 +3432,9 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   // fee. A broker-linked policy gets the full price back unless the broker
   // is the one at fault, in which case only the price minus the fee (the
   // partial refund) is returned to the broker's balance. A policy can only be
-  // annulled once. Admins (role 1) and workers (role 2) can annul any policy.
+  // annulled once. Admins (role 1) and workers (role 2) can annul a policy, but
+  // a medical insurance / civil liability one is admin-only (see
+  // Requests/InsuranceKinds.js).
   router.post(
     "/insurances/:blancNumber/annul",
     auth,
@@ -3382,6 +3479,18 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const alreadyAnnulled = Boolean(Number(insurance.Annulled));
         if (alreadyAnnulled && Number(req.user && req.user.role) !== 1) {
           return res.status(400).json({ error: "Insurance already annulled" });
+        }
+
+        // An annulment rewrites the policy's money, so a worker cannot do it to
+        // an admin-only product either (medical insurance, civil liability).
+        const policyKind = insuranceKinds.policyKind(insurance);
+        if (
+          Number(req.user && req.user.role) !== 1 &&
+          insuranceKinds.isAdminOnlyKind(policyKind)
+        ) {
+          return res.status(403).json({
+            error: insuranceKinds.adminOnlyKindError(policyKind, "annul"),
+          });
         }
 
         const price = toDecimal(insurance.Price) || 0;

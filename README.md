@@ -208,6 +208,55 @@ row's `Reason` moves, so the row starts matching its policy and stops being
 counted as a manual increase. Anything ambiguous is listed for review. It is
 idempotent; always run it without `--apply` first.
 
+## Checking a broker's period against a statement
+
+A broker's statement ("169 x 15D, 22 x 1M automobile, ..., 17 annulled, 24 005 EUR")
+can be checked against the database without writing anything:
+
+```powershell
+npm run db:check:period -- --broker=19 --from=2026-10-10 --to=2026-11-25
+npm run db:check:period -- --broker=19 --from=2026-10-10 --to=2026-11-25 --live
+```
+
+`db/check-broker-period.js` counts the broker's live policies whose
+`CreationDate` falls inside `[--from, --to]` (both days included - the same
+window a bill uses), split by duration (`15D` / `1M` / `3M`) and vehicle type,
+and prints the three figures a statement can mean:
+
+- **without annulled** - the live policies at their `Price` (an annulled policy
+  was refunded, so it is listed separately);
+- **including annulled, bill rule** - plus every annulment fee, which is what a
+  bill charges (`db/brokerBills.js`, annulled policies at their `AnnulFee`);
+- **including annulled, balance rule** - plus only the fees the broker is at
+  fault for (`AnnulReason = 'broker'`), which is what the broker *balance*
+  charges.
+
+It also lists the annulled policies with who paid the fee, the soft-deleted
+policies of the range (never counted - the bill leaves them off), any charge
+hidden on the balance history (a void, not billed) and every price that differs
+from the broker's own tariff list. The payment periods the range covers are
+printed first, so a range that is not a whole period (the schedule in
+`Requests/PaymentSchedule.js` is two weeks, not the 10th-25th) is visible at a
+glance.
+
+Under the duration table there is the same money grouped **by price and vehicle
+type**, the way a broker's price list reads - how many insurances at each price,
+their sum, how many of them were annulled (an annulled policy sits at its
+annulment fee, not at its sale price) and the total per line:
+
+```
+number of insurances by price and vehicle type:
+price / type           active         sum  annulled  annul. fees       total
+Automobile 1.00             0        0.00        12       12.00       12.00
+Automobile 9.00             0        0.00         2       18.00       18.00
+Automobile 19.00          169     3211.00         0        0.00     3211.00
+Automobile 24.00           22      528.00         0        0.00      528.00
+Automobile 31.00          648    20088.00         0        0.00    20088.00
+Bus 50.00                   1       50.00         0        0.00       50.00
+Motor 25.00                 1       25.00         0        0.00       25.00
+TOTAL                     841    23902.00        17       30.00    23932.00
+```
+
 ## Database schema
 
 The database (`insurancedb`) contains the following tables. `db/setup.js`
@@ -253,6 +302,7 @@ One row per insurance policy.
 | `BrokerId`     | Link to `brokers.id`                               |
 | `Branch`       | Branch (selected at login)                         |
 | `Otomobil`     | Vehicle/car flag value                             |
+| `Kind`         | `border`, `medical` or `civil` (default `border`)  |
 | `StartDate`    | Policy start date                                  |
 | `PaymentType`  | `"Cash"` or `"Card"`                               |
 | `NonTurk`      | `1` if the +5 non-Turk surcharge applied           |
@@ -290,6 +340,44 @@ Use case: the core business entity — created by workers, listed for clients,
 edited by admins/workers, and linked to a broker and to the current-cash
 ledger. `BlancNumber` is the natural unique key used for create/update/duplicate
 checks.
+
+#### Kinds of insurance
+
+Every policy is one of three products (`insurance.Kind`; the list and the rules
+live in `Requests/InsuranceKinds.js`):
+
+| Kind      | Product                                    | Who may create it  |
+| --------- | ------------------------------------------ | ------------------ |
+| `border`  | Border insurance — the main product        | admins and workers |
+| `medical` | Medical insurance                          | **admins only**    |
+| `civil`   | Civil liability                            | **admins only**    |
+
+- `Kind` is optional on `POST /worker/insurances` and `POST /admin/insurances`;
+  a missing value is `border`. The key (`medical`), the English label
+  (`Medical insurance`) or the Bulgarian label (`Медицинска застраховка`) are
+  accepted; anything else is answered with `400`.
+- A worker who sends `medical` or `civil` is refused with `403` ("Only admins
+  can create medical insurance"), so the rule holds even for an older client
+  that has no kind selector yet.
+- `PATCH /insurances/:blancNumber` accepts `Kind` too, but only an admin may
+  change it: a worker can neither turn a border policy into a medical one nor
+  downgrade an existing medical/civil policy back to border.
+- A medical or civil liability policy is admin-only for **every write**, not
+  just for its creation: a worker who edits one gets `403` ("Only admins can
+  edit medical insurance"), one who annuls it gets `403` ("Only admins can
+  annul …"), and deleting it is admin-only anyway. Admins do all of it.
+- `GET /insurance-kinds` (roles 1 and 2) returns the three kinds with `allowed`
+  (whether the caller may create it) and `defaultKind`, so the form can build
+  the dropdown and hide what the user cannot use.
+- `GET /insurances?kind=medical` filters the policy search;
+  `GET /admin/insurances`, `GET /insurances` and `GET /client/insurances`
+  return `Kind` on every row.
+- Every policy written before this column existed is `border` (the column
+  default), so there is nothing to backfill.
+
+The kind is a label on the policy: it does not change how a policy is paid,
+counted, annulled, deleted or billed. Cash/card/broker money, the drawer, the
+broker balance and the bi-weekly bill read the same columns as before.
 
 ### `tokens`
 
@@ -523,6 +611,20 @@ npm run test:e2e
 This starts the server (with Gmail disabled for determinism) and exercises the
 login, registration, tiered admin/worker/client endpoints, and the WebSocket.
 
+**The suite creates real rows** — test insurances, a test broker, top-ups and
+resets — so it is meant for the local `DB_*` database only. Before the server is
+even started it refuses to run when `DB_HOST`/`DB_NAME` point at the live
+database (`LIVE_DB_HOST`/`LIVE_DB_NAME`) or at any non-local host, and it prints
+the target it is about to fill:
+
+```
+Test database: localhost:5500/insurancedb (test policies are written HERE, never to the live database)
+```
+
+The live database is never a test target: test policies there would be real
+policies. (`E2E_ALLOW_REMOTE=1` exists only for a throw-away remote/staging
+database.)
+
 ## Run the client
 
 In a separate terminal:
@@ -564,8 +666,9 @@ still sent over `http://`. The Electron client does not rely on the cookie:
 - Worker (`role 2`): `/worker`, `/worker/clients`,
   `POST /worker/clients/balance`
 - Email cards (`role 1`/`role 2`): `POST /worker/insurances` (the same form also
-  creates walk-ins), `POST /worker/insurances/reply`,
-  `GET /worker/emails/:messageId/thread`
+  creates walk-ins and takes the optional `Kind` - border, medical or civil),
+  `POST /worker/insurances/reply`, `GET /worker/emails/:messageId/thread`,
+  `GET /insurance-kinds`
 - Client (`role 3`): `/client`, `/client/profile`, `/client/insurances`
 - Broker + current cash (`role 1`/`role 2`): see the sections below.
 
