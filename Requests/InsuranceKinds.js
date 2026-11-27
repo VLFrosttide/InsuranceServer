@@ -155,6 +155,27 @@ function policyKind(insurance) {
 module.exports.policyKind = policyKind;
 
 /**
+ * Whether a kind carries the border-form details: a blanc number, a car number,
+ * a policy number, a start date, a vehicle type and a duration.
+ *
+ * Border insurance is written on a blanc for a vehicle, so every one of those is
+ * required (the add form checks it and the create endpoint refuses a blank one).
+ * Medical insurance and civil liability are priced by hand: they have none of
+ * those details, so every field of their form may be left empty. A blank number
+ * is not stored as-is - the create endpoint makes up a reference (MED-… / CIV-…)
+ * so the policy still has its BlancNumber key.
+ *
+ * A missing or unknown value is a border insurance, exactly as everywhere else.
+ *
+ * @param {unknown} value  Stored value, English/Bulgarian label or body value.
+ * @returns {boolean}
+ */
+function requiresPolicyDetails(value) {
+  return policyKind({ Kind: value }) === DEFAULT_KIND;
+}
+module.exports.requiresPolicyDetails = requiresPolicyDetails;
+
+/**
  * The message a worker gets when trying to use an admin-only kind.
  *
  * @param {unknown} kind

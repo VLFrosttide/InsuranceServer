@@ -320,6 +320,50 @@ async function rejectIfBlancIsHollow(res, conn, blancNumber) {
 }
 
 /**
+ * A reference for a policy that carries none of the border-form numbers.
+ *
+ * Medical insurance and civil liability are priced by hand: the admin types the
+ * amount and may leave the blanc / policy numbers empty. The blanc number is the
+ * insurance table's primary key (and the URL parameter used to edit, annul or
+ * delete a policy), so a blank one cannot simply be stored - a reference is made
+ * instead, e.g. MED-20261127141530-4F2A. The prefix names the kind, so such a row
+ * is recognisable in the tables, the search and the exports.
+ *
+ * @param {string} kind        Stored kind value ("medical", "civil", ...).
+ * @param {string} [createdAt] The policy's creation date (YYYY-MM-DD HH:MM:SS).
+ * @returns {string}
+ */
+function makePolicyReference(kind, createdAt) {
+  const prefix = kind === "medical" ? "MED" : kind === "civil" ? "CIV" : "POL";
+  const digits = String(createdAt ?? "").replace(/\D/g, "");
+  const stamp = digits.slice(0, 14) || String(Date.now());
+  const random = Math.random().toString(36).slice(2, 6).toUpperCase();
+  return `${prefix}-${stamp}-${random}`;
+}
+
+/**
+ * A policy reference no other row uses yet, in either number column.
+ *
+ * @param {{query: Function}} conn
+ * @param {string} kind
+ * @param {string} [createdAt]
+ * @returns {Promise<string>}
+ */
+async function uniquePolicyReference(conn, kind, createdAt) {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const candidate = makePolicyReference(kind, createdAt);
+    const [rows] = await conn.query(
+      "SELECT BlancNumber FROM insurance WHERE BlancNumber = ? OR PolicyNumber = ?",
+      [candidate, candidate]
+    );
+    if (!Array.isArray(rows) || rows.length === 0) return candidate;
+  }
+  // Extremely unlikely (20 collisions); a longer stamp still cannot be typed by
+  // accident and keeps the row's key unique.
+  return makePolicyReference(kind, `${createdAt ?? ""}${Date.now()}`);
+}
+
+/**
  * Parse a human/duration value into an integer number of days.
  * Accepts "15", "15 дена", "3 месеца", "1 година", etc.
  */
@@ -889,8 +933,11 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
   router.post("/admin/insurances", auth, requireRole(1), async (req, res) => {
     try {
       const b = req.body || {};
-      const policyNumber = b.PolicyNumber ?? b.policyNumber ?? "";
-      const blancNumber = b.BlancNumber ?? b.blancNumber ?? "";
+      // The two numbers and the car number are settled further down: border
+      // insurance must carry them, while a medical / civil policy may leave them
+      // blank and gets a made-up reference instead (see requiresPolicyDetails).
+      let policyNumber = String(b.PolicyNumber ?? b.policyNumber ?? "");
+      let blancNumber = String(b.BlancNumber ?? b.blancNumber ?? "");
       const carNumber = b.CarNumber ?? b.carNumber ?? "";
       let price = String(b.Price ?? b.price ?? "");
       const currencyType = normalizePolicyCurrency(
@@ -951,16 +998,6 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       }
       const cardFee = false;
 
-      if (!String(blancNumber).trim()) {
-        return res.status(400).json({ error: "BlancNumber is required" });
-      }
-      if (!String(carNumber).trim()) {
-        return res.status(400).json({ error: "CarNumber is required" });
-      }
-      if (!String(policyNumber).trim()) {
-        return res.status(400).json({ error: "PolicyNumber is required" });
-      }
-
       // The creation time is the admin's local wall-clock time; it may be an
       // older date when entering a policy that was sold earlier.
       const sentCreationDate = b.CreationDate ?? b.creationDate;
@@ -978,6 +1015,40 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
       } else {
         creationDate = clientLocalDateTime(b.TzOffset ?? b.tzOffset ?? null);
+      }
+
+      // Border insurance is written on a blanc for a vehicle, so its blanc, car
+      // and policy numbers are all required (whitespace alone does not count).
+      // Medical insurance and civil liability are hand-priced products with none
+      // of those details: every one of their fields may be left blank, and a
+      // blank number gets a reference (MED-… / CIV-…) so the policy still has the
+      // BlancNumber primary key that the edit / annul / delete URLs use.
+      const needsPolicyDetails = insuranceKinds.requiresPolicyDetails(kind);
+      if (needsPolicyDetails) {
+        if (!String(blancNumber).trim()) {
+          return res.status(400).json({ error: "BlancNumber is required" });
+        }
+        if (!String(carNumber).trim()) {
+          return res.status(400).json({ error: "CarNumber is required" });
+        }
+        if (!String(policyNumber).trim()) {
+          return res.status(400).json({ error: "PolicyNumber is required" });
+        }
+      } else {
+        if (!String(blancNumber).trim()) {
+          blancNumber = await uniquePolicyReference(
+            DBConnection,
+            kind,
+            creationDate
+          );
+        }
+        if (!String(policyNumber).trim()) {
+          policyNumber = await uniquePolicyReference(
+            DBConnection,
+            kind,
+            creationDate
+          );
+        }
       }
 
       let startDate = b.StartDate ?? b.startDate ?? null;
@@ -1018,35 +1089,41 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         }
       }
 
-      // A blanc tagged as hollow can never be written on.
-      if (await rejectIfBlancIsHollow(res, DBConnection, blancNumber)) {
-        return;
-      }
+      // The three blanc rules are about the numbered border forms handed out to
+      // brokers. A medical / civil policy has no border form at all (its number
+      // is a typed reference or one the server made up), so it is never checked
+      // against them - it would otherwise look like a blanc outside every batch.
+      if (needsPolicyDetails) {
+        // A blanc tagged as hollow can never be written on.
+        if (await rejectIfBlancIsHollow(res, DBConnection, blancNumber)) {
+          return;
+        }
 
-      // A blanc that is already in ANOTHER broker's batches can never be used
-      // here, and "create anyway" does not override it: the error names that
-      // broker and the policy is not saved until the blanc is changed.
-      if (
-        await rejectIfBlancBelongsToAnotherBroker(
-          res,
-          DBConnection,
-          brokerId,
-          blancNumber
-        )
-      ) {
-        return;
-      }
+        // A blanc that is already in ANOTHER broker's batches can never be used
+        // here, and "create anyway" does not override it: the error names that
+        // broker and the policy is not saved until the blanc is changed.
+        if (
+          await rejectIfBlancBelongsToAnotherBroker(
+            res,
+            DBConnection,
+            brokerId,
+            blancNumber
+          )
+        ) {
+          return;
+        }
 
-      if (
-        await rejectIfBlancOutsideBrokerBatches(
-          res,
-          DBConnection,
-          brokerId,
-          blancNumber,
-          b
-        )
-      ) {
-        return;
+        if (
+          await rejectIfBlancOutsideBrokerBatches(
+            res,
+            DBConnection,
+            brokerId,
+            blancNumber,
+            b
+          )
+        ) {
+          return;
+        }
       }
 
       const priceDecimal = toDecimal(price);
@@ -1121,6 +1198,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
       res.status(201).json({
         message: "Insurance created",
         blancNumber,
+        policyNumber,
         author: req.user.username,
         kind,
       });
@@ -2567,6 +2645,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         // are admin-only, so a worker can neither turn a border policy into one
         // nor downgrade an existing medical/civil policy back to border. A save
         // that does not send the kind leaves it untouched.
+        //
+        // `finalKind` is the kind the policy has after this save; the number
+        // rules further down depend on it (see requiresPolicyDetails).
+        let finalKind = insuranceKinds.policyKind(insurance);
         const kindValue = b.Kind ?? b.kind ?? b.InsuranceKind ?? b.insuranceKind;
         if (kindValue !== undefined && kindValue !== null) {
           const parsedKind = insuranceKinds.parseKind(kindValue);
@@ -2576,6 +2658,7 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           const currentKind =
             insuranceKinds.normalizeInsuranceKind(insurance.Kind) ||
             insuranceKinds.DEFAULT_KIND;
+          finalKind = parsedKind.kind;
           if (parsedKind.kind !== currentKind) {
             if (!isAdmin) {
               return res.status(403).json({
@@ -2704,6 +2787,16 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         const isAnnulledBeforeEdit = Boolean(Number(insurance.Annulled));
         for (const [column, value] of editable) {
           if (isAnnulledBeforeEdit && column === "Price") continue;
+          // A hand-priced policy's policy number is a reference (made up by the
+          // server when the form left it blank), so a blank field keeps the
+          // stored one instead of wiping it - exactly like its blanc number below.
+          if (
+            column === "PolicyNumber" &&
+            !insuranceKinds.requiresPolicyDetails(finalKind) &&
+            !String(value ?? "").trim()
+          ) {
+            continue;
+          }
           if (value !== undefined && value !== null) {
             let v;
             if (column === "PaymentType") v = finalPayment;
@@ -2774,12 +2867,16 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           params.push(duration);
         }
 
-        // Car number is required on creation, so an empty value is rejected
-        // here too instead of silently wiping the stored one.
+        // A border policy is written on a blanc for a vehicle, so an empty car
+        // number would silently wipe the stored one - it is rejected. A medical
+        // or civil liability policy has no vehicle details, so its car number may
+        // stay empty (the add form does not ask for one).
+        const editedNeedsPolicyDetails =
+          insuranceKinds.requiresPolicyDetails(finalKind);
         const carNumberValue = b.CarNumber ?? b.carNumber;
         if (carNumberValue !== undefined && carNumberValue !== null) {
           const carNumber = String(carNumberValue).trim();
-          if (!carNumber) {
+          if (!carNumber && editedNeedsPolicyDetails) {
             return res.status(400).json({ error: "CarNumber is required" });
           }
           sets.push("CarNumber = ?");
@@ -2789,14 +2886,19 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
         // The blank number is the policy's key (and the URL parameter), so it
         // can only be changed to a number no other policy uses yet. The row is
         // still located by its CURRENT number in the WHERE clause below.
+        //
+        // It can never be cleared on a border policy. On a medical / civil one a
+        // blank field simply means "keep the stored key" (the form may be sent
+        // without it), so the policy keeps the reference it was created with.
         let newBlancNumber = String(insurance.BlancNumber ?? blancNumber);
         const blancValue = b.BlancNumber ?? b.blancNumber;
         if (blancValue !== undefined && blancValue !== null) {
           const requestedBlanc = String(blancValue).trim();
           if (!requestedBlanc) {
-            return res.status(400).json({ error: "BlancNumber is required" });
-          }
-          if (requestedBlanc !== newBlancNumber) {
+            if (editedNeedsPolicyDetails) {
+              return res.status(400).json({ error: "BlancNumber is required" });
+            }
+          } else if (requestedBlanc !== newBlancNumber) {
             const [clash] = await DBConnection.query(
               "SELECT BlancNumber FROM insurance WHERE BlancNumber = ?",
               [requestedBlanc]
