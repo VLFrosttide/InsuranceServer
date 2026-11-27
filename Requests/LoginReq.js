@@ -29,6 +29,32 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
     return res.status(status).json(body);
   }
 
+  // The two platforms a session can belong to. The website and the desktop
+  // client are usually open on the same PC, so each keeps its own session and
+  // a login only replaces the session of the platform it comes from.
+  const CLIENT_LABELS = new Set(["client", "desktop", "app", "electron"]);
+  const WEB_LABELS = new Set(["web", "website", "site", "browser"]);
+
+  /**
+   * Which session bucket this login belongs to: "web" or "client".
+   * Clients send `client: "web" | "client"`. When the field is missing (an
+   * older build) an Electron User-Agent is treated as the desktop client so it
+   * cannot evict the website's session; everything else is "web".
+   *
+   * @param {import("express").Request} req
+   * @returns {"web" | "client"}
+   */
+  function resolveClientPlatform(req) {
+    const raw =
+      typeof req.body["client"] === "string"
+        ? req.body["client"].trim().toLowerCase()
+        : "";
+    if (CLIENT_LABELS.has(raw)) return "client";
+    if (WEB_LABELS.has(raw)) return "web";
+    const userAgent = String(req.headers["user-agent"] || "");
+    return /electron/i.test(userAgent) ? "client" : "web";
+  }
+
   router.post("/logme", async (req, res) => {
     try {
       const Username = req.body["username"];
@@ -94,12 +120,21 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
       }
 
       const GeneratedToken = Crypto.randomBytes(32).toString("hex");
-      await DBConnection.query("DELETE FROM tokens WHERE Username = ?", [
-        Username,
-      ]);
+      const ClientPlatform = resolveClientPlatform(req);
+      // Replace only THIS platform's session. The website ("web") and the
+      // desktop client ("client") may be open on the same PC, and signing in on
+      // one must never end the other's session, so the delete is scoped by
+      // Device instead of by Username alone (deleting every token of the user
+      // was what made the other client look "expired"). Expired rows of the
+      // user are swept in the same statement; rows from before the Device
+      // column existed stay "legacy" and just run out their 12 hours.
       await DBConnection.query(
-        "INSERT INTO tokens (Token, Username, Expires) VALUES (?, ?, NOW() + INTERVAL 12 HOUR)",
-        [GeneratedToken, Username]
+        "DELETE FROM tokens WHERE Username = ? AND (Device = ? OR Expires <= NOW())",
+        [Username, ClientPlatform]
+      );
+      await DBConnection.query(
+        "INSERT INTO tokens (Token, Username, Device, Expires) VALUES (?, ?, ?, NOW() + INTERVAL 12 HOUR)",
+        [GeneratedToken, Username, ClientPlatform]
       );
 
       // The token is delivered both as an HttpOnly cookie (for browser-style
@@ -128,6 +163,9 @@ module.exports.createLoginRouter = function createLoginRouter(DBConnection) {
         token: GeneratedToken,
         username: Username,
         role: String(DBRole),
+        // Which session bucket was used ("web" or "client"), so a client can
+        // verify it landed in its own platform's session.
+        client: ClientPlatform,
         redirectTo: targetPage,
       };
 

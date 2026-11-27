@@ -468,16 +468,45 @@ async function runSetup(config = {}) {
   }
 
   // 4) Create the tokens table.
-
+  //
+  // A session belongs to exactly one platform: 'web' (the website, sent as an
+  // HttpOnly cookie or a Bearer token) or 'client' (the desktop client, Bearer
+  // from localStorage). Both are usually open on the same PC, so each keeps its
+  // own session and a login only replaces the session of its own platform.
   await db.query(`
     CREATE TABLE IF NOT EXISTS tokens (
       Token VARCHAR(64) NOT NULL,
       Username VARCHAR(45) NOT NULL,
+      Device VARCHAR(16) NOT NULL DEFAULT 'web',
       Expires DATETIME NOT NULL,
       PRIMARY KEY (Token),
-      KEY idx_tokens_username (Username)
+      KEY idx_tokens_user_device (Username, Device)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
+
+  // Existing installs: add tokens.Device. Sessions issued before the column
+  // existed are marked 'legacy' rather than 'web', so the first login after the
+  // upgrade cannot delete a session that belongs to the other platform; they
+  // simply expire (12 hours) and are swept below.
+  const [tokenCols] = await db.query(
+    "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    [DB_NAME, "tokens"]
+  );
+  const tokenColNames = new Set(tokenCols.map((c) => c.COLUMN_NAME));
+  if (!tokenColNames.has("Device")) {
+    await db.query(
+      "ALTER TABLE tokens ADD COLUMN Device VARCHAR(16) NOT NULL DEFAULT 'legacy' AFTER Username, " +
+        "ADD KEY idx_tokens_user_device (Username, Device)"
+    );
+    // New rows always carry a Device from /logme; the default is only a
+    // fallback for anything else that inserts a token.
+    await db.query("ALTER TABLE tokens ALTER COLUMN Device SET DEFAULT 'web'");
+    console.log("Added tokens.Device column");
+  }
+
+  // Sessions expire after 12 hours. Sweep the dead ones on start; /logme also
+  // prunes the logging-in user's expired rows.
+  await db.query("DELETE FROM tokens WHERE Expires <= NOW()");
 
   // Gmail token refresh reminder: records which Saturday the reminder was last
   // sent so a server restart on the same Saturday does not send it again.

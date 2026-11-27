@@ -179,15 +179,72 @@ async function main() {
     let r = await req("GET", "/health");
     check("GET /health", r.status === 200 && r.data.status === "ok");
 
-    // Login (admin)
+    // Login (admin) — the website labels itself with client: "web".
     r = await req("POST", "/logme", {
       username: "admin",
       password: "AdminPass123",
+      client: "web",
+    });
+    const adminWebToken1 = tokenFromSetCookie(r.setCookie);
+    check(
+      "POST /logme admin (web)",
+      r.status === 200 && !!adminWebToken1 && r.data.client === "web",
+      JSON.stringify(r.data)
+    );
+
+    // Sessions are scoped per platform. The website ("web") and the desktop
+    // client ("client") are usually open on the same PC; one login must never
+    // end the other's session (the old blanket delete did exactly that).
+    r = await req("POST", "/logme", {
+      username: "admin",
+      password: "AdminPass123",
+      client: "client",
+    });
+    const adminClientToken = tokenFromSetCookie(r.setCookie);
+    check(
+      "POST /logme admin (client) -> separate session",
+      r.status === 200 &&
+        r.data.client === "client" &&
+        !!adminClientToken &&
+        adminClientToken !== adminWebToken1,
+      JSON.stringify(r.data)
+    );
+
+    r = await req("GET", "/account", null, adminWebToken1);
+    check(
+      "Website session survives the desktop-client login",
+      r.status === 200 && r.data.username === "admin",
+      JSON.stringify(r.data)
+    );
+
+    // A second login on the SAME platform replaces that platform's session...
+    r = await req("POST", "/logme", {
+      username: "admin",
+      password: "AdminPass123",
+      client: "web",
     });
     const adminToken = tokenFromSetCookie(r.setCookie);
     check(
-      "POST /logme admin",
-      r.status === 200 && !!adminToken,
+      "POST /logme admin (web again) -> new web token",
+      r.status === 200 && !!adminToken && adminToken !== adminWebToken1,
+      JSON.stringify(r.data)
+    );
+
+    r = await req("GET", "/account", null, adminWebToken1);
+    check("Previous website session is replaced -> 401", r.status === 401);
+
+    r = await req("GET", "/account", null, adminToken);
+    check(
+      "New website session works",
+      r.status === 200 && r.data.username === "admin",
+      JSON.stringify(r.data)
+    );
+
+    // ...and never touches the desktop client's session.
+    r = await req("GET", "/account", null, adminClientToken);
+    check(
+      "Desktop session untouched by the website re-login",
+      r.status === 200 && r.data.username === "admin",
       JSON.stringify(r.data)
     );
 

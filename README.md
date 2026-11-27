@@ -383,15 +383,20 @@ broker balance and the bi-weekly bill read the same columns as before.
 
 Sessions issued at login.
 
-| Column     | Type          | Notes                        |
-| ---------- | ------------- | ---------------------------- |
-| `Token`    | `VARCHAR(64)` | Session token (primary key)  |
-| `Username` | `VARCHAR(45)` | Owner of the token           |
-| `Expires`  | `DATETIME`    | Expiry (12 hours from login) |
+| Column     | Type          | Notes                                                    |
+| ---------- | ------------- | -------------------------------------------------------- |
+| `Token`    | `VARCHAR(64)` | Session token (primary key)                              |
+| `Username` | `VARCHAR(45)` | Owner of the token                                       |
+| `Device`   | `VARCHAR(16)` | Platform: `web` (website) or `client` (desktop client)   |
+| `Expires`  | `DATETIME`    | Expiry (12 hours from login)                             |
 
-Use case: `Authorization: Bearer <token>` session auth (`/logme` inserts, the
-auth middleware validates token + expiry, and a login deletes any previous
-token for the same user).
+Use case: `Authorization: Bearer <token>` session auth. An account keeps at
+most one live session per platform — `web` for the website, `client` for the
+desktop client — so both can be signed in at the same time (usually on the same
+PC) and a login only replaces the session of its own platform. `legacy` marks
+sessions issued before the `Device` column existed; they are left alone and
+expire after their 12 hours. Expired rows are pruned at login and on server
+start, and admin suspend/delete still removes every session of the account.
 
 ### `current_cash`
 
@@ -643,7 +648,12 @@ Log in with any of the demo accounts above. The client routes by role:
 ## HTTP API
 
 - `POST /logme` — login (sets an HttpOnly session cookie and also returns the
-  token in the JSON body so the Electron client can use Bearer auth)
+  token in the JSON body so the Electron client can use Bearer auth). The
+  optional `client` field (`"web"` or `"client"`) selects the session bucket:
+  the website and the desktop client each keep one live session, so logging in
+  on one never ends the other's session. Without the field the server infers it
+  from the User-Agent (Electron → `client`, otherwise `web`); the response
+  echoes the bucket it used.
 - `POST /userreg` — register a new client account
 - `GET /health` — liveness check
 
