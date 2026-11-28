@@ -136,24 +136,50 @@ shows the charge for the insurance that always had it. It is idempotent; always
 run it without `--apply` first, and `--live` prints the host/database it is
 about to inspect.
 
-### Without Node access (phpMyAdmin)
+### Folding old price corrections
 
-The same repair is available as SQL, for a database reached through phpMyAdmin.
-Both files are in the client repository (`Insurance/migrations/`):
+A price edit no longer writes a `price_change` row: the delta is folded into the
+policy's one sale row, dated at the policy's creation day. Rows written before
+that change can be folded the same way:
 
-- `check_broker_history_gaps.sql` - **read-only**: lists every live
-  broker-charged policy whose history does not add up to its charge, with a
-  Status (`MISSING ROW`, `MISSING SALE ROW`, `VOID`, `AMOUNT MISMATCH`), plus a
-  preview of the rows block 2 relabels and block 3 writes.
-- `fix_broker_history_gaps.sql` - **writes**: relabels the stale sale rows, then
-  writes the missing ones, then verifies (`StillMissing` must be 0).
+```powershell
+npm run db:fold:prices                     # report only (local DB_*)
+npm run db:fold:prices -- --apply          # write the fixes
+npm run db:fold:prices:live                # report the live database
+npm run db:fold:prices:live -- --apply     # fold the live database
+npm run db:fold:prices -- --broker=25      # one broker
+```
 
-Run them block by block in phpMyAdmin (each block ends with a semicolon). They
-follow the same rules as the script but are deliberately more conservative on
-ambiguous pairs: a sale row is only relabelled when its blanc exists in no
-insurance at all and exactly one policy / one orphan row sit on that second;
-anything unclear stays reported. Like the script they never touch
-`brokers.CashBalance` and never restore a void.
+`db/fold-broker-price-changes.js` adds each live policy's `price_change` total
+to its sale row (keeping that row's `CreatedAt`), then deletes the folded rows.
+For a live sale row the sum of the history does not change, so no broker
+balance moves; the page simply stops showing a second row for a correction. A
+soft-deleted sale row is a void, so its amount is corrected to keep cancelling
+the policy at its current price; a balance rebuilt from the insurances takes
+that difference up on its next recalculation. Voided (soft-deleted)
+`price_change` rows are left alone - a void is a deliberate decision - and a
+policy with no sale row at all is reported for review. Idempotent.
+
+The server itself refuses a price edit when the broker-linked policy has no
+live sale row (HTTP 409, "This insurance has no sale row in the broker
+history..."), so a correction can never invent history or add a second row.
+
+
+
+### Running the repair against the live database
+
+This repair used to be duplicated as SQL files in the client repository, for a
+database reached only through phpMyAdmin. Those files are gone: a one-off like
+this is code, so it lives next to the schema it repairs. Run the script itself
+from any machine that has the checkout and the `LIVE_DB_*` settings in `.env` -
+`--live` prints the host and database before it touches anything:
+
+```powershell
+npm run db:repair:ledger:live               # report only
+npm run db:repair:ledger:live -- --apply    # repair
+```
+
+`--live` without `--apply` never writes, so the report is the safe first step.
 
 ### The structural link (why this cannot happen again)
 
@@ -164,9 +190,9 @@ attached to the policy even when its `BlancNumber` is stale, so a blanc edit can
 no longer make the charge disappear. The relabel on a blanc edit and the repair
 above stay as the second and third safety nets.
 
-The column is created by `npm run db:setup` (or
-`migrations/022_insurance_sale_movement_link.sql` in the client repository) and
-existing policies are linked by:
+The column is created by `npm run db:setup` (db/setup.js adds it, and
+`npm run db:link:sales -- --apply` adds it to a database that has not been set up
+again) and existing policies are linked by:
 
 ```powershell
 npm run db:link:sales                     # report (local DB_*)
@@ -178,6 +204,46 @@ npm run db:link:sales:live -- --apply     # link the live database
 A policy with no live sale row (a void, a missing row, or a row still under an
 older blanc) is deliberately left unlinked: run the history repair first, then
 this script again. It changes no money and is idempotent.
+
+## Legacy upgrades (one-off)
+
+Three changes reached the live database before the server knew how to make them.
+They used to be SQL files in the client repository; they now live in
+`db/legacy-upgrades.js`, and the two that rewrite historical rows require
+`--apply`:
+
+```powershell
+npm run db:check:tariffs      # report the TRY walk-in Auto prices to raise
+npm run db:raise:tariffs      # raise them: 1 600 / 2 000 / 2 200 -> 1 600 / 2 050 / 2 300
+npm run db:check:numbers      # report policies with the blanc/policy swapped
+npm run db:swap:numbers       # swap them + relabel both cash ledgers
+npm run db:check:times        # report what a UTC -> local shift would touch
+npm run db:shift:times -- --hours=3   # shift insurance + cash timestamps once
+```
+
+- `--tariffs` only raises the three known OLD prices, so an admin's later price
+  is never reverted. It is also part of `npm run db:setup` (an explicit setup
+  only), which is how a live database picks up the new TRY prices.
+- `--swap` only touches rows whose `PolicyNumber` is 6 characters and
+  `BlancNumber` 8, refuses a blanc that is already in use, keeps the originals in
+  `insurance_number_swap_backup`, and rewrites `<blanc>`, `Edit <blanc>` and
+  `Annul <blanc>` in `cash_transactions` and `total_cash_transactions`.
+- `--shift-times` writes `insurance_creationdate_backup` /
+  `cash_createdate_backup` and refuses to run again while either exists. Never
+  run it on a database whose rows are already local - after the fact the two
+  cannot be told apart.
+
+`npm run db:check:payments` is the read-only audit of what a broker's balance is
+made of: the retired `reduce`/`adjust` rows a database still carries, per broker,
+and the starting balance each broker needs for its stored figure to stay exactly
+as it is:
+
+```powershell
+npm run db:check:payments            # local DB_*
+npm run db:check:payments -- --live  # LIVE_DB_*
+```
+
+All of these accept `-- --live` to target the `LIVE_DB_*` block.
 
 ## Patching the cash drawer ledger (one-off)
 

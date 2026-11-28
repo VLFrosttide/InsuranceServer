@@ -791,8 +791,8 @@ let EuroPricing = {
 //
 // Raised on 2026-11-24 to 1 600 / 2 050 / 2 300 TRY for 15 days / 1 month /
 // 3 months. This table only seeds a database that has no TRY rows yet; the
-// live rows are raised by migrations/023 in the client repository
-// (Insurance/migrations/023_turkish_lira_tariff_increase.sql).
+// live rows were raised by `npm run db:setup`, which applies the same change
+// through db/legacy-upgrades.js (raiseTurkishLiraTariffs).
 let TryPricing = {
   Lesovo: {
     Auto: { 15: 1600, 30: 2050, 90: 2300 },

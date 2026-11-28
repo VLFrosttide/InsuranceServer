@@ -1202,14 +1202,34 @@ const restoreBrokerForDeletion = (module.exports.restoreBrokerForDeletion =
  * entirely by the broker's balance - it never touches current cash - so that
  * balance is the only record of the payment and has to follow price corrections.
  *
+ * NO new ledger row is written for a price correction. The change is FOLDED
+ * into the policy's one SALE row (`Type = 'policy'`) instead: its Amount moves
+ * by the delta and its CreatedAt is left alone, so the balance history keeps
+ * showing exactly one direct sale per policy - at the price the policy ends up
+ * with, on the day it was created. That is what makes a correction made today
+ * change the balance of the policy's creation day rather than today's.
+ *
+ * The sale row is found through `insurance.SaleMovementId` first and by
+ * (BrokerId, BlancNumber, Type = 'policy') otherwise, so a row left under an
+ * older blanc is still folded rather than duplicated. Only a LIVE sale row is
+ * folded: a soft-deleted one is a void, and a price correction is refused
+ * outright when `meta.requireSaleRow` is set - the caller then reports an error
+ * instead of inventing history or silently writing a new row. A broker move
+ * (which cancels the old broker's sale) does not require one.
+ *
  * @param {import("mysql2/promise").Connection} conn
  * @param {number} brokerId
  * @param {number|string} delta  newPrice - oldPrice (may be negative or 0).
+ * @param {{reason?: string, author?: string, blancNumber?: string,
+ *          createdAt?: string, requireSaleRow?: boolean}} [meta]  `createdAt`
+ *          and `reason` are only used for the legacy delta row.
  * @returns {Promise<number|null>} The delta applied, or null if broker missing.
+ * @throws {Error & {code: "NO_SALE_MOVEMENT"}} when a sale row is required but
+ *         the policy has none (the caller must abort the edit).
  */
 const adjustBrokerForPriceChange = (module.exports.adjustBrokerForPriceChange =
   async function adjustBrokerForPriceChange(conn, brokerId, delta, meta = {}) {
-    const d = toDecimal(delta) || 0;
+    const d = Math.round((toDecimal(delta) || 0) * 100) / 100;
     if (d === 0) return 0;
 
     const [[broker]] = await conn.query("SELECT id FROM brokers WHERE id = ?", [
@@ -1217,12 +1237,77 @@ const adjustBrokerForPriceChange = (module.exports.adjustBrokerForPriceChange =
     ]);
     if (!broker) return null;
 
+    const blanc = String(meta.blancNumber ?? "").trim();
+    if (!blanc) {
+      // No policy to fold into (defensive: every caller passes its blanc).
+      await conn.query(
+        "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
+        [d, brokerId]
+      );
+      await recordBrokerMovement(conn, brokerId, -d, "price_change", meta);
+      return d;
+    }
+
+    // The policy behind the blanc, together with the LIVE sale row it links to.
+    // A soft-deleted sale row is a void, not history to fold into.
+    const [[policy]] = await conn.query(
+      `SELECT i.CreationDate, i.Price, i.SaleMovementId,
+              m.id AS SaleId
+         FROM insurance i
+         LEFT JOIN broker_balance_movements m
+           ON m.id = i.SaleMovementId AND m.Type = 'policy' AND m.Deleted = 0
+        WHERE i.BlancNumber = ? AND i.BrokerId = ?
+        LIMIT 1`,
+      [blanc, brokerId]
+    );
+
+    // Fallback: a row created before `SaleMovementId` existed (or whose link
+    // was lost). The policy's oldest LIVE sale row is the one the history shows.
+    let sale = policy && policy.SaleId ? { id: policy.SaleId } : null;
+    if (!sale) {
+      const [rows] = await conn.query(
+        `SELECT id FROM broker_balance_movements
+          WHERE BrokerId = ? AND BlancNumber = ? AND Type = 'policy'
+            AND Deleted = 0
+          ORDER BY id ASC LIMIT 1`,
+        [brokerId, blanc]
+      );
+      if (Array.isArray(rows) && rows.length > 0) sale = { id: rows[0].id };
+    }
+
+    if (!sale) {
+      // A price correction must be folded into the policy's original sale row.
+      // Without one, refuse instead of inventing a row or leaving the change
+      // unfiled: the caller turns this into a 409 and the edit is rolled back.
+      if (meta.requireSaleRow) {
+        const err = new Error(
+          "This insurance has no sale row in the broker history; repair its history before changing its price"
+        );
+        err.code = "NO_SALE_MOVEMENT";
+        throw err;
+      }
+      // A broker move may legitimately have no sale row on the old broker
+      // (nothing to cancel). Only an unknown policy keeps the explicit delta.
+      await conn.query(
+        "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
+        [d, brokerId]
+      );
+      if (!policy) {
+        await recordBrokerMovement(conn, brokerId, -d, "price_change", meta);
+      }
+      return d;
+    }
+
+    // Shift the one sale row by the delta and keep its own CreatedAt. A
+    // negative Amount is a charge (the balance goes down).
     await conn.query(
       "UPDATE brokers SET CashBalance = CashBalance - ? WHERE id = ?",
       [d, brokerId]
     );
-
-    await recordBrokerMovement(conn, brokerId, -d, "price_change", meta);
+    await conn.query(
+      "UPDATE broker_balance_movements SET Amount = ROUND(Amount - ?, 2) WHERE id = ?",
+      [d, sale.id]
+    );
 
     return d;
   });

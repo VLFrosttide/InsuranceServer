@@ -28,8 +28,8 @@
 // CreatedAt equals the policy's CreationDate (the server copies it on sale).
 // Only an unambiguous pair is linked (exactly one candidate). A policy whose
 // sale row is missing or sits under an older blanc is not guessed: run
-// db/repair-broker-ledger.js first (or migrations/fix_broker_history_gaps.sql),
-// then this script again. Idempotent - a second run changes nothing.
+// db/repair-broker-ledger.js --apply first, then this script again. Idempotent
+// - a second run changes nothing.
 
 const mysql = require("mysql2/promise");
 
@@ -60,8 +60,8 @@ async function hasIndex(conn, table, index) {
  * money and never changes what is shown - it only makes the pairing independent
  * of the blanc, so a later blanc correction cannot detach it. A policy with no
  * live sale row (a void, a missing row or a row left under an older blanc) is
- * left NULL: `db/repair-broker-ledger.js` (or the SQL in Insurance/migrations)
- * has to put that row right first.
+ * left NULL: `db/repair-broker-ledger.js --apply` has to put that row right
+ * first.
  *
  * @param {import("mysql2/promise").Connection} conn
  * @returns {Promise<number>} policies linked

@@ -3130,6 +3130,20 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           // there is nothing sensible to keep. A stored fee of 0 is a real fee
           // the admin chose (e.g. the tax was zeroed by hand), so it is kept
           // too - only a row with NO stored fee gets a computed one.
+          //
+          // A fee typed against "no fault" cannot be honoured: nobody is at
+          // fault, so there is no one to charge. Refusing it keeps the save
+          // from reporting success while storing the old 0.
+          if (
+            effectivePayer === "none" &&
+            nextAnnulFee !== null &&
+            nextAnnulFee > 0
+          ) {
+            return res.status(400).json({
+              error:
+                "A no-fault annulment cannot have a fee; choose the broker or the worker as the payer to charge one",
+            });
+          }
           let newFee;
           if (effectivePayer === "none") {
             newFee = 0;
@@ -3313,7 +3327,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                     reason: newBlancNumber,
                     author: req.user.username,
                     blancNumber: newBlancNumber,
-                    createdAt: moveTime.createdAt,
+                    // The policy's sale belongs to the day it was created, not
+                    // to the day it was moved: the new broker's history shows
+                    // it there, so a move never changes today's balance.
+                    createdAt: insurance.CreationDate,
                   }
                 );
               }
@@ -3327,6 +3344,10 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
                   author: req.user.username,
                   blancNumber: insurance.BlancNumber,
                   createdAt: moveTime.createdAt,
+                  // The correction has to fold into the policy's original sale
+                  // row. Without one the edit is refused (NO_SALE_MOVEMENT),
+                  // instead of writing a second ledger row.
+                  requireSaleRow: true,
                 }
               );
             }
@@ -3509,6 +3530,12 @@ module.exports.createTierRouter = function createTierRouter(DBConnection) {
           return res
             .status(409)
             .json({ error: "Insurance with this BlancNumber already exists" });
+        }
+        // The policy has no original sale row in the broker history, so a price
+        // correction cannot be folded into it. The transaction was rolled back -
+        // nothing was written - and the client shows this message.
+        if (err?.code === "NO_SALE_MOVEMENT") {
+          return res.status(409).json({ error: err.message });
         }
         // The cash drawer cannot fund the reversal of the old price (the money
         // was already paid out or reset). The transaction was rolled back, so

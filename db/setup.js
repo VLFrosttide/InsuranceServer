@@ -13,11 +13,13 @@ const {
   ensureBrokerPaymentsTable,
   backfillBrokerPayments,
 } = require("./brokerPayments.js");
+const { raiseTurkishLiraTariffs } = require("./legacy-upgrades.js");
 
 /**
  * One-time split of the old global card balance into per-branch balances
- * (same statements as migrations/009_branch_card_balance.sql). Runs only
- * while `branch_card_balance` is empty, so it never overwrites live data.
+ * (the change that used to be an SQL migration; it runs on an explicit setup
+ * only). Runs only while `branch_card_balance` is empty, so it never
+ * overwrites live data.
  *
  * Each branch starts with its card share from total_cash.CardPart (summed over
  * currencies) - the card money its policies brought in since the last clear.
@@ -1044,6 +1046,23 @@ async function runSetup(config = {}) {
     console.log("Added branch_tariffs.Currency column and re-keyed its unique index");
   }
 
+  // One-off: the Turkish-lira walk-in Auto prices raised on 2026-11-24
+  // (1 600 / 2 000 / 2 200 -> 1 600 / 2 050 / 2 300 for 15 / 30 / 90 days).
+  // A database that seeds its tariffs from BrokerInfo.js already gets the new
+  // prices, and the seeding never overwrites a price that is already there, so
+  // the live rows need this. Only the known OLD value is raised, so an admin's
+  // later price change is never reverted. A data step: explicit setup only.
+  if (seed) {
+    try {
+      await raiseTurkishLiraTariffs(db, { apply: true, log: console.log });
+    } catch (err) {
+      console.warn(
+        "Could not raise the Turkish-lira Auto tariffs:",
+        (err && err.message) || err
+      );
+    }
+  }
+
   // Blanc batches handed to brokers: one row per [RangeStart, RangeEnd]
   // batch. A broker's inactive blancs are calculated from all of its batches
   // (see Requests/Brokers.js); brokers.PolicyRangeStart / PolicyRangeEnd /
@@ -1615,7 +1634,7 @@ async function runSetup(config = {}) {
  * only makes the pairing independent of the blanc, so a later blanc correction
  * cannot detach the charge. A policy with no live sale row (a void, a missing row
  * or a row left under an older blanc) stays NULL until
- * `db/repair-broker-ledger.js` (or the SQL in Insurance/migrations) puts it right.
+ * `db/repair-broker-ledger.js --apply` puts it right.
  *
  * Idempotent: it only fills SaleMovementId where it is still NULL, and the
  * unique key makes a second run a no-op.
