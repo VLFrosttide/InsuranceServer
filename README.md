@@ -323,6 +323,59 @@ Motor 25.00                 1       25.00         0        0.00       25.00
 TOTAL                     841    23902.00        17       30.00    23932.00
 ```
 
+## Insurances per shift per worker
+
+How much each worker wrote during each shift of a period, with the day and the
+night shift kept apart and the averages for each:
+
+```powershell
+npm run report:shifts                                   # the last 7 complete days
+npm run report:shifts -- --from=2026-11-21 --to=2026-11-27
+npm run report:shifts -- --days=14 --gap=240            # a 4-hour pause ends a shift
+npm run report:shifts -- --day-start=06:30 --night-start=18:30
+npm run report:shifts -- --json                         # raw JSON, for piping
+npm run report:shifts:live                              # LIVE_DB_* (read-only)
+```
+
+The same report is served over HTTP to roles 1 and 2:
+
+```
+GET /reports/shifts?from=YYYY-MM-DD&to=YYYY-MM-DD&dayStart=07:30&nightStart=19:30&gap=360
+```
+
+There is no shift table, and a shift is **not** a fixed slice of the clock: each
+employee's insurances are cut into **streaks**, where a pause longer than `gap`
+minutes (default `360` = 6 hours) starts a new shift. A shift therefore **ends at
+the employee's last insurance** - around 19:30 or 07:30, but never exactly - and
+the next one begins with the first insurance after the pause. The report shows
+that detected span for every shift (`startedAt` / `endedAt` in a row).
+
+The two times only decide whether a streak counts as **day** or **night**: the
+nominal day window is `dayStart`-`nightStart` (default `07:30`-`19:30`) and the
+night is the rest of the day, so an early arrival or a late departure cannot
+split a shift in two. Each streak is labelled by where the **majority** of its
+policies fall, and a night streak that starts before the day shift is dated the
+previous day - a policy written at 03:00 on the 22nd belongs to the night of the
+21st, which is how the crossings work and how "End shift" closes the drawer.
+Half hours are ordinary boundaries (times are compared in minutes).
+
+- Only insurances that still exist count (`Deleted = 0`). An annulled policy was
+  still written, so it stays in the count.
+- The worker is the account (`users.Username`), so a legacy casing of the same
+  login (`DARIA` / `daria`) is one person; `role` shows whether a worker (2) or
+  an admin (1) wrote it.
+- The response carries `rows` (one per shift: date, day/night, worker, role,
+  `policies`, `startedAt`, `endedAt`), `perDay` (the day/night totals of every
+  day of the range, quiet days included), `workers` (each person's day/night
+  split) and `summary` (`day`, `night`, `overall`) with `policies`, `workers`,
+  `shifts` (streaks), `activeDays` and the averages `avgPoliciesPerShift`,
+  `avgPoliciesPerWorker`, `avgPoliciesPerDay` and `avgPoliciesPerWorkerPerDay`.
+  `schedule` echoes the window, `maxGapMinutes` and the exact minutes.
+- Two streaks of the same employee on the same date are two shifts (and two
+  rows), which is what a split day really is.
+- Without `--from`/`--to` the command reports the last `--days=N` (default 7)
+  complete days, ending yesterday.
+
 ## Database schema
 
 The database (`insurancedb`) contains the following tables. `db/setup.js`

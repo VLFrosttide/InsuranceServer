@@ -18,6 +18,8 @@
     "db:link:sales:live": "node --env-file=.env db/link-insurance-sales.js --live",
     "db:check:period": "node --env-file=.env db/check-broker-period.js",
     "db:check:payments": "node --env-file=.env db/check-broker-payments.js",
+    "report:shifts": "node --env-file=.env db/shift-report.js",
+    "report:shifts:live": "node --env-file=.env db/shift-report.js --live",
     "db:check:numbers": "node --env-file=.env db/legacy-upgrades.js --swap",
     "db:swap:numbers": "node --env-file=.env db/legacy-upgrades.js --swap --apply",
     "db:check:times": "node --env-file=.env db/legacy-upgrades.js --shift-times",

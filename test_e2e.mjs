@@ -907,6 +907,250 @@ async function main() {
       r.status === 403 || r.status === 401
     );
 
+    // ---------------------------------------------------------------------
+    // Insurances per shift per worker (Requests/Reports.js). The report cuts
+    // each employee's policies into STREAKS: a pause longer than `gap` minutes
+    // (6 hours by default) starts a new shift, so a shift ends at its LAST
+    // insurance - around 19:30 / 07:30, but never exactly. Dedicated fixtures
+    // on fixed past dates keep every expectation independent of the wall clock:
+    //   15th 08:00 + 10:00 + 12:00   one DAY streak (the 12:00 is its end)
+    //   15th 21:00, 16th 03:00+06:00  one NIGHT streak across midnight
+    //   18th 02:00                    an isolated night tail -> the 17th
+    //   20th 09:00 and 17:00          an 8-hour pause -> TWO day shifts
+    // ---------------------------------------------------------------------
+    const shiftFirstDay = "2026-01-15";
+    const shiftSecondDay = "2026-01-16";
+    const shiftTailDay = "2026-01-18";
+    const shiftSplitDay = "2026-01-20";
+    const shiftFrom = "2026-01-14";
+    const shiftTo = "2026-01-20";
+    const shiftsUrl = `/reports/shifts?from=${shiftFrom}&to=${shiftTo}`;
+    const sumPolicies = (list) =>
+      (list || []).reduce((n, row) => n + Number(row.policies || 0), 0);
+    const sumPerDay = (list) =>
+      (list || []).reduce((n, row) => n + Number(row.total || 0), 0);
+    // Several streaks can share a date/shift/worker, so they are summed. The
+    // worker is optional: without it every worker of that date/shift is taken.
+    const shiftRows = (report, date, shift, worker) =>
+      ((report && report.rows) || []).filter(
+        (row) =>
+          row.date === date &&
+          row.shift === shift &&
+          (worker === undefined || row.worker === worker)
+      );
+    const shiftTotal = (report, date, shift) =>
+      shiftRows(report, date, shift).reduce((n, row) => n + row.policies, 0);
+
+    r = await req("GET", shiftsUrl, null, adminToken);
+    const shiftBefore = r.data || {};
+    check(
+      "GET /reports/shifts (admin)",
+      r.status === 200 &&
+        shiftBefore.days === 7 &&
+        shiftBefore.schedule.day.start === "07:30" &&
+        shiftBefore.schedule.night.start === "19:30" &&
+        shiftBefore.schedule.day.window === "07:30-19:30" &&
+        shiftBefore.schedule.night.window === "19:30-07:30" &&
+        shiftBefore.schedule.maxGapMinutes === 360,
+      JSON.stringify(shiftBefore.schedule)
+    );
+
+    const shiftFixtures = [
+      `${shiftFirstDay} 08:00:00`,
+      `${shiftFirstDay} 10:00:00`,
+      `${shiftFirstDay} 12:00:00`,
+      `${shiftFirstDay} 21:00:00`,
+      `${shiftSecondDay} 03:00:00`,
+      `${shiftSecondDay} 06:00:00`,
+      `${shiftTailDay} 02:00:00`,
+      `${shiftSplitDay} 09:00:00`,
+      `${shiftSplitDay} 17:00:00`,
+    ];
+    // A soft-deleted fixture keeps its blanc number forever, so the run stamp
+    // keeps a new run from colliding with the row of an earlier one.
+    const shiftStamp = Date.now();
+    const shiftBlancs = [];
+    for (const [index, at] of shiftFixtures.entries()) {
+      const blanc = `SHIFTF${shiftStamp}${index}`;
+      shiftBlancs.push(blanc);
+      r = await req(
+        "POST",
+        "/worker/insurances",
+        {
+          BlancNumber: blanc,
+          PolicyNumber: `P${blanc}`,
+          CarNumber: "CB 7777 FF",
+          Price: "55",
+          Cash: "true",
+          CreationDate: at,
+        },
+        workerToken
+      );
+      check(
+        `Shift fixture (${at}) created -> 201`,
+        r.status === 201,
+        JSON.stringify(r.data)
+      );
+    }
+
+    r = await req("GET", shiftsUrl, null, adminToken);
+    const shiftAfter = r.data || {};
+    const firstDayRows = shiftRows(shiftAfter, shiftFirstDay, "day");
+    check(
+      "Shift report ends a day shift at its last insurance",
+      firstDayRows.length === shiftRows(shiftBefore, shiftFirstDay, "day").length + 1 &&
+        shiftTotal(shiftAfter, shiftFirstDay, "day") ===
+          shiftTotal(shiftBefore, shiftFirstDay, "day") + 3 &&
+        firstDayRows.some(
+          (row) =>
+            row.startedAt === `${shiftFirstDay} 08:00` &&
+            row.endedAt === `${shiftFirstDay} 12:00`
+        ),
+      JSON.stringify(firstDayRows)
+    );
+    const nightRows = shiftRows(shiftAfter, shiftFirstDay, "night");
+    check(
+      "Shift report keeps a night shift in one streak across midnight",
+      shiftTotal(shiftAfter, shiftFirstDay, "night") ===
+        shiftTotal(shiftBefore, shiftFirstDay, "night") + 3 &&
+        nightRows.length === shiftRows(shiftBefore, shiftFirstDay, "night").length + 1 &&
+        nightRows.some(
+          (row) =>
+            row.startedAt === `${shiftFirstDay} 21:00` &&
+            row.endedAt === `${shiftSecondDay} 06:00`
+        ),
+      JSON.stringify(nightRows)
+    );
+    check(
+      "Shift report dates an isolated night tail to the previous day",
+      shiftTotal(shiftAfter, "2026-01-17", "night") ===
+        shiftTotal(shiftBefore, "2026-01-17", "night") + 1 &&
+        shiftTotal(shiftAfter, shiftTailDay, "night") ===
+          shiftTotal(shiftBefore, shiftTailDay, "night"),
+      JSON.stringify(shiftRows(shiftAfter, "2026-01-17", "night"))
+    );
+    check(
+      "Shift report splits a day on an 8-hour pause",
+      shiftRows(shiftAfter, shiftSplitDay, "day").length ===
+        shiftRows(shiftBefore, shiftSplitDay, "day").length + 2 &&
+        shiftTotal(shiftAfter, shiftSplitDay, "day") ===
+          shiftTotal(shiftBefore, shiftSplitDay, "day") + 2,
+      JSON.stringify(shiftRows(shiftAfter, shiftSplitDay, "day"))
+    );
+    check(
+      "Shift report counts exactly the nine fixtures",
+      shiftAfter.summary.overall.policies ===
+        shiftBefore.summary.overall.policies + shiftFixtures.length,
+      `${shiftBefore.summary.overall.policies} -> ${shiftAfter.summary.overall.policies}`
+    );
+    check(
+      "Shift report day + night add up to the total",
+      !!shiftAfter.summary &&
+        shiftAfter.summary.day.policies + shiftAfter.summary.night.policies ===
+          shiftAfter.summary.overall.policies &&
+        sumPolicies(shiftAfter.rows) === shiftAfter.summary.overall.policies &&
+        sumPerDay(shiftAfter.perDay) === shiftAfter.summary.overall.policies,
+      JSON.stringify(shiftAfter.summary)
+    );
+    check(
+      "Shift report per-worker rows add up to their own total",
+      Array.isArray(shiftAfter.workers) &&
+        shiftAfter.workers.some(
+          (worker) =>
+            worker.worker === "worker" &&
+            worker.day.policies + worker.night.policies ===
+              worker.total.policies
+        ),
+      JSON.stringify(shiftAfter.workers)
+    );
+
+    // A custom half-hour schedule only changes the day/night label of a streak.
+    r = await req(
+      "GET",
+      `${shiftsUrl}&dayStart=06:30&nightStart=18:30`,
+      null,
+      adminToken
+    );
+    check(
+      "Shift report honours a custom half-hour schedule",
+      r.status === 200 &&
+        r.data.schedule.day.window === "06:30-18:30" &&
+        r.data.schedule.night.window === "18:30-06:30" &&
+        r.data.summary.overall.policies ===
+          shiftAfter.summary.overall.policies,
+      JSON.stringify(r.data && r.data.schedule)
+    );
+
+    // A shorter pause splits the same policies into more shifts: the 21:00 and
+    // the 03:00 of that night are more than 250 minutes apart.
+    r = await req("GET", `${shiftsUrl}&gap=250`, null, adminToken);
+    check(
+      "Shift report splits a night when the pause is shortened",
+      r.status === 200 &&
+        r.data.schedule.maxGapMinutes === 250 &&
+        shiftRows(r.data, shiftFirstDay, "night").length ===
+          nightRows.length + 1 &&
+        shiftTotal(r.data, shiftFirstDay, "night") ===
+          shiftTotal(shiftAfter, shiftFirstDay, "night"),
+      JSON.stringify(r.data && r.data.schedule)
+    );
+
+    // A range with no policies is an empty report, not an error.
+    r = await req(
+      "GET",
+      "/reports/shifts?from=2999-01-01&to=2999-01-02",
+      null,
+      adminToken
+    );
+    check(
+      "Shift report of an empty range",
+      r.status === 200 &&
+        r.data.summary.overall.policies === 0 &&
+        r.data.workers.length === 0 &&
+        r.data.perDay.length === 2,
+      JSON.stringify(r.data && r.data.summary)
+    );
+
+    r = await req(
+      "GET",
+      `/reports/shifts?from=${shiftFirstDay}`,
+      null,
+      adminToken
+    );
+    check("Shift report without to -> 400", r.status === 400);
+    r = await req(
+      "GET",
+      `${shiftsUrl}&nightStart=07:30`,
+      null,
+      adminToken
+    );
+    check("Shift report with dayStart = nightStart -> 400", r.status === 400);
+    r = await req(
+      "GET",
+      `${shiftsUrl}&dayStart=25:00`,
+      null,
+      adminToken
+    );
+    check("Shift report with an impossible time -> 400", r.status === 400);
+    r = await req("GET", `${shiftsUrl}&gap=5`, null, adminToken);
+    check("Shift report with an impossible pause -> 400", r.status === 400);
+    r = await req("GET", shiftsUrl, null, workerToken);
+    check("Worker can read the shift report", r.status === 200);
+    r = await req("GET", shiftsUrl, null, clientToken);
+    check("Client blocked from the shift report -> 403", r.status === 403);
+
+    // The fixtures go away again; the report returns to its earlier shape.
+    for (const blanc of shiftBlancs) {
+      await req("DELETE", `/insurances/${blanc}`, null, adminToken);
+    }
+    r = await req("GET", shiftsUrl, null, adminToken);
+    check(
+      "Shift fixtures removed from the report",
+      r.status === 200 &&
+        sumPolicies(r.data.rows) === sumPolicies(shiftBefore.rows),
+      JSON.stringify(r.data && r.data.rows)
+    );
+
     // Client endpoints
     r = await req("GET", "/client/profile", null, clientToken);
     check("GET /client/profile", r.status === 200 && r.data.profile);
